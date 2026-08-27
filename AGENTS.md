@@ -91,14 +91,26 @@ GEMMs is faster than optimized PyTorch/cuBLAS. Custom Triton is a stretch path.
 
 Current Person 2 branch: `person2/ffn-layernorm`.
 
-Current Person 2 status: implementing a standalone, baseline-weight-compatible
-`OptimizedTransformerBlock` plus focused FFN/block tests and benchmarks. Final
-`UserOptimizedTransformer` assembly remains owned by Person 3.
+Current Person 2 core commit: `d6bfab0 Add standalone Person 2 FFN optimization`.
 
-Local validation environment status: the NVIDIA GeForce MX350 is visible, but
-the system Python currently has a broken CPU-only PyTorch 2.3.0 installation.
-Person 2 validation will use a repository-local Python 3.10 environment with an
-official CUDA 12.6 PyTorch build that retains Pascal (`sm_61`) support.
+The standalone, baseline-weight-compatible `OptimizedTransformerBlock`, focused
+unit tests, and `bench_person2_ffn.py` are implemented. Final
+`UserOptimizedTransformer` assembly remains owned by Person 3. The implementation
+uses exact GELU and a token-major FFN view; no custom Triton kernel was added.
+
+Local validation used Python 3.10, PyTorch 2.12.1+cu126, and an NVIDIA GeForce
+MX350 (`sm_61`, 2 GB). All eight CPU/CUDA unit tests passed for strict weight
+copy, full-block and isolated FFN equivalence, non-contiguous inputs, masking,
+causality, float32, float16, and the runtime-supported bfloat16 path. All five
+isolated float16 sweep shapes had zero output error. Their eager median speedups
+were 0.982x, 1.006x, 0.995x, 1.086x, and 1.069x in `run_sweep.py` order; the last
+case had a worse optimized p90, so there is no blanket speedup claim.
+
+The `default`, `reduce-overhead`, and `max-autotune` compile modes are unsupported
+on this GPU because TorchInductor's Triton backend requires compute capability
+7.0 or newer. Four full-block sweep shapes passed with zero error; the
+`(2, 4096, 1024)` full-attention case exceeded the 2 GB GPU memory. Re-run the
+compiled comparisons and long full-block case on the team's newer target GPU.
 
 ### Person 3 — integration, profiling, and dispatch
 
