@@ -145,6 +145,55 @@ class BaselineTransformerBlock(nn.Module):
         return x
 
 
+class OptimizedTransformerBlock(BaselineTransformerBlock):
+    """Transformer block with a compiler-friendly, token-major FFN path.
+
+    The attention path intentionally remains the baseline implementation so
+    that this block owns only the LayerNorm/FFN/residual portion assigned to
+    Person 2.  The module names and parameter structure are inherited
+    unchanged, which keeps strict state-dict copying compatible.
+    """
+
+    def _ffn_residual(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Apply the pre-norm FFN residual sublayer with baseline semantics."""
+        # LayerNorm operates over the final hidden dimension.  Reshape keeps a
+        # view when the normalized output is contiguous and materializes a
+        # contiguous layout only when the input strides require it.
+        batch, seq_len, d_model = x.shape
+        ffn_input = self.norm2(x).reshape(batch * seq_len, d_model)
+
+        # Treat every token as one row for both GEMMs.  This gives the FFN a
+        # stable [tokens, hidden] layout and lets torch.compile fuse the
+        # surrounding pointwise work when the model is compiled.
+        ffn_update = self.ffn_out(
+            F.gelu(self.ffn_in(ffn_input), approximate="none")
+        )
+
+        # Keep the residual add as one expression so the compiler can fuse it
+        # with compatible producer/consumer operations.
+        x = x + ffn_update.reshape(batch, seq_len, d_model)
+
+        # Padding semantics must match the baseline exactly: padded tokens are
+        # cleared after every Transformer block.
+        if valid_token_mask is not None:
+            x = x.masked_fill(~valid_token_mask[..., None], 0)
+        return x
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        causal: bool,
+    ) -> torch.Tensor:
+        # Keep the pre-LayerNorm attention order identical to the reference.
+        x = x + self.attention(self.norm1(x), valid_token_mask, causal)
+        return self._ffn_residual(x, valid_token_mask)
+
+
 class BaselineTransformer(nn.Module):
     def __init__(self, config: TransformerConfig) -> None:
         super().__init__()
@@ -188,14 +237,8 @@ class UserOptimizedTransformer(BaselineTransformer):
         valid_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # ====================== your codes here ======================
-        # Example optimization directions:
-        #   * torch.nn.functional.scaled_dot_product_attention
-        #   * torch.compile
-        #   * Triton/CUDA fused kernels
-        #   * fused LayerNorm / residual / FFN
-        #
-        # The default implementation calls the baseline so that this script
-        # remains directly runnable before the optimized code is inserted.
+        # Person 3 owns final assembly. Person 2's standalone
+        # OptimizedTransformerBlock is intentionally not selected here.
         return super().forward(x, valid_token_mask)
         # ============================================================
 

@@ -89,6 +89,17 @@ Own FFN and normalization optimization. Start with `torch.compile`, exact
 fusion. Do not assume that a hand-written single kernel for both large Linear
 GEMMs is faster than optimized PyTorch/cuBLAS. Custom Triton is a stretch path.
 
+Current Person 2 branch: `person2/ffn-layernorm`.
+
+Current Person 2 status: implementing a standalone, baseline-weight-compatible
+`OptimizedTransformerBlock` plus focused FFN/block tests and benchmarks. Final
+`UserOptimizedTransformer` assembly remains owned by Person 3.
+
+Local validation environment status: the NVIDIA GeForce MX350 is visible, but
+the system Python currently has a broken CPU-only PyTorch 2.3.0 installation.
+Person 2 validation will use a repository-local Python 3.10 environment with an
+official CUDA 12.6 PyTorch build that retains Pascal (`sm_61`) support.
+
 ### Person 3 — integration, profiling, and dispatch
 
 Own `UserOptimizedTransformer`, weight-copy integration, benchmark-driven
