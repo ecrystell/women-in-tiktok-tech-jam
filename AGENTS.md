@@ -34,6 +34,30 @@ The main benchmark is `torch_transformer_benchmark.py`.
 - Keep dtype, matmul precision, and TF32 settings identical for reference and
   optimized models.
 
+## Baseline profiler evidence
+
+The initial unchanged-baseline profile reported approximately:
+
+- `bmm`: 13.56% CPU total;
+- `masked_fill`: 11.81% CPU total;
+- `_softmax`: 5.22% CPU total;
+- `addmm`: 52.65% CPU total across 36 calls;
+- `copy` plus `clone`: approximately 27% CPU total.
+
+The `bmm` + `masked_fill` + `_softmax` entries total approximately 30.6%,
+supporting the SDPA direction. With the default six-layer configuration, 18 of
+the 36 `addmm` calls are the separate Q/K/V projections. Packed QKV should
+replace those 18 calls with 6 packed projections, removing 12 calls while
+leaving the 6 output projections and 12 FFN projections unchanged. This is an
+expected reduction, not a measured end-to-end result until the optimized
+attention is integrated and benchmarked.
+
+The screenshot is CPU-side profiling. It identifies operator and launch
+overhead but does not establish GPU latency, DRAM bandwidth, or FlashAttention
+backend selection. Use CUDA events or a profiler trace with CUDA activity for
+the final performance claim. Watch tensor copies and layout conversions because
+they can erase the benefit of packed QKV.
+
 ## Team ownership
 
 ### Person 1 — self-attention pipeline
