@@ -122,6 +122,11 @@ class Person2BlockTests(unittest.TestCase):
         def masked(update, residual, valid):
             return (update + residual).masked_fill(~valid[:, None], 0)
 
+        def gelu_inplace(hidden):
+            hidden.copy_(
+                torch.nn.functional.gelu(hidden, approximate="none")
+            )
+
         with (
             mock.patch.object(
                 optimized, "_supports_fast_ffn", return_value=True
@@ -129,6 +134,9 @@ class Person2BlockTests(unittest.TestCase):
             mock.patch("person2_ffn_post.load_extension"),
             mock.patch(
                 "person2_ffn_post.residual_masked", side_effect=masked
+            ),
+            mock.patch(
+                "person2_ffn_post.gelu_exact_inplace", side_effect=gelu_inplace
             ),
         ):
             self.assertTrue(optimized.prepare_fast_ffn(x, mask))
@@ -164,6 +172,7 @@ class Person2BlockTests(unittest.TestCase):
             person2_ffn_post.residual_unmasked(update, residual).shape,
             (4, 8),
         )
+        self.assertIsNone(person2_ffn_post.gelu_exact_inplace(update))
 
     def test_user_model_remains_owned_by_integration(self) -> None:
         config = TransformerConfig(1, 4, 32, 4, 64, 2, False)

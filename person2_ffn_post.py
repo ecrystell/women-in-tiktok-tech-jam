@@ -99,3 +99,16 @@ def _residual_unmasked_fake(
 ) -> torch.Tensor:
     del update
     return torch.empty_like(residual)
+
+
+@torch.library.custom_op(
+    "person2_post::gelu_exact_inplace_v1", mutates_args=("hidden",)
+)
+def gelu_exact_inplace(hidden: torch.Tensor) -> None:
+    """Apply erf-based exact GELU to an exclusively owned FP16 temporary."""
+    load_extension().gelu_exact_inplace(hidden)
+
+
+@gelu_exact_inplace.register_fake
+def _gelu_exact_inplace_fake(hidden: torch.Tensor) -> None:
+    del hidden

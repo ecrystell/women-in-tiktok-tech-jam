@@ -249,7 +249,10 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         else:
             normalized = self.norm2(x)
         ffn_input = normalized.reshape(batch * seq_len, d_model)
-        hidden = F.gelu(self.ffn_in(ffn_input), approximate="none")
+        hidden = self.ffn_in(ffn_input)
+        # ``hidden`` is a private temporary.  Reusing its storage avoids an
+        # allocator operation while retaining the erf-based exact GELU.
+        person2_ffn_post.gelu_exact_inplace(hidden)
         update = torch.addmm(
             self.ffn_out.bias,
             hidden,
