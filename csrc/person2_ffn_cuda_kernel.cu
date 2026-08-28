@@ -8,6 +8,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -72,7 +73,14 @@ std::mutex& plans_mutex() {
 MatmulPlan* create_plan(
     cublasLtHandle_t handle,
     const PlanKey& key,
-    size_t maximum_workspace_size) {
+    size_t maximum_workspace_size,
+    const void* weight,
+    const void* hidden,
+    const void* residual,
+    void* output,
+    const void* bias,
+    void* workspace,
+    cudaStream_t stream) {
   auto plan = std::make_unique<MatmulPlan>();
   const cudaDataType_t data_type = CUDA_R_16F;
   check_cublas(
@@ -104,6 +112,13 @@ MatmulPlan* create_plan(
           &epilogue,
           sizeof(epilogue)),
       "set EPILOGUE");
+  check_cublas(
+      cublasLtMatmulDescSetAttribute(
+          plan->operation,
+          CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+          &bias,
+          sizeof(bias)),
+      "set tuning bias pointer");
 
   // Row-major [tokens, dim] tensors are viewed as transposed column-major
   // matrices. This keeps D column-major so the bias epilogue is supported.
@@ -152,7 +167,8 @@ MatmulPlan* create_plan(
           sizeof(maximum_workspace_size)),
       "set maximum workspace");
 
-  cublasLtMatmulHeuristicResult_t heuristic{};
+  constexpr int maximum_algorithms = 16;
+  cublasLtMatmulHeuristicResult_t heuristics[maximum_algorithms]{};
   int returned = 0;
   check_cublas(
       cublasLtMatmulAlgoGetHeuristic(
@@ -163,14 +179,69 @@ MatmulPlan* create_plan(
           plan->residual_layout,
           plan->output_layout,
           preference,
-          1,
-          &heuristic,
+          maximum_algorithms,
+          heuristics,
           &returned),
       "cublasLtMatmulAlgoGetHeuristic");
   cublasLtMatmulPreferenceDestroy(preference);
   TORCH_CHECK(returned > 0, "cuBLASLt returned no FFN output algorithm");
-  plan->algorithm = heuristic.algo;
-  plan->workspace_size = heuristic.workspaceSize;
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  float best_ms = std::numeric_limits<float>::infinity();
+  bool found_algorithm = false;
+  for (int index = 0; index < returned; ++index) {
+    const auto& heuristic = heuristics[index];
+    if (heuristic.state != CUBLAS_STATUS_SUCCESS ||
+        heuristic.workspaceSize > maximum_workspace_size) {
+      continue;
+    }
+    cudaEvent_t start;
+    cudaEvent_t end;
+    C10_CUDA_CHECK(cudaEventCreate(&start));
+    C10_CUDA_CHECK(cudaEventCreate(&end));
+    C10_CUDA_CHECK(cudaEventRecord(start, stream));
+    cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+    constexpr int tuning_repetitions = 5;
+    for (int repetition = 0; repetition < tuning_repetitions; ++repetition) {
+      status = cublasLtMatmul(
+          handle,
+          plan->operation,
+          &alpha,
+          weight,
+          plan->weight_layout,
+          hidden,
+          plan->hidden_layout,
+          &beta,
+          residual,
+          plan->residual_layout,
+          output,
+          plan->output_layout,
+          &heuristic.algo,
+          workspace,
+          heuristic.workspaceSize,
+          stream);
+      if (status != CUBLAS_STATUS_SUCCESS) {
+        break;
+      }
+    }
+    C10_CUDA_CHECK(cudaEventRecord(end, stream));
+    C10_CUDA_CHECK(cudaEventSynchronize(end));
+    float elapsed_ms = 0.0f;
+    C10_CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, end));
+    C10_CUDA_CHECK(cudaEventDestroy(start));
+    C10_CUDA_CHECK(cudaEventDestroy(end));
+    if (status == CUBLAS_STATUS_SUCCESS) {
+      const float average_ms = elapsed_ms / tuning_repetitions;
+      if (average_ms < best_ms) {
+        best_ms = average_ms;
+        plan->algorithm = heuristic.algo;
+        plan->workspace_size = heuristic.workspaceSize;
+        found_algorithm = true;
+      }
+    }
+  }
+  TORCH_CHECK(found_algorithm, "no cuBLASLt FFN output algorithm executed");
 
   MatmulPlan* result = plan.get();
   plans().emplace(key, std::move(plan));
@@ -180,13 +251,30 @@ MatmulPlan* create_plan(
 MatmulPlan* get_plan(
     cublasLtHandle_t handle,
     const PlanKey& key,
-    size_t maximum_workspace_size) {
+    size_t maximum_workspace_size,
+    const void* weight,
+    const void* hidden,
+    const void* residual,
+    void* output,
+    const void* bias,
+    void* workspace,
+    cudaStream_t stream) {
   std::lock_guard<std::mutex> lock(plans_mutex());
   auto found = plans().find(key);
   if (found != plans().end()) {
     return found->second.get();
   }
-  return create_plan(handle, key, maximum_workspace_size);
+  return create_plan(
+      handle,
+      key,
+      maximum_workspace_size,
+      weight,
+      hidden,
+      residual,
+      output,
+      bias,
+      workspace,
+      stream);
 }
 
 __global__ void add_residual_and_zero_invalid_rows(
@@ -253,7 +341,18 @@ void ffn_out_residual_cuda(
   void* workspace = at::cuda::getCUDABlasLtWorkspace();
   const size_t maximum_workspace_size = at::cuda::getCUDABlasLtWorkspaceSize();
   const PlanKey key{device, tokens, output_dim, hidden_dim};
-  MatmulPlan* plan = get_plan(handle, key, maximum_workspace_size);
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream(device).stream();
+  MatmulPlan* plan = get_plan(
+      handle,
+      key,
+      maximum_workspace_size,
+      weight.data_ptr(),
+      hidden.data_ptr(),
+      residual.data_ptr(),
+      output.data_ptr(),
+      bias.data_ptr(),
+      workspace,
+      stream);
 
   const void* bias_pointer = bias.data_ptr();
   check_cublas(
@@ -268,7 +367,6 @@ void ffn_out_residual_cuda(
   // Preserve baseline arithmetic order: the Linear+bias result is rounded to
   // fp16 before the residual is added by the following pointwise kernel.
   const float beta = 0.0f;
-  cudaStream_t stream = c10::cuda::getCurrentCUDAStream(device).stream();
   check_cublas(
       cublasLtMatmul(
           handle,
