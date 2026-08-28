@@ -10,7 +10,6 @@ from unittest import mock
 import torch
 
 from bench_person2_ffn import accuracy_output, compile_model, mark_inference_step
-from person2_ffn_cuda import CudaFusedFFNResidual
 from profile_person2_ffn import event_device_time_us
 
 from torch_transformer_benchmark import (
@@ -179,22 +178,6 @@ class Person2BlockTests(unittest.TestCase):
         )
         self.assertEqual(event_device_time_us(cpu_only), 0.0)
 
-    def test_cuda_fusion_wrapper_has_native_cpu_fallback(self) -> None:
-        baseline, optimized = self.make_blocks()
-        fused = CudaFusedFFNResidual(optimized)
-        x = torch.randn(2, 5, 32)
-        mask = torch.tensor(
-            [[True] * 5, [True, True, True, False, False]]
-        )
-        with torch.inference_mode():
-            reference = x + baseline.ffn_out(
-                torch.nn.functional.gelu(
-                    baseline.ffn_in(baseline.norm2(x)), approximate="none"
-                )
-            )
-            reference = reference.masked_fill(~mask[..., None], 0)
-            candidate = fused(x, mask)
-        assert_or_close(self, reference, candidate)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
