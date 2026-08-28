@@ -59,58 +59,43 @@ def load_extension():
     return _EXTENSION
 
 
-@torch.library.custom_op(
-    "person2_post::residual_masked_inplace", mutates_args=("update",)
-)
-def _residual_masked_inplace(
-    update: torch.Tensor,
-    residual: torch.Tensor,
-    valid_token_mask: torch.Tensor,
-) -> None:
-    load_extension().residual_masked_out(
-        update, residual, valid_token_mask, update
-    )
-
-
-@_residual_masked_inplace.register_fake
-def _residual_masked_inplace_fake(
-    update: torch.Tensor,
-    residual: torch.Tensor,
-    valid_token_mask: torch.Tensor,
-) -> None:
-    del update, residual, valid_token_mask
-
-
+@torch.library.custom_op("person2_post::residual_masked_v2", mutates_args=())
 def residual_masked(
     update: torch.Tensor,
     residual: torch.Tensor,
     valid_token_mask: torch.Tensor,
 ) -> torch.Tensor:
-    _residual_masked_inplace(update, residual, valid_token_mask)
-    return update
+    output = torch.empty_like(residual)
+    load_extension().residual_masked_out(
+        update, residual, valid_token_mask, output
+    )
+    return output
 
 
-@torch.library.custom_op(
-    "person2_post::residual_unmasked_inplace", mutates_args=("update",)
-)
-def _residual_unmasked_inplace(
+@residual_masked.register_fake
+def _residual_masked_fake(
     update: torch.Tensor,
     residual: torch.Tensor,
-) -> None:
-    load_extension().residual_unmasked_out(update, residual, update)
+    valid_token_mask: torch.Tensor,
+) -> torch.Tensor:
+    del update, valid_token_mask
+    return torch.empty_like(residual)
 
 
-@_residual_unmasked_inplace.register_fake
-def _residual_unmasked_inplace_fake(
-    update: torch.Tensor,
-    residual: torch.Tensor,
-) -> None:
-    del update, residual
-
-
+@torch.library.custom_op("person2_post::residual_unmasked_v2", mutates_args=())
 def residual_unmasked(
     update: torch.Tensor,
     residual: torch.Tensor,
 ) -> torch.Tensor:
-    _residual_unmasked_inplace(update, residual)
-    return update
+    output = torch.empty_like(residual)
+    load_extension().residual_unmasked_out(update, residual, output)
+    return output
+
+
+@residual_unmasked.register_fake
+def _residual_unmasked_fake(
+    update: torch.Tensor,
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    del update
+    return torch.empty_like(residual)

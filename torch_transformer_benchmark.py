@@ -168,6 +168,7 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         self._norm2_weight_version = self.norm2.weight._version
         self._norm2_bias_version = self.norm2.bias._version
         self._fast_ffn_enabled = False
+        self._prepared_all_valid_mask_ptr: Optional[int] = None
         self.fast_ffn_error: Optional[str] = None
         self.register_load_state_dict_post_hook(self._refresh_after_load)
 
@@ -186,6 +187,7 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         self._norm2_weight_version = self.norm2.weight._version
         self._norm2_bias_version = self.norm2.bias._version
         self._fast_ffn_enabled = False
+        self._prepared_all_valid_mask_ptr = None
 
     def _fast_parameters_are_current(self) -> bool:
         if torch.compiler.is_compiling():
@@ -254,7 +256,13 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
             self._ffn_out_weight_nt,
         )
         residual = x.reshape(batch * seq_len, d_model)
-        if valid_token_mask is None:
+        prepared_all_valid = (
+            valid_token_mask is not None
+            and self._prepared_all_valid_mask_ptr is not None
+            and not torch.compiler.is_compiling()
+            and valid_token_mask.data_ptr() == self._prepared_all_valid_mask_ptr
+        )
+        if valid_token_mask is None or prepared_all_valid:
             output = person2_ffn_post.residual_unmasked(update, residual)
         else:
             output = person2_ffn_post.residual_masked(
@@ -279,6 +287,8 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
             return False
         try:
             person2_ffn_post.load_extension()
+            if valid_token_mask is not None and bool(valid_token_mask.all().item()):
+                self._prepared_all_valid_mask_ptr = valid_token_mask.data_ptr()
             with torch.inference_mode():
                 reference = self._ffn_residual_native(x, valid_token_mask)
                 candidate = self._ffn_residual_fast(x, valid_token_mask)

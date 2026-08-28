@@ -39,12 +39,14 @@ __global__ void residual_masked_half2(
     const half2* residual,
     const bool* valid_token_mask,
     half2* output,
-    int64_t pairs,
+    int64_t rows,
     int64_t pairs_per_row) {
-  const int64_t index =
+  const int64_t row = blockIdx.y;
+  const int64_t column =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index < pairs) {
-    output[index] = valid_token_mask[index / pairs_per_row]
+  if (row < rows && column < pairs_per_row) {
+    const int64_t index = row * pairs_per_row + column;
+    output[index] = valid_token_mask[row]
         ? __hadd2(update[index], residual[index])
         : __float2half2_rn(0.0f);
   }
@@ -81,16 +83,19 @@ void residual_masked_cuda(
   const c10::cuda::CUDAGuard guard(update.device());
   const int device = update.get_device();
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream(device).stream();
-  const int64_t pairs = update.numel() / 2;
+  const int64_t rows = update.size(0);
+  const int64_t pairs_per_row = update.size(1) / 2;
   constexpr int threads = 256;
-  const int blocks = static_cast<int>((pairs + threads - 1) / threads);
+  const dim3 blocks(
+      static_cast<unsigned int>((pairs_per_row + threads - 1) / threads),
+      static_cast<unsigned int>(rows));
   residual_masked_half2<<<blocks, threads, 0, stream>>>(
       reinterpret_cast<const half2*>(update.data_ptr<at::Half>()),
       reinterpret_cast<const half2*>(residual.data_ptr<at::Half>()),
       valid_token_mask.data_ptr<bool>(),
       reinterpret_cast<half2*>(output.data_ptr<at::Half>()),
-      pairs,
-      update.size(1) / 2);
+      rows,
+      pairs_per_row);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
