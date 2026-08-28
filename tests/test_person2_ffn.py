@@ -313,11 +313,24 @@ class Person2CudaTests(unittest.TestCase):
         self.assertTrue(bool((candidate[~mask] == 0).all().item()))
 
         if torch.cuda.get_device_capability()[0] >= 7:
+            class IsolatedFFN(torch.nn.Module):
+                def __init__(self, block: OptimizedTransformerBlock) -> None:
+                    super().__init__()
+                    self.block = block
+
+                def forward(
+                    self, value: torch.Tensor, valid: torch.Tensor
+                ) -> torch.Tensor:
+                    return self.block._ffn_residual(value, valid)
+
             compiled = torch.compile(
-                optimized, mode="default", fullgraph=True, dynamic=False
+                IsolatedFFN(optimized),
+                mode="default",
+                fullgraph=True,
+                dynamic=False,
             )
             with torch.inference_mode():
-                assert_or_close(self, reference, compiled(x, mask, False))
+                assert_or_close(self, reference, compiled(x, mask))
 
     def test_cuda_float32_and_float16(self) -> None:
         device = torch.device("cuda")
