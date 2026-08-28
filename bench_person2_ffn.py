@@ -29,6 +29,8 @@ SWEEP_SHAPES = (
     (2, 4096, 1024, 16, 4096, True, 0.0),
 )
 
+CUDA_GRAPH_MODES = frozenset(("reduce-overhead", "max-autotune"))
+
 
 class BaselineFFNResidual(nn.Module):
     """Expose only the baseline block's second pre-norm sublayer."""
@@ -187,9 +189,11 @@ def warmup(
     mask: torch.Tensor,
     iterations: int,
     device: torch.device,
+    mode: str,
 ) -> None:
     with torch.inference_mode():
         for _ in range(iterations):
+            mark_inference_step(device, mode)
             model(x, mask)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -201,6 +205,7 @@ def time_model(
     mask: torch.Tensor,
     iterations: int,
     device: torch.device,
+    mode: str,
 ) -> list[float]:
     samples: list[float] = []
     with torch.inference_mode():
@@ -209,6 +214,7 @@ def time_model(
             ends = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
             torch.cuda.synchronize(device)
             for index in range(iterations):
+                mark_inference_step(device, mode)
                 starts[index].record()
                 model(x, mask)
                 ends[index].record()
@@ -229,7 +235,32 @@ def compile_model(model: nn.Module, mode: str) -> nn.Module:
         return model
     if not hasattr(torch, "compile"):
         raise RuntimeError("this PyTorch build does not provide torch.compile")
-    return torch.compile(model, mode=mode)
+    return torch.compile(model, mode=mode, fullgraph=True, dynamic=False)
+
+
+def mark_inference_step(device: torch.device, mode: str) -> None:
+    """Mark output lifetime boundaries for TorchInductor CUDA graphs."""
+    if device.type != "cuda" or mode not in CUDA_GRAPH_MODES:
+        return
+    compiler = getattr(torch, "compiler", None)
+    marker = getattr(compiler, "cudagraph_mark_step_begin", None)
+    if marker is None:
+        raise RuntimeError(
+            "this PyTorch build lacks torch.compiler.cudagraph_mark_step_begin"
+        )
+    marker()
+
+
+def accuracy_output(
+    model: nn.Module,
+    x: torch.Tensor,
+    mask: torch.Tensor,
+    device: torch.device,
+    mode: str,
+) -> torch.Tensor:
+    """Return an owned result that survives the next CUDA-graph replay."""
+    mark_inference_step(device, mode)
+    return model(x, mask).clone()
 
 
 def make_models(
@@ -273,8 +304,8 @@ def run_case(
         x, mask = make_input(case, device, dtype, args.seed)
 
         with torch.inference_mode():
-            reference_output = baseline(x, mask)
-            candidate_output = candidate(x, mask)
+            reference_output = accuracy_output(baseline, x, mask, device, mode)
+            candidate_output = accuracy_output(candidate, x, mask, device, mode)
         accuracy = compare(
             reference_output,
             candidate_output,
@@ -290,24 +321,24 @@ def run_case(
             print("timing skipped because strict accuracy validation failed")
             return
 
-        warmup(baseline, x, mask, args.warmup, device)
-        warmup(candidate, x, mask, args.warmup, device)
+        warmup(baseline, x, mask, args.warmup, device, mode)
+        warmup(candidate, x, mask, args.warmup, device, mode)
         baseline_samples: list[float] = []
         candidate_samples: list[float] = []
         for round_index in range(args.rounds):
             if round_index % 2 == 0:
                 baseline_samples.extend(
-                    time_model(baseline, x, mask, args.repeats, device)
+                    time_model(baseline, x, mask, args.repeats, device, mode)
                 )
                 candidate_samples.extend(
-                    time_model(candidate, x, mask, args.repeats, device)
+                    time_model(candidate, x, mask, args.repeats, device, mode)
                 )
             else:
                 candidate_samples.extend(
-                    time_model(candidate, x, mask, args.repeats, device)
+                    time_model(candidate, x, mask, args.repeats, device, mode)
                 )
                 baseline_samples.extend(
-                    time_model(baseline, x, mask, args.repeats, device)
+                    time_model(baseline, x, mask, args.repeats, device, mode)
                 )
 
         baseline_median = statistics.median(baseline_samples)
@@ -369,7 +400,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--compile-mode",
-        choices=("eager", "default", "reduce-overhead", "max-autotune"),
+        choices=(
+            "eager",
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        ),
         default="eager",
     )
     parser.add_argument("--all-compile-modes", action="store_true")
@@ -407,7 +444,13 @@ def main() -> int:
 
     scopes = ("isolated", "full") if args.scope == "both" else (args.scope,)
     modes = (
-        ("eager", "default", "reduce-overhead", "max-autotune")
+        (
+            "eager",
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        )
         if args.all_compile_modes
         else (args.compile_mode,)
     )

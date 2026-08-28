@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import inspect
 import unittest
+from unittest import mock
 
 import torch
+
+from bench_person2_ffn import accuracy_output, compile_model, mark_inference_step
 
 from torch_transformer_benchmark import (
     BaselineTransformerBlock,
@@ -122,6 +125,44 @@ class Person2BlockTests(unittest.TestCase):
             reference = reference.masked_fill(~mask[..., None], 0)
             candidate = optimized._ffn_residual(x, mask)
         assert_or_close(self, reference, candidate)
+
+    def test_accuracy_output_owns_storage(self) -> None:
+        class IdentityWithMask(torch.nn.Module):
+            def forward(
+                self, value: torch.Tensor, _mask: torch.Tensor
+            ) -> torch.Tensor:
+                return value
+
+        x = torch.randn(2, 3, 4)
+        mask = torch.ones(2, 3, dtype=torch.bool)
+        output = accuracy_output(
+            IdentityWithMask(), x, mask, torch.device("cpu"), "eager"
+        )
+        self.assertTrue(torch.equal(output, x))
+        self.assertNotEqual(output.data_ptr(), x.data_ptr())
+
+    def test_cuda_graph_step_marker_is_mode_gated(self) -> None:
+        with mock.patch.object(
+            torch.compiler, "cudagraph_mark_step_begin"
+        ) as marker:
+            mark_inference_step(torch.device("cuda"), "reduce-overhead")
+            marker.assert_called_once_with()
+            marker.reset_mock()
+            mark_inference_step(torch.device("cuda"), "default")
+            marker.assert_not_called()
+            mark_inference_step(torch.device("cpu"), "reduce-overhead")
+            marker.assert_not_called()
+
+    def test_compile_model_requests_static_fullgraph(self) -> None:
+        module = torch.nn.Identity()
+        compiled = object()
+        with mock.patch.object(
+            torch, "compile", return_value=compiled
+        ) as compiler:
+            self.assertIs(compile_model(module, "default"), compiled)
+        compiler.assert_called_once_with(
+            module, mode="default", fullgraph=True, dynamic=False
+        )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
