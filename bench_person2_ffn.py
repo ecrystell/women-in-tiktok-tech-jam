@@ -268,6 +268,7 @@ def make_models(
     scope: str,
     device: torch.device,
     dtype: torch.dtype,
+    candidate_kind: str = "pytorch",
 ) -> tuple[nn.Module, nn.Module]:
     baseline_block = BaselineTransformerBlock(
         case.d_model, case.heads, case.ffn_dim
@@ -278,6 +279,17 @@ def make_models(
     optimized_block.load_state_dict(baseline_block.state_dict(), strict=True)
     baseline_block = baseline_block.to(device=device, dtype=dtype).eval()
     optimized_block = optimized_block.to(device=device, dtype=dtype).eval()
+
+    if candidate_kind == "cuda-extension":
+        from person2_ffn_cuda import CudaFusedFFNResidual, CudaFusedFullBlock
+
+        if scope == "isolated":
+            return BaselineFFNResidual(baseline_block), CudaFusedFFNResidual(
+                optimized_block
+            )
+        return FullBlock(baseline_block, case.causal), CudaFusedFullBlock(
+            optimized_block, case.causal
+        )
 
     if scope == "isolated":
         return BaselineFFNResidual(baseline_block), OptimizedFFNResidual(
@@ -298,7 +310,9 @@ def run_case(
 ) -> None:
     print(f"\n[{scope} | {mode}] {case.label}")
     try:
-        baseline, candidate = make_models(case, scope, device, dtype)
+        baseline, candidate = make_models(
+            case, scope, device, dtype, args.candidate
+        )
         baseline = compile_model(baseline, mode)
         candidate = compile_model(candidate, mode)
         x, mask = make_input(case, device, dtype, args.seed)
@@ -399,6 +413,11 @@ def parse_args() -> argparse.Namespace:
         "--scope", choices=("isolated", "full", "both"), default="isolated"
     )
     parser.add_argument(
+        "--candidate",
+        choices=("pytorch", "cuda-extension"),
+        default="pytorch",
+    )
+    parser.add_argument(
         "--compile-mode",
         choices=(
             "eager",
@@ -435,6 +454,7 @@ def main() -> int:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
     print(f"torch={torch.__version__} | device={device} | dtype={dtype}")
+    print(f"candidate={args.candidate}")
     if device.type == "cuda":
         print(
             f"gpu={torch.cuda.get_device_name(device)} | "
