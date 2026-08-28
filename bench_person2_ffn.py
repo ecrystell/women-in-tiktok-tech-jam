@@ -333,12 +333,18 @@ def run_case(
                 getattr(block, "_compact_ffn_enabled", False)
             )
             compact_reason = getattr(block, "compact_ffn_error", None)
+            all_valid_enabled = getattr(block, "_all_valid_mask", None) is mask
             print(
                 f"fast_ffn={'ENABLED' if enabled else 'FALLBACK'}"
                 + (f" | reason={reason}" if reason else "")
                 + (
                     " | valid_row_compaction=ENABLED"
                     if compact_enabled
+                    else ""
+                )
+                + (
+                    " | all_valid_mask_fastpath=ENABLED"
+                    if all_valid_enabled
                     else ""
                 )
                 + (

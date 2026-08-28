@@ -172,6 +172,8 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         self._compact_mask: Optional[torch.Tensor] = None
         self._compact_mask_version = -1
         self._compact_valid_rows: Optional[torch.Tensor] = None
+        self._all_valid_mask: Optional[torch.Tensor] = None
+        self._all_valid_mask_version = -1
         self.fast_ffn_error: Optional[str] = None
         self.compact_ffn_error: Optional[str] = None
         self.register_load_state_dict_post_hook(self._refresh_after_load)
@@ -195,6 +197,8 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         self._compact_mask = None
         self._compact_mask_version = -1
         self._compact_valid_rows = None
+        self._all_valid_mask = None
+        self._all_valid_mask_version = -1
 
     def _fast_parameters_are_current(self) -> bool:
         if torch.compiler.is_compiling():
@@ -258,7 +262,9 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         ffn_input = normalized.reshape(batch * seq_len, d_model)
         preactivation = self.ffn_in(ffn_input)
         residual = x.reshape(batch * seq_len, d_model)
-        if valid_token_mask is None:
+        if valid_token_mask is None or self._all_valid_mask_is_current(
+            valid_token_mask
+        ):
             output = person2_ffn_post.exact_gelu_down_unmasked(
                 preactivation,
                 self._ffn_out_weight_nt,
@@ -274,6 +280,18 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
                 valid_token_mask.reshape(-1),
             )
         return output.reshape(batch, seq_len, d_model)
+
+    def _all_valid_mask_is_current(
+        self,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> bool:
+        if self._all_valid_mask is None or torch.compiler.is_compiling():
+            return False
+        return (
+            valid_token_mask is self._all_valid_mask
+            and valid_token_mask is not None
+            and valid_token_mask._version == self._all_valid_mask_version
+        )
 
     def _ffn_residual_compact(
         self,
@@ -359,7 +377,29 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
                 valid_rows = torch.nonzero(
                     valid_token_mask.reshape(-1), as_tuple=False
                 ).flatten()
-                if 0 < valid_rows.numel() < valid_token_mask.numel():
+                if valid_rows.numel() == valid_token_mask.numel():
+                    self._all_valid_mask = valid_token_mask
+                    self._all_valid_mask_version = valid_token_mask._version
+                    with torch.inference_mode():
+                        unmasked_candidate = self._ffn_residual_fast(
+                            x, valid_token_mask
+                        )
+                    unmasked_opt = unmasked_candidate.float()
+                    unmasked_error = (unmasked_opt - ref).abs()
+                    unmasked_passed = torch.isfinite(ref) & torch.isfinite(
+                        unmasked_opt
+                    )
+                    unmasked_passed &= (unmasked_error <= 0.001) | (
+                        unmasked_error <= 0.01 * ref.abs()
+                    )
+                    if not bool(unmasked_passed.all().item()):
+                        self.compact_ffn_error = (
+                            "strict all-valid preflight failed: "
+                            f"max_abs={unmasked_error.max().item():.6g}, "
+                            f"failed={int((~unmasked_passed).sum().item())}"
+                        )
+                        self._all_valid_mask = None
+                elif 0 < valid_rows.numel() < valid_token_mask.numel():
                     self._compact_valid_rows = valid_rows
                     self._compact_mask = valid_token_mask
                     self._compact_mask_version = valid_token_mask._version

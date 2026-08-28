@@ -95,6 +95,7 @@ class Person2BlockTests(unittest.TestCase):
         self.assertFalse(optimized._compact_ffn_enabled)
         self.assertIsNone(optimized._compact_mask)
         self.assertIsNone(optimized._compact_valid_rows)
+        self.assertIsNone(optimized._all_valid_mask)
 
     def test_fast_ffn_cpu_and_build_failure_fall_back(self) -> None:
         _baseline, optimized = self.make_blocks()
@@ -166,6 +167,16 @@ class Person2BlockTests(unittest.TestCase):
         self.assertFalse(optimized._compact_mask_is_current(mask.clone()))
         mask.logical_not_()
         self.assertFalse(optimized._compact_mask_is_current(mask))
+
+    def test_all_valid_mask_guard_rejects_changed_or_mutated_masks(self) -> None:
+        _baseline, optimized = self.make_blocks()
+        mask = torch.ones(2, 3, dtype=torch.bool)
+        optimized._all_valid_mask = mask
+        optimized._all_valid_mask_version = mask._version
+        self.assertTrue(optimized._all_valid_mask_is_current(mask))
+        self.assertFalse(optimized._all_valid_mask_is_current(mask.clone()))
+        mask[0, 0] = False
+        self.assertFalse(optimized._all_valid_mask_is_current(mask))
 
     def test_fast_post_custom_ops_have_fake_shapes(self) -> None:
         from torch._subclasses.fake_tensor import FakeTensorMode
