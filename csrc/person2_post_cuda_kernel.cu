@@ -9,6 +9,106 @@
 
 namespace {
 
+struct WelfordState {
+  float mean;
+  float m2;
+  int count;
+};
+
+__device__ __forceinline__ WelfordState welford_combine(
+    WelfordState left,
+    WelfordState right) {
+  if (right.count == 0) {
+    return left;
+  }
+  if (left.count == 0) {
+    return right;
+  }
+  const float delta = right.mean - left.mean;
+  const int count = left.count + right.count;
+  const float right_fraction =
+      static_cast<float>(right.count) / static_cast<float>(count);
+  left.mean += delta * right_fraction;
+  left.m2 += right.m2 + delta * delta *
+      (static_cast<float>(left.count) * right.count / count);
+  left.count = count;
+  return left;
+}
+
+__device__ __forceinline__ WelfordState warp_welford(WelfordState value) {
+  constexpr unsigned mask = 0xffffffffu;
+  const int lane = threadIdx.x & 31;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    WelfordState other{
+        __shfl_down_sync(mask, value.mean, offset),
+        __shfl_down_sync(mask, value.m2, offset),
+        __shfl_down_sync(mask, value.count, offset)};
+    if (lane < offset) {
+      value = welford_combine(value, other);
+    }
+  }
+  return value;
+}
+
+__global__ void layer_norm_identity_half2(
+    const half2* input,
+    half2* output,
+    int64_t pairs_per_row,
+    float eps) {
+  const int64_t row = blockIdx.x;
+  WelfordState local{0.0f, 0.0f, 0};
+  for (int64_t pair = threadIdx.x; pair < pairs_per_row;
+       pair += blockDim.x) {
+    const half2 packed = input[row * pairs_per_row + pair];
+    const float values[2] = {
+        __half2float(__low2half(packed)),
+        __half2float(__high2half(packed))};
+#pragma unroll
+    for (int index = 0; index < 2; ++index) {
+      const WelfordState sample{values[index], 0.0f, 1};
+      local = welford_combine(local, sample);
+    }
+  }
+
+  local = warp_welford(local);
+  __shared__ float warp_means[8];
+  __shared__ float warp_m2[8];
+  __shared__ int warp_counts[8];
+  __shared__ float row_mean;
+  __shared__ float row_rstd;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  if (lane == 0) {
+    warp_means[warp] = local.mean;
+    warp_m2[warp] = local.m2;
+    warp_counts[warp] = local.count;
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    WelfordState block = lane < 8
+        ? WelfordState{warp_means[lane], warp_m2[lane], warp_counts[lane]}
+        : WelfordState{0.0f, 0.0f, 0};
+    block = warp_welford(block);
+    if (lane == 0) {
+      row_mean = block.mean;
+      row_rstd = rsqrtf(block.m2 / block.count + eps);
+    }
+  }
+  __syncthreads();
+
+  for (int64_t pair = threadIdx.x; pair < pairs_per_row;
+       pair += blockDim.x) {
+    const half2 packed = input[row * pairs_per_row + pair];
+    const float low =
+        (__half2float(__low2half(packed)) - row_mean) * row_rstd;
+    const float high =
+        (__half2float(__high2half(packed)) - row_mean) * row_rstd;
+    output[row * pairs_per_row + pair] =
+        __halves2half2(__float2half_rn(low), __float2half_rn(high));
+  }
+}
+
 void validate_common(
     const torch::Tensor& update,
     const torch::Tensor& residual,
@@ -120,6 +220,30 @@ __global__ void residual_unmasked_half8(
 }
 
 }  // namespace
+
+torch::Tensor layer_norm_identity_cuda(
+    const torch::Tensor& input,
+    double eps) {
+  TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+  TORCH_CHECK(input.scalar_type() == torch::kFloat16, "input must be float16");
+  TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+  TORCH_CHECK(input.dim() == 3, "input must have shape [batch, sequence, model]");
+  TORCH_CHECK(input.size(2) % 2 == 0, "model dimension must be even");
+  const c10::cuda::CUDAGuard guard(input.device());
+  const int device = input.get_device();
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream(device).stream();
+  auto output = torch::empty_like(input);
+  const int64_t rows = input.numel() / input.size(2);
+  const int64_t pairs_per_row = input.size(2) / 2;
+  constexpr int threads = 256;
+  layer_norm_identity_half2<<<static_cast<int>(rows), threads, 0, stream>>>(
+      reinterpret_cast<const half2*>(input.data_ptr<at::Half>()),
+      reinterpret_cast<half2*>(output.data_ptr<at::Half>()),
+      pairs_per_row,
+      static_cast<float>(eps));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return output;
+}
 
 void residual_masked_cuda(
     const torch::Tensor& update,
