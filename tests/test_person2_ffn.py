@@ -72,6 +72,99 @@ class Person2BlockTests(unittest.TestCase):
         self.assertEqual(set(baseline.state_dict()), set(optimized.state_dict()))
         optimized.load_state_dict(baseline.state_dict(), strict=True)
 
+    def test_fast_ffn_cache_is_nonpersistent_and_refreshes(self) -> None:
+        baseline, optimized = self.make_blocks()
+        self.assertNotIn("_ffn_out_weight_nt", optimized.state_dict())
+        self.assertTrue(
+            torch.equal(
+                optimized._ffn_out_weight_nt,
+                optimized.ffn_out.weight.detach().t().contiguous(),
+            )
+        )
+        with torch.no_grad():
+            baseline.ffn_out.weight.add_(0.125)
+            baseline.norm2.weight[0] = 0.75
+        optimized.load_state_dict(baseline.state_dict(), strict=True)
+        self.assertTrue(
+            torch.equal(
+                optimized._ffn_out_weight_nt,
+                optimized.ffn_out.weight.detach().t().contiguous(),
+            )
+        )
+        self.assertFalse(optimized._norm2_affine_is_identity)
+
+    def test_fast_ffn_cpu_and_build_failure_fall_back(self) -> None:
+        _baseline, optimized = self.make_blocks()
+        x = torch.randn(2, 5, 32)
+        mask = torch.ones(2, 5, dtype=torch.bool)
+        self.assertFalse(optimized.prepare_fast_ffn(x, mask))
+        self.assertIn("unsupported", optimized.fast_ffn_error or "")
+
+        optimized = self.make_blocks()[1]
+        with (
+            mock.patch.object(
+                optimized, "_supports_fast_ffn", return_value=True
+            ),
+            mock.patch(
+                "person2_ffn_post.load_extension",
+                side_effect=RuntimeError("simulated build failure"),
+            ),
+        ):
+            self.assertFalse(optimized.prepare_fast_ffn(x, mask))
+        self.assertIn("simulated build failure", optimized.fast_ffn_error or "")
+        self.assertFalse(optimized._fast_ffn_enabled)
+
+    def test_fast_ffn_preflight_and_repeated_calls(self) -> None:
+        baseline, optimized = self.make_blocks()
+        x = torch.randn(2, 5, 32)
+        mask = torch.tensor([[True] * 5, [True, True, True, False, False]])
+
+        def masked(update, residual, valid):
+            return (update + residual).masked_fill(~valid[:, None], 0)
+
+        with (
+            mock.patch.object(
+                optimized, "_supports_fast_ffn", return_value=True
+            ),
+            mock.patch("person2_ffn_post.load_extension"),
+            mock.patch(
+                "person2_ffn_post.residual_masked", side_effect=masked
+            ),
+        ):
+            self.assertTrue(optimized.prepare_fast_ffn(x, mask))
+            with torch.inference_mode():
+                reference = baseline._ffn_residual_native(x, mask) if hasattr(
+                    baseline, "_ffn_residual_native"
+                ) else x + baseline.ffn_out(
+                    torch.nn.functional.gelu(
+                        baseline.ffn_in(baseline.norm2(x)), approximate="none"
+                    )
+                )
+                reference = reference.masked_fill(~mask[..., None], 0)
+                first = optimized._ffn_residual_fast(x, mask)
+                second = optimized._ffn_residual_fast(x, mask)
+        assert_or_close(self, reference, first)
+        self.assertTrue(torch.equal(first, second))
+        self.assertNotEqual(first.data_ptr(), second.data_ptr())
+
+    def test_fast_post_custom_ops_have_fake_shapes(self) -> None:
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        import person2_ffn_post
+
+        mode = FakeTensorMode()
+        update = mode.from_tensor(torch.empty(4, 8))
+        residual = mode.from_tensor(torch.empty(4, 8))
+        mask = mode.from_tensor(torch.ones(4, dtype=torch.bool))
+        self.assertEqual(
+            person2_ffn_post.residual_masked(update, residual, mask).shape,
+            (4, 8),
+        )
+        self.assertEqual(
+            person2_ffn_post.residual_unmasked(update, residual).shape,
+            (4, 8),
+        )
+
     def test_user_model_remains_owned_by_integration(self) -> None:
         config = TransformerConfig(1, 4, 32, 4, 64, 2, False)
         model = UserOptimizedTransformer(config)
@@ -192,6 +285,40 @@ class Person2BlockTests(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
 class Person2CudaTests(unittest.TestCase):
+    def test_cuda_fast_ffn_extension_and_compile(self) -> None:
+        from torch.utils.cpp_extension import CUDA_HOME
+
+        if CUDA_HOME is None:
+            self.skipTest("a CUDA toolkit is unavailable for extension build")
+        device = torch.device("cuda")
+        baseline, optimized = Person2BlockTests.make_blocks(
+            device, torch.float16
+        )
+        x = torch.randn(2, 16, 32, device=device, dtype=torch.float16)
+        mask = torch.tensor(
+            [[True] * 16, [True] * 12 + [False] * 4], device=device
+        )
+        self.assertTrue(
+            optimized.prepare_fast_ffn(x, mask), optimized.fast_ffn_error
+        )
+        with torch.inference_mode():
+            reference = x + baseline.ffn_out(
+                torch.nn.functional.gelu(
+                    baseline.ffn_in(baseline.norm2(x)), approximate="none"
+                )
+            )
+            reference = reference.masked_fill(~mask[..., None], 0)
+            candidate = optimized._ffn_residual(x, mask)
+        assert_or_close(self, reference, candidate)
+        self.assertTrue(bool((candidate[~mask] == 0).all().item()))
+
+        if torch.cuda.get_device_capability()[0] >= 7:
+            compiled = torch.compile(
+                optimized, mode="default", fullgraph=True, dynamic=False
+            )
+            with torch.inference_mode():
+                assert_or_close(self, reference, compiled(x, mask, False))
+
     def test_cuda_float32_and_float16(self) -> None:
         device = torch.device("cuda")
         for dtype in (torch.float32, torch.float16):
