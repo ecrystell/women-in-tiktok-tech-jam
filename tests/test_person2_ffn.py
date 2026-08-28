@@ -74,7 +74,14 @@ class Person2BlockTests(unittest.TestCase):
 
     def test_fast_ffn_cache_is_nonpersistent_and_refreshes(self) -> None:
         baseline, optimized = self.make_blocks()
+        self.assertNotIn("_ffn_in_weight_nt", optimized.state_dict())
         self.assertNotIn("_ffn_out_weight_nt", optimized.state_dict())
+        self.assertTrue(
+            torch.equal(
+                optimized._ffn_in_weight_nt,
+                optimized.ffn_in.weight.detach().t().contiguous(),
+            )
+        )
         self.assertTrue(
             torch.equal(
                 optimized._ffn_out_weight_nt,
@@ -82,9 +89,16 @@ class Person2BlockTests(unittest.TestCase):
             )
         )
         with torch.no_grad():
+            baseline.ffn_in.weight.sub_(0.0625)
             baseline.ffn_out.weight.add_(0.125)
             baseline.norm2.weight[0] = 0.75
         optimized.load_state_dict(baseline.state_dict(), strict=True)
+        self.assertTrue(
+            torch.equal(
+                optimized._ffn_in_weight_nt,
+                optimized.ffn_in.weight.detach().t().contiguous(),
+            )
+        )
         self.assertTrue(
             torch.equal(
                 optimized._ffn_out_weight_nt,

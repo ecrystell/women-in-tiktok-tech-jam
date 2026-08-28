@@ -159,11 +159,17 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
     def __init__(self, d_model: int, num_heads: int, ffn_dim: int) -> None:
         super().__init__(d_model, num_heads, ffn_dim)
         self.register_buffer(
+            "_ffn_in_weight_nt",
+            self.ffn_in.weight.detach().t().contiguous(),
+            persistent=False,
+        )
+        self.register_buffer(
             "_ffn_out_weight_nt",
             self.ffn_out.weight.detach().t().contiguous(),
             persistent=False,
         )
         self._norm2_affine_is_identity = True
+        self._ffn_in_weight_version = self.ffn_in.weight._version
         self._ffn_out_weight_version = self.ffn_out.weight._version
         self._norm2_weight_version = self.norm2.weight._version
         self._norm2_bias_version = self.norm2.bias._version
@@ -177,11 +183,13 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
 
     @torch.no_grad()
     def _refresh_fast_ffn_state(self) -> None:
+        self._ffn_in_weight_nt = self.ffn_in.weight.detach().t().contiguous()
         self._ffn_out_weight_nt = self.ffn_out.weight.detach().t().contiguous()
         self._norm2_affine_is_identity = bool(
             torch.equal(self.norm2.weight, torch.ones_like(self.norm2.weight))
             and torch.count_nonzero(self.norm2.bias).item() == 0
         )
+        self._ffn_in_weight_version = self.ffn_in.weight._version
         self._ffn_out_weight_version = self.ffn_out.weight._version
         self._norm2_weight_version = self.norm2.weight._version
         self._norm2_bias_version = self.norm2.bias._version
@@ -191,7 +199,8 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         if torch.compiler.is_compiling():
             return True
         current = (
-            self._ffn_out_weight_version == self.ffn_out.weight._version
+            self._ffn_in_weight_version == self.ffn_in.weight._version
+            and self._ffn_out_weight_version == self.ffn_out.weight._version
             and self._norm2_weight_version == self.norm2.weight._version
             and self._norm2_bias_version == self.norm2.bias._version
         )
@@ -247,7 +256,11 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         else:
             normalized = self.norm2(x)
         ffn_input = normalized.reshape(batch * seq_len, d_model)
-        preactivation = self.ffn_in(ffn_input)
+        preactivation = torch.addmm(
+            self.ffn_in.bias,
+            ffn_input,
+            self._ffn_in_weight_nt,
+        )
         residual = x.reshape(batch * seq_len, d_model)
         if valid_token_mask is None:
             output = person2_ffn_post.exact_gelu_down_unmasked(
