@@ -12,5 +12,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def(
       "ffn_out_residual_out",
       &ffn_out_residual_cuda,
-      "cuBLASLt FFN output projection with residual, bias, and row masking");
+      "cuBLASLt FFN output plus fused residual add and row masking");
 }

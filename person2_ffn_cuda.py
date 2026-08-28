@@ -83,7 +83,7 @@ def _ffn_out_residual_fake(
 
 
 class CudaFusedFFNResidual(nn.Module):
-    """Use native norm/first GEMM/exact GELU and a fused output projection."""
+    """Fuse post-projection residual addition with invalid-row zeroing."""
 
     def __init__(self, block: nn.Module) -> None:
         super().__init__()

@@ -189,15 +189,18 @@ MatmulPlan* get_plan(
   return create_plan(handle, key, maximum_workspace_size);
 }
 
-__global__ void zero_invalid_rows(
+__global__ void add_residual_and_zero_invalid_rows(
     half* output,
+    const half* residual,
     const bool* valid_token_mask,
     int64_t elements,
     int64_t output_dim) {
   const int64_t index =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index < elements && !valid_token_mask[index / output_dim]) {
-    output[index] = __float2half(0.0f);
+  if (index < elements) {
+    output[index] = valid_token_mask[index / output_dim]
+        ? __hadd(output[index], residual[index])
+        : __float2half(0.0f);
   }
 }
 
@@ -262,7 +265,9 @@ void ffn_out_residual_cuda(
       "set bias pointer");
 
   const float alpha = 1.0f;
-  const float beta = 1.0f;
+  // Preserve baseline arithmetic order: the Linear+bias result is rounded to
+  // fp16 before the residual is added by the following pointwise kernel.
+  const float beta = 0.0f;
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream(device).stream();
   check_cublas(
       cublasLtMatmul(
@@ -287,8 +292,9 @@ void ffn_out_residual_cuda(
   const int64_t elements = output.numel();
   const int threads = 256;
   const int blocks = static_cast<int>((elements + threads - 1) / threads);
-  zero_invalid_rows<<<blocks, threads, 0, stream>>>(
+  add_residual_and_zero_invalid_rows<<<blocks, threads, 0, stream>>>(
       reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(residual.data_ptr<at::Half>()),
       valid_token_mask.data_ptr<bool>(),
       elements,
       output_dim);
