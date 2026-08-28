@@ -268,6 +268,7 @@ def make_models(
     scope: str,
     device: torch.device,
     dtype: torch.dtype,
+    candidate_kind: str = "pytorch",
 ) -> tuple[nn.Module, nn.Module]:
     baseline_block = BaselineTransformerBlock(
         case.d_model, case.heads, case.ffn_dim
@@ -278,6 +279,20 @@ def make_models(
     optimized_block.load_state_dict(baseline_block.state_dict(), strict=True)
     baseline_block = baseline_block.to(device=device, dtype=dtype).eval()
     optimized_block = optimized_block.to(device=device, dtype=dtype).eval()
+
+    if candidate_kind == "article-fusion":
+        from person2_ffn_fusion import (
+            ArticleFusedFFNResidual,
+            ArticleFusedFullBlock,
+        )
+
+        if scope == "isolated":
+            return BaselineFFNResidual(baseline_block), ArticleFusedFFNResidual(
+                optimized_block
+            )
+        return FullBlock(baseline_block, case.causal), ArticleFusedFullBlock(
+            optimized_block, case.causal
+        )
 
     if scope == "isolated":
         return BaselineFFNResidual(baseline_block), OptimizedFFNResidual(
@@ -298,10 +313,22 @@ def run_case(
 ) -> None:
     print(f"\n[{scope} | {mode}] {case.label}")
     try:
-        baseline, candidate = make_models(case, scope, device, dtype)
+        baseline, candidate = make_models(
+            case, scope, device, dtype, args.candidate
+        )
+        x, mask = make_input(case, device, dtype, args.seed)
+        prepare = getattr(candidate, "prepare", None)
+        if prepare is not None:
+            enabled = prepare(x, mask)
+            reason = getattr(candidate, "last_error", None)
+            if reason is None and hasattr(candidate, "ffn"):
+                reason = getattr(candidate.ffn, "last_error", None)
+            print(
+                f"fusion_preflight={'ENABLED' if enabled else 'FALLBACK'}"
+                + (f" | reason={reason}" if reason else "")
+            )
         baseline = compile_model(baseline, mode)
         candidate = compile_model(candidate, mode)
-        x, mask = make_input(case, device, dtype, args.seed)
 
         with torch.inference_mode():
             reference_output = accuracy_output(baseline, x, mask, device, mode)
@@ -399,6 +426,11 @@ def parse_args() -> argparse.Namespace:
         "--scope", choices=("isolated", "full", "both"), default="isolated"
     )
     parser.add_argument(
+        "--candidate",
+        choices=("pytorch", "article-fusion"),
+        default="pytorch",
+    )
+    parser.add_argument(
         "--compile-mode",
         choices=(
             "eager",
@@ -416,7 +448,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=100)
-    parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--rounds", type=int, default=5)
     return parser.parse_args()
 
 
@@ -435,6 +467,7 @@ def main() -> int:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
     print(f"torch={torch.__version__} | device={device} | dtype={dtype}")
+    print(f"candidate={args.candidate}")
     if device.type == "cuda":
         print(
             f"gpu={torch.cuda.get_device_name(device)} | "

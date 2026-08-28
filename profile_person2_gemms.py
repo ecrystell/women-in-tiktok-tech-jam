@@ -44,6 +44,17 @@ class GemmResult:
     kernel_names: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class AlgorithmResult:
+    case: str
+    algorithm_index: int
+    correctness_passed: bool
+    max_abs: float
+    failed_elements: int
+    median_ms: float | None
+    p90_ms: float | None
+
+
 def gemm_shapes(case: Case) -> tuple[GemmShape, GemmShape]:
     tokens = case.batch * case.seq_len
     return (
@@ -130,6 +141,111 @@ def print_result(result: GemmResult) -> None:
     print("kernels=" + (", ".join(result.kernel_names) or "<none>"))
 
 
+def measure_cublaslt_algorithms(
+    case: Case,
+    block: BaselineTransformerBlock,
+    args: argparse.Namespace,
+) -> list[AlgorithmResult]:
+    """Validate every returned heuristic before reporting its latency."""
+    from person2_ffn_fusion import load_down_extension
+
+    extension = load_down_extension()
+    device = block.ffn_out.weight.device
+    calibrations = []
+    algorithm_count = None
+    for seed in (args.seed, args.seed + 1, args.seed + 2):
+        x, mask = make_input(case, device, torch.float16, seed)
+        tokens = case.batch * case.seq_len
+        with torch.inference_mode():
+            normalized = block.norm2(x).reshape(tokens, case.d_model)
+            hidden = F.gelu(block.ffn_in(normalized), approximate="none").contiguous()
+            residual = x.reshape(tokens, case.d_model).contiguous()
+            reference = residual + F.linear(
+                hidden, block.ffn_out.weight, block.ffn_out.bias
+            )
+            reference = reference.masked_fill(~mask.reshape(-1, 1), 0)
+        output = torch.empty_like(residual)
+        if algorithm_count is None:
+            algorithm_count = extension.down_algorithm_count(
+                hidden,
+                residual,
+                block.ffn_out.weight,
+                block.ffn_out.bias,
+                output,
+            )
+        calibrations.append((hidden, residual, mask.reshape(-1), reference, output))
+
+    results: list[AlgorithmResult] = []
+    assert algorithm_count is not None
+    for algorithm_index in range(algorithm_count):
+        max_abs = 0.0
+        failed = 0
+        for hidden, residual, mask, reference, output in calibrations:
+            extension.down_residual_masked_algorithm_out(
+                hidden,
+                residual,
+                block.ffn_out.weight,
+                block.ffn_out.bias,
+                mask,
+                algorithm_index,
+                output,
+            )
+            error = (output.float() - reference.float()).abs()
+            passed = torch.isfinite(output) & torch.isfinite(reference)
+            passed &= (error <= args.atol) | (
+                error <= args.rtol * reference.float().abs()
+            )
+            max_abs = max(max_abs, float(error.max().item()))
+            failed += int((~passed).sum().item())
+
+        median_ms = None
+        p90_ms = None
+        if failed == 0:
+            hidden, residual, mask, _reference, output = calibrations[0]
+
+            def operation() -> torch.Tensor:
+                extension.down_residual_masked_algorithm_out(
+                    hidden,
+                    residual,
+                    block.ffn_out.weight,
+                    block.ffn_out.bias,
+                    mask,
+                    algorithm_index,
+                    output,
+                )
+                return output
+
+            with torch.inference_mode():
+                for _ in range(args.warmup):
+                    operation()
+            torch.cuda.synchronize()
+            samples = cuda_event_samples(operation, args.repeats)
+            median_ms = statistics.median(samples)
+            p90_ms = percentile(samples, 0.90)
+
+        result = AlgorithmResult(
+            case=case.label,
+            algorithm_index=algorithm_index,
+            correctness_passed=failed == 0,
+            max_abs=max_abs,
+            failed_elements=failed,
+            median_ms=median_ms,
+            p90_ms=p90_ms,
+        )
+        results.append(result)
+        timing = (
+            f"median={median_ms:.4f} ms p90={p90_ms:.4f} ms"
+            if median_ms is not None and p90_ms is not None
+            else "timing=SKIPPED"
+        )
+        print(
+            f"cuBLASLt algorithm={algorithm_index} | "
+            f"accuracy={'PASS' if failed == 0 else 'FAIL'} | "
+            f"max_abs={max_abs:.6g} | failed={failed} | {timing}"
+        )
+    return results
+
+
 def cases_from_args(args: argparse.Namespace) -> Iterable[Case]:
     if args.sweep:
         return (Case(*shape) for shape in SWEEP_SHAPES)
@@ -160,6 +276,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=100)
     parser.add_argument("--profile-iterations", type=int, default=20)
+    parser.add_argument("--atol", type=float, default=0.001)
+    parser.add_argument("--rtol", type=float, default=0.01)
+    parser.add_argument("--cublaslt-algorithms", action="store_true")
     parser.add_argument("--json-output", type=Path)
     return parser.parse_args()
 
@@ -178,6 +297,7 @@ def main() -> int:
     )
 
     results: list[GemmResult] = []
+    algorithm_results: list[AlgorithmResult] = []
     for case in cases_from_args(args):
         print(f"\n{case.label}")
         block = BaselineTransformerBlock(
@@ -232,12 +352,24 @@ def main() -> int:
             )
             results.append(result)
             print_result(result)
+        if args.cublaslt_algorithms:
+            algorithm_results.extend(
+                measure_cublaslt_algorithms(case, block, args)
+            )
         torch.cuda.empty_cache()
 
     if args.json_output is not None:
         args.json_output.parent.mkdir(parents=True, exist_ok=True)
         args.json_output.write_text(
-            json.dumps([asdict(result) for result in results], indent=2),
+            json.dumps(
+                {
+                    "gemms": [asdict(result) for result in results],
+                    "cublaslt_algorithms": [
+                        asdict(result) for result in algorithm_results
+                    ],
+                },
+                indent=2,
+            ),
             encoding="utf-8",
         )
         print(f"wrote {args.json_output}")
