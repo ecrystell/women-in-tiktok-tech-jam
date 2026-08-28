@@ -89,7 +89,7 @@ Own FFN and normalization optimization. Start with `torch.compile`, exact
 fusion. Do not assume that a hand-written single kernel for both large Linear
 GEMMs is faster than optimized PyTorch/cuBLAS. Custom Triton is a stretch path.
 
-Current Person 2 branch: `person2/ffn-ln-identity-t4`.
+Current Person 2 branch: `person2/ffn-101-t4`.
 
 Current Person 2 core commit: `d6bfab0 Add standalone Person 2 FFN optimization`.
 
@@ -253,6 +253,14 @@ and 1.002x in sweep order. The universal 1.05x gate therefore failed in the
 first process; the remaining two processes and full-block gate were not run.
 The identity-affine candidate is removed from the final source tree, and no
 speedup is claimed.
+
+The relaxed universal-gate experiment is `person2/ffn-101-t4`, created from
+`e9e7bad`. It combines the guarded identity-affine LayerNorm path, the native
+up projection with exact GELU, a contiguous prepacked down-projection operand,
+and a small CUDA post kernel that preserves FP16 residual-add order while
+fusing invalid-token zeroing. The new acceptance target is at least 1.01x on
+every T4 sweep shape with zero failed elements and no worse p90. Results are
+pending.
 
 ### Person 3 — integration, profiling, and dispatch
 

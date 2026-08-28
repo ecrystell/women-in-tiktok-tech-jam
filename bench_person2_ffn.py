@@ -62,6 +62,15 @@ class OptimizedFFNResidual(nn.Module):
     ) -> torch.Tensor:
         return self.block._ffn_residual(x, valid_token_mask)
 
+    def prepare(
+        self, x: torch.Tensor, valid_token_mask: Optional[torch.Tensor]
+    ) -> bool:
+        return self.block.prepare_fast_ffn(x, valid_token_mask)
+
+    @property
+    def prepare_error(self) -> Optional[str]:
+        return self.block.fast_ffn_error
+
 
 class FullBlock(nn.Module):
     def __init__(self, block: nn.Module, causal: bool) -> None:
@@ -73,6 +82,21 @@ class FullBlock(nn.Module):
         self, x: torch.Tensor, valid_token_mask: Optional[torch.Tensor]
     ) -> torch.Tensor:
         return self.block(x, valid_token_mask, self.causal)
+
+    def prepare(
+        self, x: torch.Tensor, valid_token_mask: Optional[torch.Tensor]
+    ) -> bool:
+        if not isinstance(self.block, OptimizedTransformerBlock):
+            return False
+        with torch.inference_mode():
+            ffn_input = x + self.block.attention(
+                self.block.norm1(x), valid_token_mask, self.causal
+            )
+        return self.block.prepare_fast_ffn(ffn_input, valid_token_mask)
+
+    @property
+    def prepare_error(self) -> Optional[str]:
+        return getattr(self.block, "fast_ffn_error", None)
 
 
 @dataclass(frozen=True)
@@ -298,10 +322,18 @@ def run_case(
 ) -> None:
     print(f"\n[{scope} | {mode}] {case.label}")
     try:
+        x, mask = make_input(case, device, dtype, args.seed)
         baseline, candidate = make_models(case, scope, device, dtype)
+        prepare = getattr(candidate, "prepare", None)
+        if prepare is not None:
+            enabled = prepare(x, mask)
+            reason = getattr(candidate, "prepare_error", None)
+            print(
+                f"fast_ffn={'ENABLED' if enabled else 'FALLBACK'}"
+                + (f" | reason={reason}" if reason else "")
+            )
         baseline = compile_model(baseline, mode)
         candidate = compile_model(candidate, mode)
-        x, mask = make_input(case, device, dtype, args.seed)
 
         with torch.inference_mode():
             reference_output = accuracy_output(baseline, x, mask, device, mode)
