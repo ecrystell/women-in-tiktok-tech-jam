@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import importlib
 import os
 from pathlib import Path
+import subprocess
+import sys
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.cpp_extension import load
 
 
 _EXTENSION = None
@@ -20,20 +22,36 @@ def load_extension():
     if _EXTENSION is not None:
         return _EXTENSION
     root = Path(__file__).resolve().parent
-    build_directory = root / "benchmark-results" / "torch-extensions"
-    build_directory.mkdir(parents=True, exist_ok=True)
-    _EXTENSION = load(
-        name="person2_ffn_cuda_ext",
-        sources=[
-            str(root / "csrc" / "person2_ffn_cuda.cpp"),
-            str(root / "csrc" / "person2_ffn_cuda_kernel.cu"),
-        ],
-        extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3", "--use_fast_math"],
-        extra_ldflags=["-lcublasLt"],
-        build_directory=str(build_directory),
-        verbose=os.environ.get("PERSON2_CUDA_VERBOSE", "0") == "1",
+    build_root = root / "benchmark-results" / "setuptools-cuda-build"
+    build_lib = build_root / "lib"
+    build_temp = build_root / "temp"
+    build_lib.mkdir(parents=True, exist_ok=True)
+    build_temp.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        str(root / "setup_person2_ffn_cuda.py"),
+        "build_ext",
+        "--build-lib",
+        str(build_lib),
+        "--build-temp",
+        str(build_temp),
+    ]
+    verbose = os.environ.get("PERSON2_CUDA_VERBOSE", "0") == "1"
+    result = subprocess.run(
+        command,
+        cwd=root,
+        check=False,
+        capture_output=not verbose,
+        text=True,
     )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Person 2 CUDA extension build failed:\n"
+            + (result.stdout or "")
+            + (result.stderr or "")
+        )
+    sys.path.insert(0, str(build_lib))
+    _EXTENSION = importlib.import_module("person2_ffn_cuda_ext")
     return _EXTENSION
 
 
