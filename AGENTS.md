@@ -136,14 +136,51 @@ Although the runtime reports BF16 support, TorchInductor warns that the T4 does
 not support native BF16 compilation and skips that compilation, so the observed
 0.997x `default` result is not claimed as compiled performance.
 
-`reduce-overhead` and `max-autotune` could not be timed: alternating baseline
-and candidate calls access a CUDA-graph output overwritten by a subsequent run.
-The exact backend error is retained in the notebook. `max-autotune` also reports
-that the T4 has too few SMs for `max_autotune_gemm`. No speedup is claimed for
-either mode. The official harness smoke test preserved the public forward
-signature and passed two strict trials with zero of 32,768 elements failing.
-Results remain shape-dependent and essentially neutral, so there is no blanket
-speedup claim and the profiler-evidence gate for a custom Triton fusion remains.
+The universal-speedup follow-up branch is `person2/ffn-fusion-t4`. Commit
+`76a1d73` added static full-graph compilation, CUDA-graph output ownership and
+step markers, `max-autotune-no-cudagraphs`, focused tests, and the T4 profiler.
+Commit `181521e` corrected the profiler to count CUDA-only self time. The
+expanded local/T4 unit suite has 12 tests. `reduce-overhead` now executes all
+five shapes correctly instead of failing on overwritten CUDA-graph outputs.
+
+With 20 warmups, 100 repetitions, and five alternating rounds, compiler-only
+median speedups in sweep order were:
+
+| Global mode | Five isolated FP16 speedups | Universal 1.05x |
+| --- | --- | --- |
+| `default` | 0.996x, 1.000x, 1.000x, 1.000x, 1.000x | FAIL |
+| `reduce-overhead` | 0.999x, 1.001x, 1.012x, 1.000x, 1.000x | FAIL |
+| `max-autotune-no-cudagraphs` | 0.994x, 1.010x, 1.020x, 1.000x, 1.004x | FAIL |
+
+The corrected eager baseline profile reported the following CUDA-time shares.
+The Amdahl bound assumes every non-GEMM operation could be eliminated, so it is
+an upper bound rather than an expected result.
+
+| Shape | GEMM | LayerNorm | exact GELU | residual/mask | non-GEMM | Amdahl bound |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `(1, 128, 512)` | 86.59% | 3.58% | 2.65% | 3.91% | 13.41% | 1.155x |
+| `(8, 512, 512)` | 68.07% | 6.90% | 12.02% | 5.47% | 31.93% | 1.469x |
+| `(8, 512, 512)`, causal, padded | 67.71% | 6.93% | 12.27% | 5.44% | 32.29% | 1.477x |
+| `(4, 2048, 1024)` | 82.18% | 3.28% | 6.92% | 3.28% | 17.82% | 1.217x |
+| `(2, 4096, 1024)`, causal | 82.48% | 3.28% | 6.75% | 3.24% | 17.52% | 1.212x |
+
+A bounded CUDA/cuBLASLt experiment was attempted and rejected. Fusing the
+residual through cuBLASLt `beta=1` reordered FP16 arithmetic and failed 3 of
+65,536 elements (`max_abs=0.0078125`). Preserving baseline order by fusing only
+the residual add and final mask produced exact-zero error, but its five eager
+speedups were only 1.047x, 1.052x, 1.054x, 1.026x, and 1.006x. One-time
+cuBLASLt algorithm autotuning introduced a one-element strict failure on the
+short case and still did not make every other case 1.05x. Even eliminating all
+measured LayerNorm time would cap the worst strict-valid case near 1.04x, so the
+LayerNorm extension gate was closed. The rejected extension is absent from the
+final tree; its experimental commits remain in branch history.
+
+The official harness smoke test preserved the public forward signature and
+passed two strict trials with zero of 32,768 elements failing. No universal
+Person 2 optimization met the required 1.05x threshold, so the standalone
+PyTorch block remains the accepted implementation and no kernel speedup is
+claimed. Person 3 may use the measured table for dispatch, but Person 2 does not
+add shape dispatch or change `UserOptimizedTransformer`.
 
 ### Person 3 — integration, profiling, and dispatch
 
