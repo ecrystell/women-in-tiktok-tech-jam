@@ -102,24 +102,33 @@ Detailed Person 2 benchmark history, profiler evidence, and rejected
 variants now live in `PERSON2_EXPERIMENTS.md`. Keep `AGENTS.md` focused on
 the active handoff.
 
-The current validation branch is `person2/ffn-1005-t4`, created from
-documentation commit `2a37c5b`. The acceptance threshold is now at least
-1.005x isolated FP16 median speedup on every one of the five T4 sweep shapes in
-each of three independent eager processes, with zero failed elements and no
-worse optimized p90.
+The current validation branch is `person2/ffn-1005-t4`. It restores the
+strongest balanced implementation from the 1.01x pass: native up projection,
+ATen exact GELU using its owned temporary, a cached nonpersistent contiguous
+down operand, combined native GELU/down-projection orchestration, and 128-bit
+row-tiled FP16 residual/mask postprocessing.
 
-The candidate to restore is the strongest balanced implementation from the
-1.01x pass: native up projection, ATen exact GELU using its owned temporary,
-a cached nonpersistent contiguous down operand, combined native
-GELU/down-projection orchestration, and 128-bit row-tiled FP16 residual/mask
-postprocessing. Its prior worst result was 1.006x, so it qualifies for
-revalidation under the new gate but is not accepted until the full three-process
-and full-block safety checks complete.
+The NeurIPS run-length-tokenization follow-up adds a strictly guarded valid-row
+compaction path. Setup caches row indices only when the exact supplied mask has
+padding; timed inference may use them only for that same mask object and tensor
+version. It computes the FFN only for valid rows and scatters into a fixed-shape
+zero tensor. Changed masks, unpadded inputs, compilation, unsupported devices,
+and failed numerical preflight use the dense implementation.
 
-The Colab target remains Tesla T4 (`sm_75`, 14.56 GiB), PyTorch
-2.11.0+cu128, and CUDA 12.8. The source is currently being restored and results
-for the 1.005x gate are pending. `UserOptimizedTransformer` and Person 3
-dispatch remain unchanged.
+On the Colab Tesla T4 (`sm_75`, 14.56 GiB), PyTorch 2.11.0+cu128 and CUDA
+12.8, the guarded candidate passed all 19 CUDA/CPU tests. Padded-case isolated
+speedups were 1.048x, 1.040x, and 1.035x in three processes with zero failed
+elements. One complete three-process restored-candidate run cleared the 1.005x
+median threshold on all five shapes, but a later independent run measured
+0.980x on the shortest shape in one process; one short p90 and the short
+full-block case also regressed. Therefore there is no repeatable universal
+1.005x or full-block safety claim. Exact measurements and rejected experiments
+are in `PERSON2_EXPERIMENTS.md`.
+
+The all-valid-mask bypass passed 20 local tests but was reverted because Colab
+disconnected and reached its GPU quota before T4 timing. Current validated
+source commit: `fd7b8d7`. `UserOptimizedTransformer` and Person 3 dispatch
+remain unchanged.
 
 ### Person 3 — integration, profiling, and dispatch
 

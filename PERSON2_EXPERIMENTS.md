@@ -134,3 +134,57 @@ all unpadded behavior, and be rejected if the dynamic indexing cost outweighs
 the saved GEMM work.
 
 Source: https://proceedings.neurips.cc/paper_files/paper/2024/file/3181db351fd3ced43cd589b0b572675d-Paper-Conference.pdf
+
+## Universal 1.005x pass and valid-row compaction
+
+Branch `person2/ffn-1005-t4` restored the strongest balanced candidate from
+commit `452e028`. The restored source passed 18 T4 tests. Its first new set of
+three independent eager processes produced:
+
+| Process | Five isolated FP16 speedups | Median 1.005x gate |
+| --- | --- | --- |
+| 1 | 1.082x, 1.009x, 1.028x, 1.051x, 1.050x | PASS |
+| 2 | 1.060x, 1.021x, 1.025x, 1.050x, 1.049x | PASS |
+| 3 | 1.082x, 1.008x, 1.013x, 1.048x, 1.047x | PASS |
+
+All 15 accuracy checks had zero failed elements. One process-2 short-case p90
+was 0.4508 ms versus 0.4468 ms for baseline, so the stronger every-p90 gate
+did not pass. The five full-block speedups were 0.944x, 1.021x, 1.023x,
+1.006x, and 1.002x. All were strict-correct, but the short case failed the
+0.99x median and 2% p90 safety requirements.
+
+The paper's compatible systems lesson was then implemented as valid-row
+compaction. Preparation performs the synchronizing `nonzero` and strict
+accuracy check outside timed inference. The fast path is guarded by the exact
+mask object's identity and tensor version; it gathers valid residual rows,
+runs per-row LayerNorm and the exact-GELU FFN, and scatters into an exactly
+zeroed fixed-shape result. Unpadded inputs and changed or mutated masks retain
+the dense path, while compiled execution deliberately avoids dynamic
+compaction.
+
+This candidate passed 19 T4 tests, including CUDA extension execution,
+full-graph compile fallback, repeated output ownership, exact invalid zeroing,
+mask mutation/replacement guards, FP16, FP32, and the runtime-supported BF16
+test. On the padded `(8,512,512,2048)` case it first measured 1.045x. A later
+three-process sweep measured 1.048x, 1.040x, and 1.035x on that case, always
+with zero failed elements and improved p90.
+
+The same later sweep exposed that the universal claim was not repeatable:
+
+| Process | Five isolated FP16 speedups | Median 1.005x gate |
+| --- | --- | --- |
+| 1 | 0.980x, 1.037x, 1.048x, 1.054x, 1.053x | FAIL |
+| 2 | 1.082x, 1.021x, 1.040x, 1.053x, 1.052x | PASS |
+| 3 | 1.081x, 1.029x, 1.035x, 1.052x, 1.051x | PASS |
+
+The failing short process measured baseline at an unusually low 0.2469 ms
+and optimized at 0.2519 ms; its p90 also regressed. The result is retained as
+real variance rather than discarded as an outlier. Consequently the restored
+implementation and useful padded-row enhancement are delivered without a
+repeatable universal 1.005x claim.
+
+A final semantic experiment cached a proven all-true mask and selected the
+unmasked post kernel for that exact mask identity/version. It passed 20 local
+tests, but Colab disconnected and reached its GPU usage limit before the T4
+screen. Commit `ce762be` was therefore reverted by `fd7b8d7`; the unmeasured
+optimization is not in the validated source.
