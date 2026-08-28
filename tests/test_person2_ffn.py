@@ -92,6 +92,9 @@ class Person2BlockTests(unittest.TestCase):
             )
         )
         self.assertFalse(optimized._norm2_affine_is_identity)
+        self.assertFalse(optimized._compact_ffn_enabled)
+        self.assertIsNone(optimized._compact_mask)
+        self.assertIsNone(optimized._compact_valid_rows)
 
     def test_fast_ffn_cpu_and_build_failure_fall_back(self) -> None:
         _baseline, optimized = self.make_blocks()
@@ -113,6 +116,7 @@ class Person2BlockTests(unittest.TestCase):
             self.assertFalse(optimized.prepare_fast_ffn(x, mask))
         self.assertIn("simulated build failure", optimized.fast_ffn_error or "")
         self.assertFalse(optimized._fast_ffn_enabled)
+        self.assertFalse(optimized._compact_ffn_enabled)
 
     def test_fast_ffn_preflight_and_repeated_calls(self) -> None:
         baseline, optimized = self.make_blocks()
@@ -151,6 +155,17 @@ class Person2BlockTests(unittest.TestCase):
         assert_or_close(self, reference, first)
         self.assertTrue(torch.equal(first, second))
         self.assertNotEqual(first.data_ptr(), second.data_ptr())
+
+    def test_compact_mask_guard_rejects_changed_or_mutated_masks(self) -> None:
+        _baseline, optimized = self.make_blocks()
+        mask = torch.tensor([[True, True, False], [True, False, False]])
+        optimized._compact_ffn_enabled = True
+        optimized._compact_mask = mask
+        optimized._compact_mask_version = mask._version
+        self.assertTrue(optimized._compact_mask_is_current(mask))
+        self.assertFalse(optimized._compact_mask_is_current(mask.clone()))
+        mask.logical_not_()
+        self.assertFalse(optimized._compact_mask_is_current(mask))
 
     def test_fast_post_custom_ops_have_fake_shapes(self) -> None:
         from torch._subclasses.fake_tensor import FakeTensorMode
@@ -321,6 +336,7 @@ class Person2CudaTests(unittest.TestCase):
         self.assertTrue(
             optimized.prepare_fast_ffn(x, mask), optimized.fast_ffn_error
         )
+        self.assertTrue(optimized._compact_ffn_enabled)
         with torch.inference_mode():
             reference = x + baseline.ffn_out(
                 torch.nn.functional.gelu(
@@ -331,6 +347,19 @@ class Person2CudaTests(unittest.TestCase):
             candidate = optimized._ffn_residual(x, mask)
         assert_or_close(self, reference, candidate)
         self.assertTrue(bool((candidate[~mask] == 0).all().item()))
+        with torch.inference_mode():
+            repeated = optimized._ffn_residual(x, mask)
+        assert_or_close(self, reference, repeated)
+        self.assertNotEqual(candidate.data_ptr(), repeated.data_ptr())
+
+        changed_mask = mask.clone()
+        with mock.patch.object(
+            optimized, "_ffn_residual_fast", wraps=optimized._ffn_residual_fast
+        ) as dense_path:
+            with torch.inference_mode():
+                changed_candidate = optimized._ffn_residual(x, changed_mask)
+            dense_path.assert_called_once()
+        assert_or_close(self, reference, changed_candidate)
 
         if torch.cuda.get_device_capability()[0] >= 7:
             class IsolatedFFN(torch.nn.Module):

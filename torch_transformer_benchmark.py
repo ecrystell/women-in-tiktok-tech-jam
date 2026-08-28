@@ -168,7 +168,12 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         self._norm2_weight_version = self.norm2.weight._version
         self._norm2_bias_version = self.norm2.bias._version
         self._fast_ffn_enabled = False
+        self._compact_ffn_enabled = False
+        self._compact_mask: Optional[torch.Tensor] = None
+        self._compact_mask_version = -1
+        self._compact_valid_rows: Optional[torch.Tensor] = None
         self.fast_ffn_error: Optional[str] = None
+        self.compact_ffn_error: Optional[str] = None
         self.register_load_state_dict_post_hook(self._refresh_after_load)
 
     def _refresh_after_load(self, module: nn.Module, incompatible_keys: object) -> None:
@@ -186,6 +191,10 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         self._norm2_weight_version = self.norm2.weight._version
         self._norm2_bias_version = self.norm2.bias._version
         self._fast_ffn_enabled = False
+        self._compact_ffn_enabled = False
+        self._compact_mask = None
+        self._compact_mask_version = -1
+        self._compact_valid_rows = None
 
     def _fast_parameters_are_current(self) -> bool:
         if torch.compiler.is_compiling():
@@ -266,6 +275,50 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
             )
         return output.reshape(batch, seq_len, d_model)
 
+    def _ffn_residual_compact(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the FFN only for rows already declared valid by the mask."""
+        if self._compact_valid_rows is None:
+            raise RuntimeError("valid-row compaction was not prepared")
+        batch, seq_len, d_model = x.shape
+        flat = x.reshape(batch * seq_len, d_model)
+        residual = flat.index_select(0, self._compact_valid_rows)
+        if self._norm2_affine_is_identity:
+            normalized = F.layer_norm(
+                residual,
+                self.norm2.normalized_shape,
+                None,
+                None,
+                self.norm2.eps,
+            )
+        else:
+            normalized = self.norm2(residual)
+        preactivation = self.ffn_in(normalized)
+        valid_output = person2_ffn_post.exact_gelu_down_unmasked(
+            preactivation,
+            self._ffn_out_weight_nt,
+            self.ffn_out.bias,
+            residual,
+        )
+        output = torch.zeros_like(flat)
+        output.index_copy_(0, self._compact_valid_rows, valid_output)
+        return output.reshape(batch, seq_len, d_model)
+
+    def _compact_mask_is_current(
+        self,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> bool:
+        if torch.compiler.is_compiling():
+            return False
+        return (
+            self._compact_ffn_enabled
+            and valid_token_mask is self._compact_mask
+            and valid_token_mask is not None
+            and valid_token_mask._version == self._compact_mask_version
+        )
+
     def prepare_fast_ffn(
         self,
         x: torch.Tensor,
@@ -274,6 +327,7 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         """Build, prepack, and strictly validate outside timed inference."""
         self._refresh_fast_ffn_state()
         self.fast_ffn_error = None
+        self.compact_ffn_error = None
         with torch.inference_mode():
             supported = self._supports_fast_ffn(x, valid_token_mask)
         if not supported:
@@ -297,6 +351,38 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
                 )
                 return False
             self._fast_ffn_enabled = True
+            # Run-length tokenization cannot remove arbitrary benchmark tokens,
+            # but its "do not process known redundant rows" lesson applies to
+            # padding.  Build indices only during setup; timed inference uses
+            # this path solely for the exact, unchanged mask object/version.
+            if x.is_cuda and valid_token_mask is not None:
+                valid_rows = torch.nonzero(
+                    valid_token_mask.reshape(-1), as_tuple=False
+                ).flatten()
+                if 0 < valid_rows.numel() < valid_token_mask.numel():
+                    self._compact_valid_rows = valid_rows
+                    self._compact_mask = valid_token_mask
+                    self._compact_mask_version = valid_token_mask._version
+                    with torch.inference_mode():
+                        compact_candidate = self._ffn_residual_compact(x)
+                    compact_opt = compact_candidate.float()
+                    compact_error = (compact_opt - ref).abs()
+                    compact_passed = torch.isfinite(ref) & torch.isfinite(
+                        compact_opt
+                    )
+                    compact_passed &= (compact_error <= 0.001) | (
+                        compact_error <= 0.01 * ref.abs()
+                    )
+                    if bool(compact_passed.all().item()):
+                        self._compact_ffn_enabled = True
+                    else:
+                        self.compact_ffn_error = (
+                            "strict compact preflight failed: "
+                            f"max_abs={compact_error.max().item():.6g}, "
+                            f"failed={int((~compact_passed).sum().item())}"
+                        )
+                        self._compact_mask = None
+                        self._compact_valid_rows = None
             return True
         except (ImportError, OSError, RuntimeError) as error:
             self.fast_ffn_error = f"{type(error).__name__}: {error}"
@@ -313,6 +399,8 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
             and self._fast_parameters_are_current()
             and self._supports_fast_ffn(x, valid_token_mask)
         ):
+            if self._compact_mask_is_current(valid_token_mask):
+                return self._ffn_residual_compact(x)
             return self._ffn_residual_fast(x, valid_token_mask)
         return self._ffn_residual_native(x, valid_token_mask)
 

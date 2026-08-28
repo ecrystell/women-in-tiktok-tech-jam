@@ -328,9 +328,24 @@ def run_case(
         if prepare is not None:
             enabled = prepare(x, mask)
             reason = getattr(candidate, "prepare_error", None)
+            block = getattr(candidate, "block", None)
+            compact_enabled = bool(
+                getattr(block, "_compact_ffn_enabled", False)
+            )
+            compact_reason = getattr(block, "compact_ffn_error", None)
             print(
                 f"fast_ffn={'ENABLED' if enabled else 'FALLBACK'}"
                 + (f" | reason={reason}" if reason else "")
+                + (
+                    " | valid_row_compaction=ENABLED"
+                    if compact_enabled
+                    else ""
+                )
+                + (
+                    f" | compact_reason={compact_reason}"
+                    if compact_reason
+                    else ""
+                )
             )
         baseline = compile_model(baseline, mode)
         candidate = compile_model(candidate, mode)
