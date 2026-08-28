@@ -200,7 +200,10 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         )
 
     def _prepacked_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if (
+        # The internal tensor version counter becomes a data-dependent symbol
+        # under Dynamo. Compiled inference uses the explicitly prepared,
+        # immutable buffers; eager inference retains mutation detection.
+        if not torch.compiler.is_compiling() and (
             self._ffn_in_weight_version != self.ffn_in.weight._version
             or self._ffn_out_weight_version != self.ffn_out.weight._version
         ):
