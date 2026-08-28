@@ -182,6 +182,15 @@ PyTorch block remains the accepted implementation and no kernel speedup is
 claimed. Person 3 may use the measured table for dispatch, but Person 2 does not
 add shape dispatch or change `UserOptimizedTransformer`.
 
+The article-inspired GEMM follow-up branch is `person2/ffn-gemm-t4`, created
+from `ff54b21`. Its guaranteed path remains the standalone PyTorch block. The
+experiment measures the concrete FFN up/down GEMMs independently, then gates a
+strict-order FP16 down-projection residual/mask fusion and an erf-based exact
+GELU up-projection fusion on the same universal `1.05x` T4 criterion. FP8/FP4
+and integer quantization are out of scope because they do not match the T4 and
+strict FP16 correctness contract. Local branch setup is complete; T4 profiling
+and validation are pending.
+
 ### Person 3 — integration, profiling, and dispatch
 
 Own `UserOptimizedTransformer`, weight-copy integration, benchmark-driven
