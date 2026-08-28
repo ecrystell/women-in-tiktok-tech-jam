@@ -11,10 +11,6 @@ void residual_unmasked_cuda(
     const torch::Tensor& residual,
     torch::Tensor& output);
 
-torch::Tensor layer_norm_identity_cuda(
-    const torch::Tensor& input,
-    double eps);
-
 torch::Tensor exact_gelu_down_masked(
     torch::Tensor preactivation,
     const torch::Tensor& weight_nt,
@@ -57,8 +53,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       "exact_gelu_down_unmasked",
       &exact_gelu_down_unmasked,
       "Exact GELU, down projection, and residual add");
-  module.def(
-      "layer_norm_identity",
-      &layer_norm_identity_cuda,
-      "FP16 LayerNorm with FP32 Welford statistics and identity affine");
 }

@@ -135,12 +135,6 @@ class Person2BlockTests(unittest.TestCase):
                 "person2_ffn_post.exact_gelu_down_masked",
                 side_effect=combined,
             ),
-            mock.patch(
-                "person2_ffn_post.layer_norm_identity",
-                side_effect=lambda value, eps: torch.nn.functional.layer_norm(
-                    value, value.shape[-1:], None, None, eps
-                ),
-            ),
         ):
             self.assertTrue(optimized.prepare_fast_ffn(x, mask))
             with torch.inference_mode():
@@ -189,11 +183,6 @@ class Person2BlockTests(unittest.TestCase):
                 preactivation, weight, bias, residual
             ).shape,
             (4, 8),
-        )
-        layer_input = mode.from_tensor(torch.empty(2, 4, 8))
-        self.assertEqual(
-            person2_ffn_post.layer_norm_identity(layer_input, 1e-5).shape,
-            (2, 4, 8),
         )
 
     def test_user_model_remains_owned_by_integration(self) -> None:

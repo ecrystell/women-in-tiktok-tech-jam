@@ -155,17 +155,3 @@ def _exact_gelu_down_unmasked_fake(
 ) -> torch.Tensor:
     del preactivation, weight_nt, bias
     return torch.empty_like(residual)
-
-
-@torch.library.custom_op("person2_post::layer_norm_identity_v1", mutates_args=())
-def layer_norm_identity(input: torch.Tensor, eps: float) -> torch.Tensor:
-    """Apply identity-affine FP16 LayerNorm with FP32 Welford statistics."""
-    return load_extension().layer_norm_identity(input, eps)
-
-
-@layer_norm_identity.register_fake
-def _layer_norm_identity_fake(
-    input: torch.Tensor, eps: float
-) -> torch.Tensor:
-    del eps
-    return torch.empty_like(input)

@@ -237,8 +237,12 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
     ) -> torch.Tensor:
         batch, seq_len, d_model = x.shape
         if self._norm2_affine_is_identity:
-            normalized = person2_ffn_post.layer_norm_identity(
-                x, self.norm2.eps
+            normalized = F.layer_norm(
+                x,
+                self.norm2.normalized_shape,
+                None,
+                None,
+                self.norm2.eps,
             )
         else:
             normalized = self.norm2(x)
