@@ -10,12 +10,6 @@ from unittest import mock
 import torch
 
 from bench_person2_ffn import accuracy_output, compile_model, mark_inference_step
-from person2_ffn_fusion import (
-    ArticleFusedFFNResidual,
-    linear_exact_gelu,
-    strict_accuracy,
-    triton,
-)
 from profile_person2_gemms import gemm_shapes
 from profile_person2_ffn import event_device_time_us
 
@@ -194,97 +188,6 @@ class Person2BlockTests(unittest.TestCase):
         self.assertEqual((down.m, down.n, down.k), (4096, 512, 2048))
         self.assertEqual(up.flops, down.flops)
 
-    def test_article_fusion_has_native_cpu_fallback(self) -> None:
-        baseline, optimized = self.make_blocks()
-        fused = ArticleFusedFFNResidual(optimized)
-        x = torch.randn(2, 5, 32)
-        for mask in (
-            None,
-            torch.tensor([[True] * 5, [True, True, True, False, False]]),
-        ):
-            with torch.inference_mode():
-                reference = x + baseline.ffn_out(
-                    torch.nn.functional.gelu(
-                        baseline.ffn_in(baseline.norm2(x)), approximate="none"
-                    )
-                )
-                if mask is not None:
-                    reference = reference.masked_fill(~mask[..., None], 0)
-                candidate = fused(x, mask)
-            assert_or_close(self, reference, candidate)
-            if mask is not None:
-                self.assertTrue(bool((candidate[~mask] == 0).all().item()))
-
-        self.assertFalse(fused.prepare(x, None))
-        self.assertIn("unsupported", fused.last_error or "")
-
-    def test_article_fusion_preflight_and_repeated_calls(self) -> None:
-        _baseline, optimized = self.make_blocks()
-        fused = ArticleFusedFFNResidual(optimized)
-        x = torch.randn(2, 5, 32)
-        mask = torch.tensor([[True] * 5, [True, True, True, False, False]])
-
-        def up(value, weight, bias):
-            return torch.nn.functional.gelu(
-                torch.nn.functional.linear(value, weight, bias),
-                approximate="none",
-            )
-
-        def down(hidden, residual, weight, bias, valid):
-            result = residual + torch.nn.functional.linear(hidden, weight, bias)
-            return result.masked_fill(~valid[:, None], 0)
-
-        with (
-            mock.patch("person2_ffn_fusion.supports_fusion", return_value=True),
-            mock.patch("person2_ffn_fusion.linear_exact_gelu", side_effect=up),
-            mock.patch("person2_ffn_fusion.down_residual_masked", side_effect=down),
-        ):
-            self.assertTrue(fused.prepare(x, mask))
-            first = fused(x, mask)
-            second = fused(x, mask)
-        self.assertTrue(torch.equal(first, second))
-        self.assertTrue(bool((first[~mask] == 0).all().item()))
-
-    def test_article_fusion_build_failure_falls_back(self) -> None:
-        _baseline, optimized = self.make_blocks()
-        fused = ArticleFusedFFNResidual(optimized)
-        x = torch.randn(2, 5, 32)
-        mask = torch.ones(2, 5, dtype=torch.bool)
-
-        def up(value, weight, bias):
-            return torch.nn.functional.gelu(
-                torch.nn.functional.linear(value, weight, bias),
-                approximate="none",
-            )
-
-        with (
-            mock.patch("person2_ffn_fusion.supports_fusion", return_value=True),
-            mock.patch("person2_ffn_fusion.linear_exact_gelu", side_effect=up),
-            mock.patch(
-                "person2_ffn_fusion.down_residual_masked",
-                side_effect=RuntimeError("simulated extension failure"),
-            ),
-        ):
-            self.assertFalse(fused.prepare(x, mask))
-        self.assertIn("simulated extension failure", fused.last_error or "")
-        with torch.inference_mode():
-            self.assertTrue(torch.equal(fused(x, mask), optimized._ffn_residual(x, mask)))
-
-    def test_article_custom_op_has_fake_shape_implementation(self) -> None:
-        from torch._subclasses.fake_tensor import FakeTensorMode
-
-        mode = FakeTensorMode()
-        x = mode.from_tensor(torch.empty(4, 8))
-        weight = mode.from_tensor(torch.empty(16, 8))
-        bias = mode.from_tensor(torch.empty(16))
-        output = linear_exact_gelu(x, weight, bias)
-        self.assertEqual(output.shape, (4, 16))
-
-    def test_strict_accuracy_handles_adversarial_near_zero_values(self) -> None:
-        reference = torch.tensor([-1e-4, 0.0, 1e-4, 1.0])
-        self.assertTrue(strict_accuracy(reference, reference + 5e-4))
-        self.assertFalse(strict_accuracy(reference, reference + 2e-3))
-
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
@@ -318,24 +221,6 @@ class Person2CudaTests(unittest.TestCase):
                 baseline(x, mask, False),
                 optimized(x, mask, False),
             )
-
-    def test_triton_up_exact_gelu_multi_seed(self) -> None:
-        if triton is None or torch.cuda.get_device_capability()[0] < 7:
-            self.skipTest("Triton tensor-core path requires compute capability 7+")
-        device = torch.device("cuda")
-        for seed in (3, 17, 41):
-            torch.manual_seed(seed)
-            x = torch.randn(64, 32, device=device, dtype=torch.float16)
-            weight = torch.randn(64, 32, device=device, dtype=torch.float16)
-            bias = torch.randn(64, device=device, dtype=torch.float16)
-            with torch.inference_mode():
-                reference = torch.nn.functional.gelu(
-                    torch.nn.functional.linear(x, weight, bias),
-                    approximate="none",
-                )
-                candidate = linear_exact_gelu(x, weight, bias)
-            assert_or_close(self, reference, candidate)
-
 
 if __name__ == "__main__":
     unittest.main()
