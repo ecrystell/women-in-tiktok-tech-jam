@@ -89,7 +89,7 @@ Own FFN and normalization optimization. Start with `torch.compile`, exact
 fusion. Do not assume that a hand-written single kernel for both large Linear
 GEMMs is faster than optimized PyTorch/cuBLAS. Custom Triton is a stretch path.
 
-Current Person 2 branch: `person2/ffn-layernorm`.
+Current Person 2 branch: `person2/ffn-gemm-t4`.
 
 Current Person 2 core commit: `d6bfab0 Add standalone Person 2 FFN optimization`.
 
@@ -183,13 +183,51 @@ claimed. Person 3 may use the measured table for dispatch, but Person 2 does not
 add shape dispatch or change `UserOptimizedTransformer`.
 
 The article-inspired GEMM follow-up branch is `person2/ffn-gemm-t4`, created
-from `ff54b21`. Its guaranteed path remains the standalone PyTorch block. The
-experiment measures the concrete FFN up/down GEMMs independently, then gates a
-strict-order FP16 down-projection residual/mask fusion and an erf-based exact
-GELU up-projection fusion on the same universal `1.05x` T4 criterion. FP8/FP4
-and integer quantization are out of scope because they do not match the T4 and
-strict FP16 correctness contract. Local branch setup is complete; T4 profiling
-and validation are pending.
+from `ff54b21`. Commit `0d2d2f5` adds the retained, standalone up/down GEMM
+profiler. Candidate commit `bb62a8d` was evaluated on the same Colab Tesla T4
+with PyTorch 2.11.0+cu128 and CUDA 12.8. All 19 candidate tests passed on the
+T4, including multi-seed exact-GELU equivalence, custom-op fallbacks, repeated
+calls, masks, compilation tracing, and output ownership.
+
+The article's useful methodology was applied by timing each concrete workload
+independently before an end-to-end sweep. For the first and most
+launch-sensitive isolated FP16 shape, `(1, 128, 512)`, the generated workloads
+were up `[128,512] x [512,2048]` and down `[128,2048] x [2048,512]`. Baseline
+median/p90 measurements were 0.0470/0.0533 ms for the raw up GEMM,
+0.0726/0.0821 ms for up plus exact GELU, 0.1918/0.1925 ms for the raw down GEMM,
+and 0.1966/0.1970 ms for down plus residual.
+
+The Triton FP16 tensor-core up projection used FP32 accumulation, an explicit
+FP16 rounding boundary, and FP32 erf-based exact GELU. It passed the strict
+accuracy contract but measured 0.676896/0.681984 ms versus
+0.075216/0.103744 ms for PyTorch, about nine times slower. The strict-order
+cuBLASLt down projection plus residual/mask measured 0.198496/0.198656 ms versus
+0.196240/0.196608 ms for PyTorch. Of eight returned cuBLASLt algorithms, only
+algorithms 0 and 7 passed multi-seed strict validation; algorithm 0 measured
+0.1981/0.1986 ms and algorithm 7 measured 0.2158/0.2166 ms. Algorithms 1-6 each
+failed one element with `max_abs=0.00195312`.
+
+The combined isolated candidate retained zero failed elements
+(`max_abs=0.00195312`) but regressed from 0.4691/0.5110 ms to
+0.8925/1.0622 ms, a 0.526x median speedup. This fails both the universal 1.05x
+median gate and the no-worse-p90 gate on the first required shape. Because both
+experimental component replacements were already slower than PyTorch on that
+shape, no global candidate could satisfy the every-shape requirement. Per the
+early-stop rule, the remaining multi-process/full-sweep timing was not run and
+no speedup is claimed.
+
+Commit `ee3ab0d` removes the rejected Triton/cuBLASLt candidate, build files,
+and candidate-only tests while retaining the reusable per-GEMM profiler and
+the reliable standalone PyTorch block. The retained 13-test suite passes both
+locally and on the T4 across CPU and available CUDA FP32, FP16, and BF16. Final
+T4 strict-zero-error eager smokes measured 0.999x for FP32 and 1.000x for BF16.
+The official one-layer FP16 harness passed two trials with zero of 131,072
+elements failing; its reduced-sample median was 1.026x and is a safety smoke,
+not a performance claim. The preserved Colab artifact is named
+`Person2_T4_Article_GEMM_Gate_ee3ab0d.ipynb`. FP8/FP4 and integer quantization
+remain out of scope because they do not satisfy the T4 and strict FP16
+correctness contract. `UserOptimizedTransformer` and Person 3 dispatch remain
+unchanged.
 
 ### Person 3 — integration, profiling, and dispatch
 
