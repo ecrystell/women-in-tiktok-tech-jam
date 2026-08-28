@@ -50,9 +50,17 @@ class ProfileResult:
 
 
 def event_device_time_us(event: object) -> float:
-    value = getattr(event, "self_device_time_total", None)
+    # key_averages() contains CPU operators with a generic
+    # self_device_time_total equal to their CPU time. Prefer the CUDA-specific
+    # field so host work is never counted as GPU kernel execution.
+    value = getattr(event, "self_cuda_time_total", None)
     if value is None:
-        value = getattr(event, "self_cuda_time_total", 0.0)
+        device_type = str(getattr(event, "device_type", "")).lower()
+        value = (
+            getattr(event, "self_device_time_total", 0.0)
+            if "cuda" in device_type
+            else 0.0
+        )
     return float(value or 0.0)
 
 

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 import torch
 
 from bench_person2_ffn import accuracy_output, compile_model, mark_inference_step
+from profile_person2_ffn import event_device_time_us
 
 from torch_transformer_benchmark import (
     BaselineTransformerBlock,
@@ -163,6 +165,18 @@ class Person2BlockTests(unittest.TestCase):
         compiler.assert_called_once_with(
             module, mode="default", fullgraph=True, dynamic=False
         )
+
+    def test_profiler_uses_cuda_only_time(self) -> None:
+        event = SimpleNamespace(
+            self_cuda_time_total=7.5,
+            self_device_time_total=101.0,
+            device_type="CPU",
+        )
+        self.assertEqual(event_device_time_us(event), 7.5)
+        cpu_only = SimpleNamespace(
+            self_device_time_total=101.0, device_type="CPU"
+        )
+        self.assertEqual(event_device_time_us(cpu_only), 0.0)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
