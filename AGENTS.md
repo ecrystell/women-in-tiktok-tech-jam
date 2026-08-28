@@ -255,12 +255,43 @@ The identity-affine candidate is removed from the final source tree, and no
 speedup is claimed.
 
 The relaxed universal-gate experiment is `person2/ffn-101-t4`, created from
-`e9e7bad`. It combines the guarded identity-affine LayerNorm path, the native
-up projection with exact GELU, a contiguous prepacked down-projection operand,
-and a small CUDA post kernel that preserves FP16 residual-add order while
-fusing invalid-token zeroing. The new acceptance target is at least 1.01x on
-every T4 sweep shape with zero failed elements and no worse p90. Results are
-pending.
+`e9e7bad`. The bounded pass tested single-dispatch C++ orchestration around
+native exact GELU and cuBLAS, 128-bit residual/mask postprocessing, native
+in-place exact GELU on an owned temporary, a FP32-Welford LayerNorm kernel, and
+prepacked up/down projection operands. Every experimental T4 suite passed all
+18 tests, including strict state transfer, masks, repeated output ownership,
+CPU/FP32/BF16 fallbacks, and static full-graph tracing. The best candidates had
+zero failed elements at `atol=0.001`, `rtol=0.01`; the largest observed error
+was `0.00390625` on the two 512-wide medium cases.
+
+The strongest balanced candidate kept the native up projection, reused ATen's
+exact GELU output storage, prepacked only the down operand, and used the
+row-tiled post kernel for every supplied mask. Three independent eager
+processes used 20 warmups, 100 CUDA-event repetitions, and five alternating
+rounds. Their five median speedups in sweep order were:
+
+| Process | Five isolated FP16 speedups | Gate result |
+| --- | --- | --- |
+| 1 | 1.083x, 1.019x, 1.024x, 1.050x, 1.028x | PASS |
+| 2 | 1.081x, 1.010x, 1.018x, 1.049x, 1.036x | PASS (unrounded second ratio 1.0104x) |
+| 3 | 1.081x, 1.006x, 1.024x, 1.036x, 1.025x | FAIL |
+
+All 15 p90 comparisons improved and accuracy had zero failed elements, but the
+universal every-process 1.01x median gate failed on the unpadded
+`(8, 512, 512)` case. `reduce-overhead` was rejected at 0.950x, 0.960x,
+0.962x, 1.020x, and 1.001x. The Welford LayerNorm candidate was correct but
+slower on the medium cases (0.980x and 0.995x). Prepacking the up operand moved
+the bottleneck: its first process reached 1.040x/1.059x on the medium cases but
+only an unrounded 1.0095x on `(4, 2048, 1024)`; a later process measured 1.006x
+on the final long case and another had a short-case p90 regression. A custom
+erf GELU and in-place residual variant were also slower and rejected.
+
+Per the early-stop rule, the full-block gate was not rerun. The experimental
+extension, candidate-only tests, and altered block are removed from the final
+source tree; commit history and the populated Colab notebook preserve all
+evidence. The retained implementation is the strict-valid `e9e7bad` source,
+and no universal 1.01x speedup is claimed. `UserOptimizedTransformer` and
+Person 3 dispatch remain unchanged.
 
 ### Person 3 — integration, profiling, and dispatch
 

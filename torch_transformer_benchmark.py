@@ -25,8 +25,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import person2_ffn_post
-
 
 @dataclass(frozen=True)
 class TransformerConfig:
@@ -156,178 +154,34 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
     unchanged, which keeps strict state-dict copying compatible.
     """
 
-    def __init__(self, d_model: int, num_heads: int, ffn_dim: int) -> None:
-        super().__init__(d_model, num_heads, ffn_dim)
-        self.register_buffer(
-            "_ffn_in_weight_nt",
-            self.ffn_in.weight.detach().t().contiguous(),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_ffn_out_weight_nt",
-            self.ffn_out.weight.detach().t().contiguous(),
-            persistent=False,
-        )
-        self._norm2_affine_is_identity = True
-        self._ffn_in_weight_version = self.ffn_in.weight._version
-        self._ffn_out_weight_version = self.ffn_out.weight._version
-        self._norm2_weight_version = self.norm2.weight._version
-        self._norm2_bias_version = self.norm2.bias._version
-        self._fast_ffn_enabled = False
-        self.fast_ffn_error: Optional[str] = None
-        self.register_load_state_dict_post_hook(self._refresh_after_load)
-
-    def _refresh_after_load(self, module: nn.Module, incompatible_keys: object) -> None:
-        del module, incompatible_keys
-        self._refresh_fast_ffn_state()
-
-    @torch.no_grad()
-    def _refresh_fast_ffn_state(self) -> None:
-        self._ffn_in_weight_nt = self.ffn_in.weight.detach().t().contiguous()
-        self._ffn_out_weight_nt = self.ffn_out.weight.detach().t().contiguous()
-        self._norm2_affine_is_identity = bool(
-            torch.equal(self.norm2.weight, torch.ones_like(self.norm2.weight))
-            and torch.count_nonzero(self.norm2.bias).item() == 0
-        )
-        self._ffn_in_weight_version = self.ffn_in.weight._version
-        self._ffn_out_weight_version = self.ffn_out.weight._version
-        self._norm2_weight_version = self.norm2.weight._version
-        self._norm2_bias_version = self.norm2.bias._version
-        self._fast_ffn_enabled = False
-
-    def _fast_parameters_are_current(self) -> bool:
-        if torch.compiler.is_compiling():
-            return True
-        current = (
-            self._ffn_in_weight_version == self.ffn_in.weight._version
-            and self._ffn_out_weight_version == self.ffn_out.weight._version
-            and self._norm2_weight_version == self.norm2.weight._version
-            and self._norm2_bias_version == self.norm2.bias._version
-        )
-        if not current:
-            self._refresh_fast_ffn_state()
-        return current
-
-    def _supports_fast_ffn(
-        self,
-        x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor],
-    ) -> bool:
-        return (
-            x.is_cuda
-            and x.dtype == torch.float16
-            and x.ndim == 3
-            and x.is_contiguous()
-            and x.shape[-1] % 2 == 0
-            and (valid_token_mask is None or valid_token_mask.is_contiguous())
-            and not self.training
-            and not torch.is_grad_enabled()
-        )
-
-    def _ffn_residual_native(
-        self,
-        x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        batch, seq_len, d_model = x.shape
-        ffn_input = self.norm2(x).reshape(batch * seq_len, d_model)
-        ffn_update = self.ffn_out(
-            F.gelu(self.ffn_in(ffn_input), approximate="none")
-        )
-        output = x + ffn_update.reshape(batch, seq_len, d_model)
-        if valid_token_mask is not None:
-            output = output.masked_fill(~valid_token_mask[..., None], 0)
-        return output
-
-    def _ffn_residual_fast(
-        self,
-        x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        batch, seq_len, d_model = x.shape
-        if self._norm2_affine_is_identity:
-            normalized = F.layer_norm(
-                x,
-                self.norm2.normalized_shape,
-                None,
-                None,
-                self.norm2.eps,
-            )
-        else:
-            normalized = self.norm2(x)
-        ffn_input = normalized.reshape(batch * seq_len, d_model)
-        preactivation = torch.addmm(
-            self.ffn_in.bias,
-            ffn_input,
-            self._ffn_in_weight_nt,
-        )
-        residual = x.reshape(batch * seq_len, d_model)
-        if valid_token_mask is None:
-            output = person2_ffn_post.exact_gelu_down_unmasked(
-                preactivation,
-                self._ffn_out_weight_nt,
-                self.ffn_out.bias,
-                residual,
-            )
-        else:
-            output = person2_ffn_post.exact_gelu_down_masked(
-                preactivation,
-                self._ffn_out_weight_nt,
-                self.ffn_out.bias,
-                residual,
-                valid_token_mask.reshape(-1),
-            )
-        return output.reshape(batch, seq_len, d_model)
-
-    def prepare_fast_ffn(
-        self,
-        x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor],
-    ) -> bool:
-        """Build, prepack, and strictly validate outside timed inference."""
-        self._refresh_fast_ffn_state()
-        self.fast_ffn_error = None
-        with torch.inference_mode():
-            supported = self._supports_fast_ffn(x, valid_token_mask)
-        if not supported:
-            self.fast_ffn_error = "unsupported device, dtype, layout, or mode"
-            return False
-        try:
-            person2_ffn_post.load_extension()
-            with torch.inference_mode():
-                reference = self._ffn_residual_native(x, valid_token_mask)
-                candidate = self._ffn_residual_fast(x, valid_token_mask)
-            ref = reference.float()
-            opt = candidate.float()
-            error = (opt - ref).abs()
-            passed = torch.isfinite(ref) & torch.isfinite(opt)
-            passed &= (error <= 0.001) | (error <= 0.01 * ref.abs())
-            if not bool(passed.all().item()):
-                self.fast_ffn_error = (
-                    "strict numerical preflight failed: "
-                    f"max_abs={error.max().item():.6g}, "
-                    f"failed={int((~passed).sum().item())}"
-                )
-                return False
-            self._fast_ffn_enabled = True
-            return True
-        except (ImportError, OSError, RuntimeError) as error:
-            self.fast_ffn_error = f"{type(error).__name__}: {error}"
-            return False
-
     def _ffn_residual(
         self,
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Apply the pre-norm FFN residual sublayer with baseline semantics."""
-        if (
-            self._fast_ffn_enabled
-            and self._fast_parameters_are_current()
-            and self._supports_fast_ffn(x, valid_token_mask)
-        ):
-            return self._ffn_residual_fast(x, valid_token_mask)
-        return self._ffn_residual_native(x, valid_token_mask)
+        # LayerNorm operates over the final hidden dimension.  Reshape keeps a
+        # view when the normalized output is contiguous and materializes a
+        # contiguous layout only when the input strides require it.
+        batch, seq_len, d_model = x.shape
+        ffn_input = self.norm2(x).reshape(batch * seq_len, d_model)
+
+        # Treat every token as one row for both GEMMs.  This gives the FFN a
+        # stable [tokens, hidden] layout and lets torch.compile fuse the
+        # surrounding pointwise work when the model is compiled.
+        ffn_update = self.ffn_out(
+            F.gelu(self.ffn_in(ffn_input), approximate="none")
+        )
+
+        # Keep the residual add as one expression so the compiler can fuse it
+        # with compatible producer/consumer operations.
+        x = x + ffn_update.reshape(batch, seq_len, d_model)
+
+        # Padding semantics must match the baseline exactly: padded tokens are
+        # cleared after every Transformer block.
+        if valid_token_mask is not None:
+            x = x.masked_fill(~valid_token_mask[..., None], 0)
+        return x
 
     def forward(
         self,
