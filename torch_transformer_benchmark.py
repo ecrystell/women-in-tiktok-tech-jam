@@ -154,52 +154,6 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
     unchanged, which keeps strict state-dict copying compatible.
     """
 
-    def __init__(self, d_model: int, num_heads: int, ffn_dim: int) -> None:
-        super().__init__(d_model, num_heads, ffn_dim)
-        self._norm2_weight_version = self.norm2.weight._version
-        self._norm2_bias_version = self.norm2.bias._version
-        self._norm2_affine_is_identity = True
-        self.register_load_state_dict_post_hook(self._refresh_after_load)
-
-    def _refresh_after_load(self, module: nn.Module, incompatible_keys: object) -> None:
-        del module, incompatible_keys
-        self.prepare_ffn_weights()
-
-    @torch.no_grad()
-    def prepare_ffn_weights(self) -> None:
-        """Cache whether LayerNorm's learned affine is exactly an identity.
-
-        The value checks may synchronize when parameters live on CUDA, so the
-        benchmark calls this method before compilation and warmup. Non-identity
-        weights retain the native LayerNorm path.
-        """
-        self._norm2_affine_is_identity = bool(
-            torch.equal(
-                self.norm2.weight,
-                torch.ones_like(self.norm2.weight),
-            )
-            and bool(torch.count_nonzero(self.norm2.bias).item() == 0)
-        )
-        self._norm2_weight_version = self.norm2.weight._version
-        self._norm2_bias_version = self.norm2.bias._version
-
-    def _can_elide_norm2_affine(self, x: torch.Tensor) -> bool:
-        # Dynamo cannot guard on internal tensor version counters. Compiled
-        # inference consumes the explicitly prepared immutable decision;
-        # eager inference refreshes it if parameters were modified.
-        if not torch.compiler.is_compiling() and (
-            self._norm2_weight_version != self.norm2.weight._version
-            or self._norm2_bias_version != self.norm2.bias._version
-        ):
-            self.prepare_ffn_weights()
-        return (
-            self._norm2_affine_is_identity
-            and x.is_cuda
-            and x.dtype == torch.float16
-            and not self.training
-            and not torch.is_grad_enabled()
-        )
-
     def _ffn_residual(
         self,
         x: torch.Tensor,
@@ -210,17 +164,7 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         # view when the normalized output is contiguous and materializes a
         # contiguous layout only when the input strides require it.
         batch, seq_len, d_model = x.shape
-        if self._can_elide_norm2_affine(x):
-            normalized = F.layer_norm(
-                x,
-                self.norm2.normalized_shape,
-                None,
-                None,
-                self.norm2.eps,
-            )
-        else:
-            normalized = self.norm2(x)
-        ffn_input = normalized.reshape(batch * seq_len, d_model)
+        ffn_input = self.norm2(x).reshape(batch * seq_len, d_model)
 
         # Treat every token as one row for both GEMMs.  This gives the FFN a
         # stable [tokens, hidden] layout and lets torch.compile fuse the

@@ -231,12 +231,28 @@ unchanged.
 
 The prepacked-layout branch `person2/ffn-prepack-t4` changed cuBLAS kernels on
 both GPUs but did not clear the T4 gate: its first isolated shape measured only
-1.011x. A split-K down-projection reduced the raw short-shape GEMM median by
-about 31%, but alternate accumulation order caused strict near-zero failures;
-it is rejected. The current bounded experiment elides LayerNorm's affine work
-only when its learned scale is exactly one and bias exactly zero, as in the
-official untrained benchmark. Non-identity weights and unsupported execution
-modes use native LayerNorm. T4 acceptance results are pending.
+1.011x. The prepacked up product selected an NN kernel but was slower than the
+native TN kernel (0.0793 versus 0.0712 ms including exact GELU); the prepacked
+down product improved only from 0.1915 to 0.1905 ms. The candidate is rejected.
+
+A split-K down-projection reduced the raw short-shape median from 0.1901 to
+0.1311 ms (about 31%). FP16 partial reduction changed accumulation order and
+caused strict near-zero failures on multiple seeds; FP32 partials passed but
+regressed to 0.2519 ms. A reverse FP16 reduction order passed seven eager seed
+checks, but the equally compiled comparison still failed one element and
+measured 0.990x. Split-K is rejected.
+
+The final bounded experiment on `person2/ffn-ln-identity-t4` elided LayerNorm's
+affine work only when scale was exactly one and bias exactly zero, with native
+fallback for non-identity weights and unsupported modes. Candidate commit
+`a855739` passed all 16 T4 tests, including fullgraph compilation and randomized
+non-identity fallback. One fresh-process isolated FP16 sweep used 20 warmups,
+100 repetitions, and five alternating rounds. Every shape had zero error and
+its p90 improved, but median speedups were only 1.001x, 1.013x, 1.011x, 1.012x,
+and 1.002x in sweep order. The universal 1.05x gate therefore failed in the
+first process; the remaining two processes and full-block gate were not run.
+The identity-affine candidate is removed from the final source tree, and no
+speedup is claimed.
 
 ### Person 3 — integration, profiling, and dispatch
 
