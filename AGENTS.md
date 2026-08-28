@@ -89,7 +89,7 @@ Own FFN and normalization optimization. Start with `torch.compile`, exact
 fusion. Do not assume that a hand-written single kernel for both large Linear
 GEMMs is faster than optimized PyTorch/cuBLAS. Custom Triton is a stretch path.
 
-Current Person 2 branch: `person2/ffn-101-t4`.
+Current Person 2 branch: `person2/ffn-1005-t4`.
 
 Current Person 2 core commit: `d6bfab0 Add standalone Person 2 FFN optimization`.
 
@@ -98,200 +98,28 @@ unit tests, and `bench_person2_ffn.py` are implemented. Final
 `UserOptimizedTransformer` assembly remains owned by Person 3. The implementation
 uses exact GELU and a token-major FFN view; no custom Triton kernel was added.
 
-The newer-GPU validation target was commit `b4fd2b9`. It ran in Colab with
-Python 3.13.15, PyTorch 2.11.0+cu128, CUDA 12.8, driver 580.82.07, and a Tesla
-T4 (`sm_75`, 14.56 GiB). The reproducible notebook is named
-`Person2_T4_Validation_b4fd2b9.ipynb`. It uses `atol=0.001`, `rtol=0.01`, seed
-1234, CUDA-event timing, and excludes compile/autotune setup through warmup.
-All eight unit tests passed, including strict weight transfer, signatures,
-non-contiguous inputs, masks, causality, FP32, FP16, and runtime-supported BF16.
+Detailed Person 2 benchmark history, profiler evidence, and rejected
+variants now live in `PERSON2_EXPERIMENTS.md`. Keep `AGENTS.md` focused on
+the active handoff.
 
-All five isolated FP16 shapes passed with `max_abs=0`, `max_rel=0`, and zero
-failed elements. Each entry below is baseline median/p90 to optimized
-median/p90, followed by optimized throughput and median speedup. Sampling used
-20 warmups, 100 repetitions, and three alternating rounds.
+The current validation branch is `person2/ffn-1005-t4`, created from
+documentation commit `2a37c5b`. The acceptance threshold is now at least
+1.005x isolated FP16 median speedup on every one of the five T4 sweep shapes in
+each of three independent eager processes, with zero failed elements and no
+worse optimized p90.
 
-| Shape in `run_sweep.py` order | Mode | Latency (ms) | Optimized token/s | Speedup |
-| --- | --- | ---: | ---: | ---: |
-| `(1, 128, 512)` | eager | 0.2273/0.2632 to 0.2300/0.2724 | 556,599 | 0.988x |
-| `(8, 512, 512)` | eager | 1.0848/1.0998 to 1.0834/1.0875 | 3,780,718 | 1.001x |
-| `(8, 512, 512)`, causal, 20% padding | eager | 1.0732/1.1427 to 1.0701/1.0834 | 3,827,579 | 1.003x |
-| `(4, 2048, 1024)` | eager | 7.3932/7.4356 to 7.2991/7.4339 | 1,122,330 | 1.013x |
-| `(2, 4096, 1024)`, causal | eager | 7.4342/7.5763 to 7.4341/7.5756 | 1,101,943 | 1.000x |
-| `(1, 128, 512)` | `default` | 0.4050/0.4657 to 0.4322/0.4956 | 296,132 | 0.937x |
-| `(8, 512, 512)` | `default` | 1.0035/1.2742 to 0.9899/1.0042 | 4,137,909 | 1.014x |
-| `(8, 512, 512)`, causal, 20% padding | `default` | 0.9894/1.1166 to 0.9900/0.9933 | 4,137,374 | 0.999x |
-| `(4, 2048, 1024)` | `default` | 7.2508/7.4015 to 7.2505/7.4014 | 1,129,856 | 1.000x |
-| `(2, 4096, 1024)`, causal | `default` | 7.4010/7.5558 to 7.4015/7.5581 | 1,106,807 | 1.000x |
+The candidate to restore is the strongest balanced implementation from the
+1.01x pass: native up projection, ATen exact GELU using its owned temporary,
+a cached nonpersistent contiguous down operand, combined native
+GELU/down-projection orchestration, and 128-bit row-tiled FP16 residual/mask
+postprocessing. Its prior worst result was 1.006x, so it qualifies for
+revalidation under the new gate but is not accepted until the full three-process
+and full-block safety checks complete.
 
-The five full-block FP16 eager cases also had zero error. With five warmups,
-ten repetitions, and three rounds, their median speedups were 0.991x, 0.965x,
-1.001x, 1.014x, and 0.998x in sweep order. The former MX350 OOM case
-`(2, 4096, 1024)` completed on the T4 at 121.2859/121.8447 ms baseline versus
-121.4752/121.8742 ms optimized (median/p90, 67,438 optimized token/s).
-
-Representative causal, 20%-padded `(8, 512, 512)` checks also passed with zero
-error. FP32 measured 1.000x in eager and `default`; BF16 measured 1.000x eager.
-Although the runtime reports BF16 support, TorchInductor warns that the T4 does
-not support native BF16 compilation and skips that compilation, so the observed
-0.997x `default` result is not claimed as compiled performance.
-
-The universal-speedup follow-up branch is `person2/ffn-fusion-t4`. Commit
-`76a1d73` added static full-graph compilation, CUDA-graph output ownership and
-step markers, `max-autotune-no-cudagraphs`, focused tests, and the T4 profiler.
-Commit `181521e` corrected the profiler to count CUDA-only self time. The
-expanded local/T4 unit suite has 12 tests. `reduce-overhead` now executes all
-five shapes correctly instead of failing on overwritten CUDA-graph outputs.
-
-With 20 warmups, 100 repetitions, and five alternating rounds, compiler-only
-median speedups in sweep order were:
-
-| Global mode | Five isolated FP16 speedups | Universal 1.05x |
-| --- | --- | --- |
-| `default` | 0.996x, 1.000x, 1.000x, 1.000x, 1.000x | FAIL |
-| `reduce-overhead` | 0.999x, 1.001x, 1.012x, 1.000x, 1.000x | FAIL |
-| `max-autotune-no-cudagraphs` | 0.994x, 1.010x, 1.020x, 1.000x, 1.004x | FAIL |
-
-The corrected eager baseline profile reported the following CUDA-time shares.
-The Amdahl bound assumes every non-GEMM operation could be eliminated, so it is
-an upper bound rather than an expected result.
-
-| Shape | GEMM | LayerNorm | exact GELU | residual/mask | non-GEMM | Amdahl bound |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `(1, 128, 512)` | 86.59% | 3.58% | 2.65% | 3.91% | 13.41% | 1.155x |
-| `(8, 512, 512)` | 68.07% | 6.90% | 12.02% | 5.47% | 31.93% | 1.469x |
-| `(8, 512, 512)`, causal, padded | 67.71% | 6.93% | 12.27% | 5.44% | 32.29% | 1.477x |
-| `(4, 2048, 1024)` | 82.18% | 3.28% | 6.92% | 3.28% | 17.82% | 1.217x |
-| `(2, 4096, 1024)`, causal | 82.48% | 3.28% | 6.75% | 3.24% | 17.52% | 1.212x |
-
-A bounded CUDA/cuBLASLt experiment was attempted and rejected. Fusing the
-residual through cuBLASLt `beta=1` reordered FP16 arithmetic and failed 3 of
-65,536 elements (`max_abs=0.0078125`). Preserving baseline order by fusing only
-the residual add and final mask produced exact-zero error, but its five eager
-speedups were only 1.047x, 1.052x, 1.054x, 1.026x, and 1.006x. One-time
-cuBLASLt algorithm autotuning introduced a one-element strict failure on the
-short case and still did not make every other case 1.05x. Even eliminating all
-measured LayerNorm time would cap the worst strict-valid case near 1.04x, so the
-LayerNorm extension gate was closed. The rejected extension is absent from the
-final tree; its experimental commits remain in branch history.
-
-The official harness smoke test preserved the public forward signature and
-passed two strict trials with zero of 32,768 elements failing. No universal
-Person 2 optimization met the required 1.05x threshold, so the standalone
-PyTorch block remains the accepted implementation and no kernel speedup is
-claimed. Person 3 may use the measured table for dispatch, but Person 2 does not
-add shape dispatch or change `UserOptimizedTransformer`.
-
-The article-inspired GEMM follow-up branch is `person2/ffn-gemm-t4`, created
-from `ff54b21`. Commit `0d2d2f5` adds the retained, standalone up/down GEMM
-profiler. Candidate commit `bb62a8d` was evaluated on the same Colab Tesla T4
-with PyTorch 2.11.0+cu128 and CUDA 12.8. All 19 candidate tests passed on the
-T4, including multi-seed exact-GELU equivalence, custom-op fallbacks, repeated
-calls, masks, compilation tracing, and output ownership.
-
-The article's useful methodology was applied by timing each concrete workload
-independently before an end-to-end sweep. For the first and most
-launch-sensitive isolated FP16 shape, `(1, 128, 512)`, the generated workloads
-were up `[128,512] x [512,2048]` and down `[128,2048] x [2048,512]`. Baseline
-median/p90 measurements were 0.0470/0.0533 ms for the raw up GEMM,
-0.0726/0.0821 ms for up plus exact GELU, 0.1918/0.1925 ms for the raw down GEMM,
-and 0.1966/0.1970 ms for down plus residual.
-
-The Triton FP16 tensor-core up projection used FP32 accumulation, an explicit
-FP16 rounding boundary, and FP32 erf-based exact GELU. It passed the strict
-accuracy contract but measured 0.676896/0.681984 ms versus
-0.075216/0.103744 ms for PyTorch, about nine times slower. The strict-order
-cuBLASLt down projection plus residual/mask measured 0.198496/0.198656 ms versus
-0.196240/0.196608 ms for PyTorch. Of eight returned cuBLASLt algorithms, only
-algorithms 0 and 7 passed multi-seed strict validation; algorithm 0 measured
-0.1981/0.1986 ms and algorithm 7 measured 0.2158/0.2166 ms. Algorithms 1-6 each
-failed one element with `max_abs=0.00195312`.
-
-The combined isolated candidate retained zero failed elements
-(`max_abs=0.00195312`) but regressed from 0.4691/0.5110 ms to
-0.8925/1.0622 ms, a 0.526x median speedup. This fails both the universal 1.05x
-median gate and the no-worse-p90 gate on the first required shape. Because both
-experimental component replacements were already slower than PyTorch on that
-shape, no global candidate could satisfy the every-shape requirement. Per the
-early-stop rule, the remaining multi-process/full-sweep timing was not run and
-no speedup is claimed.
-
-Commit `ee3ab0d` removes the rejected Triton/cuBLASLt candidate, build files,
-and candidate-only tests while retaining the reusable per-GEMM profiler and
-the reliable standalone PyTorch block. The retained 13-test suite passes both
-locally and on the T4 across CPU and available CUDA FP32, FP16, and BF16. Final
-T4 strict-zero-error eager smokes measured 0.999x for FP32 and 1.000x for BF16.
-The official one-layer FP16 harness passed two trials with zero of 131,072
-elements failing; its reduced-sample median was 1.026x and is a safety smoke,
-not a performance claim. The preserved Colab artifact is named
-`Person2_T4_Article_GEMM_Gate_ee3ab0d.ipynb`. FP8/FP4 and integer quantization
-remain out of scope because they do not satisfy the T4 and strict FP16
-correctness contract. `UserOptimizedTransformer` and Person 3 dispatch remain
-unchanged.
-
-The prepacked-layout branch `person2/ffn-prepack-t4` changed cuBLAS kernels on
-both GPUs but did not clear the T4 gate: its first isolated shape measured only
-1.011x. The prepacked up product selected an NN kernel but was slower than the
-native TN kernel (0.0793 versus 0.0712 ms including exact GELU); the prepacked
-down product improved only from 0.1915 to 0.1905 ms. The candidate is rejected.
-
-A split-K down-projection reduced the raw short-shape median from 0.1901 to
-0.1311 ms (about 31%). FP16 partial reduction changed accumulation order and
-caused strict near-zero failures on multiple seeds; FP32 partials passed but
-regressed to 0.2519 ms. A reverse FP16 reduction order passed seven eager seed
-checks, but the equally compiled comparison still failed one element and
-measured 0.990x. Split-K is rejected.
-
-The final bounded experiment on `person2/ffn-ln-identity-t4` elided LayerNorm's
-affine work only when scale was exactly one and bias exactly zero, with native
-fallback for non-identity weights and unsupported modes. Candidate commit
-`a855739` passed all 16 T4 tests, including fullgraph compilation and randomized
-non-identity fallback. One fresh-process isolated FP16 sweep used 20 warmups,
-100 repetitions, and five alternating rounds. Every shape had zero error and
-its p90 improved, but median speedups were only 1.001x, 1.013x, 1.011x, 1.012x,
-and 1.002x in sweep order. The universal 1.05x gate therefore failed in the
-first process; the remaining two processes and full-block gate were not run.
-The identity-affine candidate is removed from the final source tree, and no
-speedup is claimed.
-
-The relaxed universal-gate experiment is `person2/ffn-101-t4`, created from
-`e9e7bad`. The bounded pass tested single-dispatch C++ orchestration around
-native exact GELU and cuBLAS, 128-bit residual/mask postprocessing, native
-in-place exact GELU on an owned temporary, a FP32-Welford LayerNorm kernel, and
-prepacked up/down projection operands. Every experimental T4 suite passed all
-18 tests, including strict state transfer, masks, repeated output ownership,
-CPU/FP32/BF16 fallbacks, and static full-graph tracing. The best candidates had
-zero failed elements at `atol=0.001`, `rtol=0.01`; the largest observed error
-was `0.00390625` on the two 512-wide medium cases.
-
-The strongest balanced candidate kept the native up projection, reused ATen's
-exact GELU output storage, prepacked only the down operand, and used the
-row-tiled post kernel for every supplied mask. Three independent eager
-processes used 20 warmups, 100 CUDA-event repetitions, and five alternating
-rounds. Their five median speedups in sweep order were:
-
-| Process | Five isolated FP16 speedups | Gate result |
-| --- | --- | --- |
-| 1 | 1.083x, 1.019x, 1.024x, 1.050x, 1.028x | PASS |
-| 2 | 1.081x, 1.010x, 1.018x, 1.049x, 1.036x | PASS (unrounded second ratio 1.0104x) |
-| 3 | 1.081x, 1.006x, 1.024x, 1.036x, 1.025x | FAIL |
-
-All 15 p90 comparisons improved and accuracy had zero failed elements, but the
-universal every-process 1.01x median gate failed on the unpadded
-`(8, 512, 512)` case. `reduce-overhead` was rejected at 0.950x, 0.960x,
-0.962x, 1.020x, and 1.001x. The Welford LayerNorm candidate was correct but
-slower on the medium cases (0.980x and 0.995x). Prepacking the up operand moved
-the bottleneck: its first process reached 1.040x/1.059x on the medium cases but
-only an unrounded 1.0095x on `(4, 2048, 1024)`; a later process measured 1.006x
-on the final long case and another had a short-case p90 regression. A custom
-erf GELU and in-place residual variant were also slower and rejected.
-
-Per the early-stop rule, the full-block gate was not rerun. The experimental
-extension, candidate-only tests, and altered block are removed from the final
-source tree; commit history and the populated Colab notebook preserve all
-evidence. The retained implementation is the strict-valid `e9e7bad` source,
-and no universal 1.01x speedup is claimed. `UserOptimizedTransformer` and
-Person 3 dispatch remain unchanged.
+The Colab target remains Tesla T4 (`sm_75`, 14.56 GiB), PyTorch
+2.11.0+cu128, and CUDA 12.8. The source is currently being restored and results
+for the 1.005x gate are pending. `UserOptimizedTransformer` and Person 3
+dispatch remain unchanged.
 
 ### Person 3 — integration, profiling, and dispatch
 
