@@ -89,7 +89,7 @@ Own FFN and normalization optimization. Start with `torch.compile`, exact
 fusion. Do not assume that a hand-written single kernel for both large Linear
 GEMMs is faster than optimized PyTorch/cuBLAS. Custom Triton is a stretch path.
 
-Current Person 2 branch: `person2/ffn-gemm-t4`.
+Current Person 2 branch: `person2/ffn-ln-identity-t4`.
 
 Current Person 2 core commit: `d6bfab0 Add standalone Person 2 FFN optimization`.
 
@@ -228,6 +228,15 @@ not a performance claim. The preserved Colab artifact is named
 remain out of scope because they do not satisfy the T4 and strict FP16
 correctness contract. `UserOptimizedTransformer` and Person 3 dispatch remain
 unchanged.
+
+The prepacked-layout branch `person2/ffn-prepack-t4` changed cuBLAS kernels on
+both GPUs but did not clear the T4 gate: its first isolated shape measured only
+1.011x. A split-K down-projection reduced the raw short-shape GEMM median by
+about 31%, but alternate accumulation order caused strict near-zero failures;
+it is rejected. The current bounded experiment elides LayerNorm's affine work
+only when its learned scale is exactly one and bias exactly zero, as in the
+official untrained benchmark. Non-identity weights and unsupported execution
+modes use native LayerNorm. T4 acceptance results are pending.
 
 ### Person 3 — integration, profiling, and dispatch
 
