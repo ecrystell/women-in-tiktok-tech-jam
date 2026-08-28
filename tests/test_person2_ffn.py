@@ -72,6 +72,16 @@ class Person2BlockTests(unittest.TestCase):
         self.assertEqual(set(baseline.state_dict()), set(optimized.state_dict()))
         optimized.load_state_dict(baseline.state_dict(), strict=True)
 
+    def test_identity_layernorm_decision_refreshes_after_strict_load(self) -> None:
+        baseline, optimized = self.make_blocks()
+        self.assertTrue(optimized._norm2_affine_is_identity)
+        with torch.no_grad():
+            baseline.norm2.weight[0] = 0.75
+            baseline.norm2.bias[1] = 0.125
+        optimized.load_state_dict(baseline.state_dict(), strict=True)
+        self.assertFalse(optimized._norm2_affine_is_identity)
+        self.assertEqual(set(baseline.state_dict()), set(optimized.state_dict()))
+
     def test_user_model_remains_owned_by_integration(self) -> None:
         config = TransformerConfig(1, 4, 32, 4, 64, 2, False)
         model = UserOptimizedTransformer(config)
@@ -192,6 +202,50 @@ class Person2BlockTests(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
 class Person2CudaTests(unittest.TestCase):
+    def test_cuda_fp16_elides_only_identity_layernorm_affine(self) -> None:
+        device = torch.device("cuda")
+        baseline, optimized = Person2BlockTests.make_blocks(
+            device, torch.float16
+        )
+        x = torch.randn(2, 16, 32, device=device, dtype=torch.float16)
+        mask = torch.tensor(
+            [[True] * 16, [True] * 12 + [False] * 4], device=device
+        )
+        with torch.inference_mode():
+            reference = baseline(x, mask, True)
+            with mock.patch(
+                "torch_transformer_benchmark.F.layer_norm",
+                wraps=torch.nn.functional.layer_norm,
+            ) as layer_norm:
+                candidate = optimized(x, mask, True)
+        identity_calls = [
+            call
+            for call in layer_norm.call_args_list
+            if len(call.args) >= 4 and call.args[2] is None and call.args[3] is None
+        ]
+        self.assertEqual(len(identity_calls), 1)
+        assert_or_close(self, reference, candidate)
+
+        with torch.no_grad():
+            baseline.norm2.weight.uniform_(0.5, 1.5)
+            baseline.norm2.bias.normal_(0, 0.1)
+        optimized.load_state_dict(baseline.state_dict(), strict=True)
+        self.assertFalse(optimized._norm2_affine_is_identity)
+        with torch.inference_mode():
+            reference = baseline(x, mask, False)
+            with mock.patch(
+                "torch_transformer_benchmark.F.layer_norm",
+                wraps=torch.nn.functional.layer_norm,
+            ) as layer_norm:
+                candidate = optimized(x, mask, False)
+        identity_calls = [
+            call
+            for call in layer_norm.call_args_list
+            if len(call.args) >= 4 and call.args[2] is None and call.args[3] is None
+        ]
+        self.assertEqual(identity_calls, [])
+        assert_or_close(self, reference, candidate)
+
     def test_cuda_float32_and_float16(self) -> None:
         device = torch.device("cuda")
         for dtype in (torch.float32, torch.float16):
@@ -221,6 +275,39 @@ class Person2CudaTests(unittest.TestCase):
                 baseline(x, mask, False),
                 optimized(x, mask, False),
             )
+
+    def test_cuda_compile_traces_identity_layernorm_path(self) -> None:
+        if torch.cuda.get_device_capability()[0] < 7:
+            self.skipTest("TorchInductor requires compute capability 7+")
+
+        class IsolatedFFN(torch.nn.Module):
+            def __init__(self, block: OptimizedTransformerBlock) -> None:
+                super().__init__()
+                self.block = block
+
+            def forward(
+                self, value: torch.Tensor, mask: torch.Tensor
+            ) -> torch.Tensor:
+                return self.block._ffn_residual(value, mask)
+
+        device = torch.device("cuda")
+        baseline, optimized = Person2BlockTests.make_blocks(
+            device, torch.float16
+        )
+        optimized.prepare_ffn_weights()
+        compiled = torch.compile(
+            IsolatedFFN(optimized), mode="default", fullgraph=True, dynamic=False
+        )
+        x = torch.randn(2, 16, 32, device=device, dtype=torch.float16)
+        mask = torch.ones(2, 16, device=device, dtype=torch.bool)
+        with torch.inference_mode():
+            reference = x + baseline.ffn_out(
+                torch.nn.functional.gelu(
+                    baseline.ffn_in(baseline.norm2(x)), approximate="none"
+                )
+            )
+            candidate = compiled(x, mask)
+        assert_or_close(self, reference, candidate)
 
 if __name__ == "__main__":
     unittest.main()
