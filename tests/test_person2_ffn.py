@@ -119,13 +119,12 @@ class Person2BlockTests(unittest.TestCase):
         x = torch.randn(2, 5, 32)
         mask = torch.tensor([[True] * 5, [True, True, True, False, False]])
 
-        def masked(update, residual, valid):
-            return (update + residual).masked_fill(~valid[:, None], 0)
-
-        def gelu_inplace(hidden):
-            hidden.copy_(
-                torch.nn.functional.gelu(hidden, approximate="none")
+        def combined(preactivation, weight, bias, residual, valid):
+            hidden = torch.nn.functional.gelu(
+                preactivation, approximate="none"
             )
+            update = torch.addmm(bias, hidden, weight)
+            return (update + residual).masked_fill(~valid[:, None], 0)
 
         with (
             mock.patch.object(
@@ -133,10 +132,8 @@ class Person2BlockTests(unittest.TestCase):
             ),
             mock.patch("person2_ffn_post.load_extension"),
             mock.patch(
-                "person2_ffn_post.residual_masked", side_effect=masked
-            ),
-            mock.patch(
-                "person2_ffn_post.gelu_exact_inplace", side_effect=gelu_inplace
+                "person2_ffn_post.exact_gelu_down_masked",
+                side_effect=combined,
             ),
         ):
             self.assertTrue(optimized.prepare_fast_ffn(x, mask))
@@ -172,7 +169,21 @@ class Person2BlockTests(unittest.TestCase):
             person2_ffn_post.residual_unmasked(update, residual).shape,
             (4, 8),
         )
-        self.assertIsNone(person2_ffn_post.gelu_exact_inplace(update))
+        preactivation = mode.from_tensor(torch.empty(4, 16))
+        weight = mode.from_tensor(torch.empty(16, 8))
+        bias = mode.from_tensor(torch.empty(8))
+        self.assertEqual(
+            person2_ffn_post.exact_gelu_down_masked(
+                preactivation, weight, bias, residual, mask
+            ).shape,
+            (4, 8),
+        )
+        self.assertEqual(
+            person2_ffn_post.exact_gelu_down_unmasked(
+                preactivation, weight, bias, residual
+            ).shape,
+            (4, 8),
+        )
 
     def test_user_model_remains_owned_by_integration(self) -> None:
         config = TransformerConfig(1, 4, 32, 4, 64, 2, False)

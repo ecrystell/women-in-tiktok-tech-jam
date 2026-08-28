@@ -249,15 +249,7 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         else:
             normalized = self.norm2(x)
         ffn_input = normalized.reshape(batch * seq_len, d_model)
-        hidden = self.ffn_in(ffn_input)
-        # ``hidden`` is a private temporary.  Reusing its storage avoids an
-        # allocator operation while retaining the erf-based exact GELU.
-        person2_ffn_post.gelu_exact_inplace(hidden)
-        update = torch.addmm(
-            self.ffn_out.bias,
-            hidden,
-            self._ffn_out_weight_nt,
-        )
+        preactivation = self.ffn_in(ffn_input)
         residual = x.reshape(batch * seq_len, d_model)
         prepared_all_valid = (
             valid_token_mask is not None
@@ -266,10 +258,17 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
             and valid_token_mask.data_ptr() == self._prepared_all_valid_mask_ptr
         )
         if valid_token_mask is None or prepared_all_valid:
-            output = person2_ffn_post.residual_unmasked(update, residual)
+            output = person2_ffn_post.exact_gelu_down_unmasked(
+                preactivation,
+                self._ffn_out_weight_nt,
+                self.ffn_out.bias,
+                residual,
+            )
         else:
-            output = person2_ffn_post.residual_masked(
-                update,
+            output = person2_ffn_post.exact_gelu_down_masked(
+                preactivation,
+                self._ffn_out_weight_nt,
+                self.ffn_out.bias,
                 residual,
                 valid_token_mask.reshape(-1),
             )

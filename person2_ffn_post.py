@@ -101,14 +101,51 @@ def _residual_unmasked_fake(
     return torch.empty_like(residual)
 
 
-@torch.library.custom_op(
-    "person2_post::gelu_exact_inplace_v1", mutates_args=("hidden",)
-)
-def gelu_exact_inplace(hidden: torch.Tensor) -> None:
-    """Apply erf-based exact GELU to an exclusively owned FP16 temporary."""
-    load_extension().gelu_exact_inplace(hidden)
+@torch.library.custom_op("person2_post::exact_gelu_down_masked_v1", mutates_args=())
+def exact_gelu_down_masked(
+    preactivation: torch.Tensor,
+    weight_nt: torch.Tensor,
+    bias: torch.Tensor,
+    residual: torch.Tensor,
+    valid_token_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Launch native exact GELU/down GEMM and the masked post kernel in C++."""
+    return load_extension().exact_gelu_down_masked(
+        preactivation, weight_nt, bias, residual, valid_token_mask
+    )
 
 
-@gelu_exact_inplace.register_fake
-def _gelu_exact_inplace_fake(hidden: torch.Tensor) -> None:
-    del hidden
+@exact_gelu_down_masked.register_fake
+def _exact_gelu_down_masked_fake(
+    preactivation: torch.Tensor,
+    weight_nt: torch.Tensor,
+    bias: torch.Tensor,
+    residual: torch.Tensor,
+    valid_token_mask: torch.Tensor,
+) -> torch.Tensor:
+    del preactivation, weight_nt, bias, valid_token_mask
+    return torch.empty_like(residual)
+
+
+@torch.library.custom_op("person2_post::exact_gelu_down_unmasked_v1", mutates_args=())
+def exact_gelu_down_unmasked(
+    preactivation: torch.Tensor,
+    weight_nt: torch.Tensor,
+    bias: torch.Tensor,
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    """Launch native exact GELU/down GEMM and the unmasked post kernel in C++."""
+    return load_extension().exact_gelu_down_unmasked(
+        preactivation, weight_nt, bias, residual
+    )
+
+
+@exact_gelu_down_unmasked.register_fake
+def _exact_gelu_down_unmasked_fake(
+    preactivation: torch.Tensor,
+    weight_nt: torch.Tensor,
+    bias: torch.Tensor,
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    del preactivation, weight_nt, bias
+    return torch.empty_like(residual)
