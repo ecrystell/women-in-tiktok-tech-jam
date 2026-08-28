@@ -12,25 +12,25 @@ void residual_unmasked_cuda(
     torch::Tensor& output);
 
 torch::Tensor exact_gelu_down_masked(
-    const torch::Tensor& preactivation,
+    torch::Tensor preactivation,
     const torch::Tensor& weight_nt,
     const torch::Tensor& bias,
     const torch::Tensor& residual,
     const torch::Tensor& valid_token_mask) {
-  auto hidden = at::gelu(preactivation, "none");
-  auto update = at::addmm(bias, hidden, weight_nt);
+  at::gelu_(preactivation, "none");
+  auto update = at::addmm(bias, preactivation, weight_nt);
   auto output = torch::empty_like(residual);
   residual_masked_cuda(update, residual, valid_token_mask, output);
   return output;
 }
 
 torch::Tensor exact_gelu_down_unmasked(
-    const torch::Tensor& preactivation,
+    torch::Tensor preactivation,
     const torch::Tensor& weight_nt,
     const torch::Tensor& bias,
     const torch::Tensor& residual) {
-  auto hidden = at::gelu(preactivation, "none");
-  auto update = at::addmm(bias, hidden, weight_nt);
+  at::gelu_(preactivation, "none");
+  auto update = at::addmm(bias, preactivation, weight_nt);
   auto output = torch::empty_like(residual);
   residual_unmasked_cuda(update, residual, output);
   return output;

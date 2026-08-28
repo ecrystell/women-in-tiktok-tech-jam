@@ -101,7 +101,10 @@ def _residual_unmasked_fake(
     return torch.empty_like(residual)
 
 
-@torch.library.custom_op("person2_post::exact_gelu_down_masked_v1", mutates_args=())
+@torch.library.custom_op(
+    "person2_post::exact_gelu_down_masked_v2",
+    mutates_args=("preactivation",),
+)
 def exact_gelu_down_masked(
     preactivation: torch.Tensor,
     weight_nt: torch.Tensor,
@@ -127,7 +130,10 @@ def _exact_gelu_down_masked_fake(
     return torch.empty_like(residual)
 
 
-@torch.library.custom_op("person2_post::exact_gelu_down_unmasked_v1", mutates_args=())
+@torch.library.custom_op(
+    "person2_post::exact_gelu_down_unmasked_v2",
+    mutates_args=("preactivation",),
+)
 def exact_gelu_down_unmasked(
     preactivation: torch.Tensor,
     weight_nt: torch.Tensor,
