@@ -278,6 +278,7 @@ def make_models(
     optimized_block.load_state_dict(baseline_block.state_dict(), strict=True)
     baseline_block = baseline_block.to(device=device, dtype=dtype).eval()
     optimized_block = optimized_block.to(device=device, dtype=dtype).eval()
+    optimized_block.prepare_ffn_weights()
 
     if scope == "isolated":
         return BaselineFFNResidual(baseline_block), OptimizedFFNResidual(

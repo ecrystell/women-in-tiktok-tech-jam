@@ -154,6 +154,59 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
     unchanged, which keeps strict state-dict copying compatible.
     """
 
+    def __init__(self, d_model: int, num_heads: int, ffn_dim: int) -> None:
+        super().__init__(d_model, num_heads, ffn_dim)
+
+        # cuBLAS can select materially different kernels for a contiguous
+        # [K, N] operand than for nn.Linear's transposed [N, K] weight view.
+        # These inference-only copies are non-persistent buffers: they follow
+        # device/dtype moves but do not alter parameter names or state_dict().
+        self.register_buffer(
+            "_ffn_in_weight_nt",
+            self.ffn_in.weight.detach().t().contiguous(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_ffn_out_weight_nt",
+            self.ffn_out.weight.detach().t().contiguous(),
+            persistent=False,
+        )
+        self._ffn_in_weight_version = self.ffn_in.weight._version
+        self._ffn_out_weight_version = self.ffn_out.weight._version
+        self.register_load_state_dict_post_hook(self._refresh_after_load)
+
+    def _refresh_after_load(self, module: nn.Module, incompatible_keys: object) -> None:
+        del module, incompatible_keys
+        self._refresh_prepacked_ffn_weights()
+
+    @torch.no_grad()
+    def _refresh_prepacked_ffn_weights(self) -> None:
+        """Refresh non-persistent copies after a strict weight transfer."""
+        self._ffn_in_weight_nt = self.ffn_in.weight.detach().t().contiguous()
+        self._ffn_out_weight_nt = self.ffn_out.weight.detach().t().contiguous()
+        self._ffn_in_weight_version = self.ffn_in.weight._version
+        self._ffn_out_weight_version = self.ffn_out.weight._version
+
+    def prepare_ffn_weights(self) -> None:
+        """Prepare the inference cache outside benchmark timing/compilation."""
+        self._refresh_prepacked_ffn_weights()
+
+    def _can_use_prepacked_ffn(self, x: torch.Tensor) -> bool:
+        return (
+            x.is_cuda
+            and x.dtype == torch.float16
+            and not self.training
+            and not torch.is_grad_enabled()
+        )
+
+    def _prepacked_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self._ffn_in_weight_version != self.ffn_in.weight._version
+            or self._ffn_out_weight_version != self.ffn_out.weight._version
+        ):
+            self._refresh_prepacked_ffn_weights()
+        return self._ffn_in_weight_nt, self._ffn_out_weight_nt
+
     def _ffn_residual(
         self,
         x: torch.Tensor,
@@ -169,9 +222,15 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         # Treat every token as one row for both GEMMs.  This gives the FFN a
         # stable [tokens, hidden] layout and lets torch.compile fuse the
         # surrounding pointwise work when the model is compiled.
-        ffn_update = self.ffn_out(
-            F.gelu(self.ffn_in(ffn_input), approximate="none")
-        )
+        if self._can_use_prepacked_ffn(ffn_input):
+            in_weight, out_weight = self._prepacked_weights()
+            hidden = torch.addmm(self.ffn_in.bias, ffn_input, in_weight)
+            hidden = F.gelu(hidden, approximate="none")
+            ffn_update = torch.addmm(self.ffn_out.bias, hidden, out_weight)
+        else:
+            ffn_update = self.ffn_out(
+                F.gelu(self.ffn_in(ffn_input), approximate="none")
+            )
 
         # Keep the residual add as one expression so the compiler can fuse it
         # with compatible producer/consumer operations.

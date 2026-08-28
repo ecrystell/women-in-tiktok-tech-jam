@@ -191,6 +191,8 @@ def main() -> int:
             linear_up = F.linear(normalized, block.ffn_in.weight, block.ffn_in.bias)
             hidden = F.gelu(linear_up, approximate="none")
             residual = x.reshape(tokens, case.d_model)
+            in_weight_nt = block.ffn_in.weight.detach().t().contiguous()
+            out_weight_nt = block.ffn_out.weight.detach().t().contiguous()
         up_shape, down_shape = gemm_shapes(case)
         stages = (
             (
@@ -209,6 +211,21 @@ def main() -> int:
                 ),
             ),
             (
+                up_shape,
+                "up_addmm_prepacked_nt",
+                lambda: torch.addmm(
+                    block.ffn_in.bias, normalized, in_weight_nt
+                ),
+            ),
+            (
+                up_shape,
+                "up_addmm_prepacked_nt_exact_gelu",
+                lambda: F.gelu(
+                    torch.addmm(block.ffn_in.bias, normalized, in_weight_nt),
+                    approximate="none",
+                ),
+            ),
+            (
                 down_shape,
                 "down_linear",
                 lambda: F.linear(hidden, block.ffn_out.weight, block.ffn_out.bias),
@@ -218,6 +235,19 @@ def main() -> int:
                 "down_linear_residual",
                 lambda: residual
                 + F.linear(hidden, block.ffn_out.weight, block.ffn_out.bias),
+            ),
+            (
+                down_shape,
+                "down_addmm_prepacked_nt",
+                lambda: torch.addmm(
+                    block.ffn_out.bias, hidden, out_weight_nt
+                ),
+            ),
+            (
+                down_shape,
+                "down_addmm_prepacked_nt_residual",
+                lambda: residual
+                + torch.addmm(block.ffn_out.bias, hidden, out_weight_nt),
             ),
         )
         for shape, name, operation in stages:

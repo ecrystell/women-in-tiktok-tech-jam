@@ -89,7 +89,7 @@ Own FFN and normalization optimization. Start with `torch.compile`, exact
 fusion. Do not assume that a hand-written single kernel for both large Linear
 GEMMs is faster than optimized PyTorch/cuBLAS. Custom Triton is a stretch path.
 
-Current Person 2 branch: `person2/ffn-gemm-t4`.
+Current Person 2 branch: `person2/ffn-prepack-t4`.
 
 Current Person 2 core commit: `d6bfab0 Add standalone Person 2 FFN optimization`.
 
@@ -228,6 +228,13 @@ not a performance claim. The preserved Colab artifact is named
 remain out of scope because they do not satisfy the T4 and strict FP16
 correctness contract. `UserOptimizedTransformer` and Person 3 dispatch remain
 unchanged.
+
+The next bounded experiment is `person2/ffn-prepack-t4`, created from
+`8fc0ad7`. It tests inference-time contiguous transposed copies of the existing
+FP16 FFN weights so the up/down products can use non-transposed GEMM operands.
+The hypothesis is motivated by the T4 profile's especially low down-projection
+throughput. Exact GELU, residual/mask order, parameter names, state-dict layout,
+and `UserOptimizedTransformer` remain unchanged. Results are pending.
 
 ### Person 3 — integration, profiling, and dispatch
 
