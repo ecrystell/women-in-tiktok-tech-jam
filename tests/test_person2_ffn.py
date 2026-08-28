@@ -72,6 +72,36 @@ class Person2BlockTests(unittest.TestCase):
         self.assertEqual(set(baseline.state_dict()), set(optimized.state_dict()))
         optimized.load_state_dict(baseline.state_dict(), strict=True)
 
+    def test_prepacked_weights_are_nonpersistent_and_refresh_after_load(self) -> None:
+        baseline, optimized = self.make_blocks()
+        self.assertNotIn("_ffn_in_weight_nt", optimized.state_dict())
+        self.assertNotIn("_ffn_out_weight_nt", optimized.state_dict())
+        self.assertTrue(optimized._ffn_in_weight_nt.is_contiguous())
+        self.assertTrue(optimized._ffn_out_weight_nt.is_contiguous())
+        self.assertTrue(
+            torch.equal(
+                optimized._ffn_in_weight_nt,
+                optimized.ffn_in.weight.detach().t().contiguous(),
+            )
+        )
+
+        with torch.no_grad():
+            baseline.ffn_in.weight.add_(0.125)
+            baseline.ffn_out.weight.sub_(0.25)
+        optimized.load_state_dict(baseline.state_dict(), strict=True)
+        self.assertTrue(
+            torch.equal(
+                optimized._ffn_in_weight_nt,
+                optimized.ffn_in.weight.detach().t().contiguous(),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                optimized._ffn_out_weight_nt,
+                optimized.ffn_out.weight.detach().t().contiguous(),
+            )
+        )
+
     def test_user_model_remains_owned_by_integration(self) -> None:
         config = TransformerConfig(1, 4, 32, 4, 64, 2, False)
         model = UserOptimizedTransformer(config)
@@ -192,6 +222,28 @@ class Person2BlockTests(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
 class Person2CudaTests(unittest.TestCase):
+    def test_cuda_fp16_uses_prepacked_addmm_path(self) -> None:
+        device = torch.device("cuda")
+        baseline, optimized = Person2BlockTests.make_blocks(
+            device, torch.float16
+        )
+        x = torch.randn(2, 16, 32, device=device, dtype=torch.float16)
+        mask = torch.tensor(
+            [[True] * 16, [True] * 12 + [False] * 4], device=device
+        )
+        with torch.inference_mode():
+            reference = x + baseline.ffn_out(
+                torch.nn.functional.gelu(
+                    baseline.ffn_in(baseline.norm2(x)), approximate="none"
+                )
+            )
+            reference = reference.masked_fill(~mask[..., None], 0)
+            with mock.patch.object(torch, "addmm", wraps=torch.addmm) as addmm:
+                candidate = optimized._ffn_residual(x, mask)
+        self.assertEqual(addmm.call_count, 2)
+        assert_or_close(self, reference, candidate)
+        self.assertTrue(bool((candidate[~mask] == 0).all().item()))
+
     def test_cuda_float32_and_float16(self) -> None:
         device = torch.device("cuda")
         for dtype in (torch.float32, torch.float16):
@@ -205,6 +257,39 @@ class Person2CudaTests(unittest.TestCase):
                 reference = baseline(x, mask, True)
                 candidate = optimized(x, mask, True)
             assert_or_close(self, reference, candidate)
+
+    def test_cuda_compile_traces_prepacked_path(self) -> None:
+        if torch.cuda.get_device_capability()[0] < 7:
+            self.skipTest("TorchInductor requires compute capability 7+")
+
+        class IsolatedFFN(torch.nn.Module):
+            def __init__(self, block: OptimizedTransformerBlock) -> None:
+                super().__init__()
+                self.block = block
+
+            def forward(
+                self, value: torch.Tensor, mask: torch.Tensor
+            ) -> torch.Tensor:
+                return self.block._ffn_residual(value, mask)
+
+        device = torch.device("cuda")
+        baseline, optimized = Person2BlockTests.make_blocks(
+            device, torch.float16
+        )
+        optimized.prepare_ffn_weights()
+        compiled = torch.compile(
+            IsolatedFFN(optimized), mode="default", fullgraph=True, dynamic=False
+        )
+        x = torch.randn(2, 16, 32, device=device, dtype=torch.float16)
+        mask = torch.ones(2, 16, device=device, dtype=torch.bool)
+        with torch.inference_mode():
+            reference = x + baseline.ffn_out(
+                torch.nn.functional.gelu(
+                    baseline.ffn_in(baseline.norm2(x)), approximate="none"
+                )
+            )
+            candidate = compiled(x, mask)
+        assert_or_close(self, reference, candidate)
 
     def test_cuda_bfloat16_when_supported(self) -> None:
         if not torch.cuda.is_bf16_supported():
