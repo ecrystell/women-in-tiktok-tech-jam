@@ -98,19 +98,52 @@ unit tests, and `bench_person2_ffn.py` are implemented. Final
 `UserOptimizedTransformer` assembly remains owned by Person 3. The implementation
 uses exact GELU and a token-major FFN view; no custom Triton kernel was added.
 
-Local validation used Python 3.10, PyTorch 2.12.1+cu126, and an NVIDIA GeForce
-MX350 (`sm_61`, 2 GB). All eight CPU/CUDA unit tests passed for strict weight
-copy, full-block and isolated FFN equivalence, non-contiguous inputs, masking,
-causality, float32, float16, and the runtime-supported bfloat16 path. All five
-isolated float16 sweep shapes had zero output error. Their eager median speedups
-were 0.982x, 1.006x, 0.995x, 1.086x, and 1.069x in `run_sweep.py` order; the last
-case had a worse optimized p90, so there is no blanket speedup claim.
+The newer-GPU validation target was commit `b4fd2b9`. It ran in Colab with
+Python 3.13.15, PyTorch 2.11.0+cu128, CUDA 12.8, driver 580.82.07, and a Tesla
+T4 (`sm_75`, 14.56 GiB). The reproducible notebook is named
+`Person2_T4_Validation_b4fd2b9.ipynb`. It uses `atol=0.001`, `rtol=0.01`, seed
+1234, CUDA-event timing, and excludes compile/autotune setup through warmup.
+All eight unit tests passed, including strict weight transfer, signatures,
+non-contiguous inputs, masks, causality, FP32, FP16, and runtime-supported BF16.
 
-The `default`, `reduce-overhead`, and `max-autotune` compile modes are unsupported
-on this GPU because TorchInductor's Triton backend requires compute capability
-7.0 or newer. Four full-block sweep shapes passed with zero error; the
-`(2, 4096, 1024)` full-attention case exceeded the 2 GB GPU memory. Re-run the
-compiled comparisons and long full-block case on the team's newer target GPU.
+All five isolated FP16 shapes passed with `max_abs=0`, `max_rel=0`, and zero
+failed elements. Each entry below is baseline median/p90 to optimized
+median/p90, followed by optimized throughput and median speedup. Sampling used
+20 warmups, 100 repetitions, and three alternating rounds.
+
+| Shape in `run_sweep.py` order | Mode | Latency (ms) | Optimized token/s | Speedup |
+| --- | --- | ---: | ---: | ---: |
+| `(1, 128, 512)` | eager | 0.2273/0.2632 to 0.2300/0.2724 | 556,599 | 0.988x |
+| `(8, 512, 512)` | eager | 1.0848/1.0998 to 1.0834/1.0875 | 3,780,718 | 1.001x |
+| `(8, 512, 512)`, causal, 20% padding | eager | 1.0732/1.1427 to 1.0701/1.0834 | 3,827,579 | 1.003x |
+| `(4, 2048, 1024)` | eager | 7.3932/7.4356 to 7.2991/7.4339 | 1,122,330 | 1.013x |
+| `(2, 4096, 1024)`, causal | eager | 7.4342/7.5763 to 7.4341/7.5756 | 1,101,943 | 1.000x |
+| `(1, 128, 512)` | `default` | 0.4050/0.4657 to 0.4322/0.4956 | 296,132 | 0.937x |
+| `(8, 512, 512)` | `default` | 1.0035/1.2742 to 0.9899/1.0042 | 4,137,909 | 1.014x |
+| `(8, 512, 512)`, causal, 20% padding | `default` | 0.9894/1.1166 to 0.9900/0.9933 | 4,137,374 | 0.999x |
+| `(4, 2048, 1024)` | `default` | 7.2508/7.4015 to 7.2505/7.4014 | 1,129,856 | 1.000x |
+| `(2, 4096, 1024)`, causal | `default` | 7.4010/7.5558 to 7.4015/7.5581 | 1,106,807 | 1.000x |
+
+The five full-block FP16 eager cases also had zero error. With five warmups,
+ten repetitions, and three rounds, their median speedups were 0.991x, 0.965x,
+1.001x, 1.014x, and 0.998x in sweep order. The former MX350 OOM case
+`(2, 4096, 1024)` completed on the T4 at 121.2859/121.8447 ms baseline versus
+121.4752/121.8742 ms optimized (median/p90, 67,438 optimized token/s).
+
+Representative causal, 20%-padded `(8, 512, 512)` checks also passed with zero
+error. FP32 measured 1.000x in eager and `default`; BF16 measured 1.000x eager.
+Although the runtime reports BF16 support, TorchInductor warns that the T4 does
+not support native BF16 compilation and skips that compilation, so the observed
+0.997x `default` result is not claimed as compiled performance.
+
+`reduce-overhead` and `max-autotune` could not be timed: alternating baseline
+and candidate calls access a CUDA-graph output overwritten by a subsequent run.
+The exact backend error is retained in the notebook. `max-autotune` also reports
+that the T4 has too few SMs for `max_autotune_gemm`. No speedup is claimed for
+either mode. The official harness smoke test preserved the public forward
+signature and passed two strict trials with zero of 32,768 elements failing.
+Results remain shape-dependent and essentially neutral, so there is no blanket
+speedup claim and the profiler-evidence gate for a custom Triton fusion remains.
 
 ### Person 3 — integration, profiling, and dispatch
 
