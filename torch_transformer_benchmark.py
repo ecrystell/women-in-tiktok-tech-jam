@@ -399,7 +399,9 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
             and self._fast_parameters_are_current()
             and self._supports_fast_ffn(x, valid_token_mask)
         ):
-            if self._compact_mask_is_current(valid_token_mask):
+            if self._compact_ffn_enabled and self._compact_mask_is_current(
+                valid_token_mask
+            ):
                 return self._ffn_residual_compact(x)
             return self._ffn_residual_fast(x, valid_token_mask)
         return self._ffn_residual_native(x, valid_token_mask)
