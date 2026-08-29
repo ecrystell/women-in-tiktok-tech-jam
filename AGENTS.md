@@ -89,7 +89,16 @@ Own FFN and normalization optimization. Start with `torch.compile`, exact
 fusion. Do not assume that a hand-written single kernel for both large Linear
 GEMMs is faster than optimized PyTorch/cuBLAS. Custom Triton is a stretch path.
 
-Current Person 2 branch: `person2/ffn-fullop-t4`.
+Current Person 2 branch: `person2/tensorrt-ffn-t4`, created from validated
+control `person2/ffn-fullop-t4` at `f50ef57`.
+
+This pass evaluates two separately gated T4 inference candidates: a native
+CUDA fusion of the attention residual add with FP32-statistics identity
+`norm2`, and an optional fixed-shape TensorRT FFN engine using exact
+`GELU_ERF`. Both retain the current PyTorch/CUDA full-op as rollback; neither
+may modify `UserOptimizedTransformer`, state-dict layout, or the public
+forward signature. Transformer Engine / FP8 is excluded on the Tesla T4
+(`sm_75`).
 
 Current Person 2 core commit: `d6bfab0 Add standalone Person 2 FFN optimization`.
 
