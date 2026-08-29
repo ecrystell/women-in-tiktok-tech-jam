@@ -223,3 +223,51 @@ noisy small-shape run and remains Person 3's responsibility.
 The all-valid-mask bypass remains reverted at source commit `fd7b8d7`. It is
 rejected because its saved launch/mask work is smaller than short-shape
 variance and does not satisfy repeatable isolated or full-block safety gates.
+
+## Task 2 full-op orchestration pass
+
+Branch `person2/ffn-fullop-t4` revisited the fused-FFN assignment without
+replacing either cuBLAS GEMM. Source commit `16cf403` places identity-affine
+LayerNorm, the native up projection, exact in-place ATen GELU, the native down
+projection, and the existing vectorized residual/mask post kernel behind one
+inference-only C++ custom-op boundary. This preserves operation order and
+removes Python and custom-op transitions between the stages. Nonidentity
+LayerNorm parameters and unsupported environments retain the native fallback.
+
+On Tesla T4 (`sm_75`, 15,360 MiB), driver 580.82.07, PyTorch 2.11.0+cu128,
+and CUDA 12.8, all 19 tests passed in 102.240 seconds. This included actual
+CUDA extension execution, strict state loading, fake/meta tracing, static
+full-graph compilation, masks, repeated output ownership, exact invalid
+zeroing, FP16, FP32 fallback, and runtime-supported BF16 fallback.
+
+The five-shape isolated FP16 gate used seed 1234, `atol=0.001`, `rtol=0.01`,
+20 warmups, 100 CUDA-event repetitions, five alternating rounds, and three
+independent processes:
+
+| Process | Five isolated speedups | Lowest | p90 / accuracy |
+| --- | --- | --- | --- |
+| 1 | 1.184x, 1.023x, 1.052x, 1.035x, 1.053x | 1.023x | all improved / zero failures |
+| 2 | 1.086x, 1.026x, 1.047x, 1.053x, 1.038x | 1.026x | all improved / zero failures |
+| 3 | 1.084x, 1.023x, 1.034x, 1.051x, 1.051x | 1.023x | all improved / zero failures |
+
+The repeatable universal 1.005x isolated gate therefore passed. The smallest
+margin was still 1.023x, and all 15 optimized p90 measurements were lower.
+
+The reduced-sampling full-block sweep measured 1.004x, 0.858x, 1.004x,
+1.008x, and 1.001x. The medium unpadded result was inconsistent with its
+isolated result and failed the 0.99x safety threshold; the short p90 was also
+noisy. Primary-sampling repeats were therefore run instead of discarding the
+observation. The short full block measured 1.037x with p90 improving from
+1.2606 to 1.1983 ms. Three independent primary-sampling medium full-block
+processes measured 1.016x, 1.011x, and 1.013x, each with lower p90 and zero
+failed elements. The 0.858x observation remains reported as sampling variance,
+so the full-block result carries this caveat even though primary repeats pass.
+
+Static `default` compilation remained strict-correct on the short isolated
+case and measured 1.035x. The official harness smoke test retained the
+unchanged `UserOptimizedTransformer.forward`, passed with zero error, and
+measured 1.013x in that run. The algebraic identity-LayerNorm/up-projection
+reformulation was also screened: it had zero strict failures on short and
+medium shapes, but was not promoted because it changes floating-point
+evaluation and would require a new fused statistics/correction kernel. It
+remains a separately gated future experiment rather than part of this result.

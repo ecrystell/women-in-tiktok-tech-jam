@@ -102,11 +102,14 @@ Detailed Person 2 benchmark history, profiler evidence, and rejected
 variants now live in `PERSON2_EXPERIMENTS.md`. Keep `AGENTS.md` focused on
 the active handoff.
 
-The current validation branch is `person2/ffn-1005-t4`. It restores the
-strongest balanced implementation from the 1.01x pass: native up projection,
-ATen exact GELU using its owned temporary, a cached nonpersistent contiguous
-down operand, combined native GELU/down-projection orchestration, and 128-bit
-row-tiled FP16 residual/mask postprocessing.
+The current validation branch is `person2/ffn-fullop-t4`. Source commit
+`16cf403` extends the strongest balanced implementation with a single
+inference-only custom-op boundary for the complete identity-affine LayerNorm
+and FFN sequence. PyTorch/cuBLAS still execute both GEMMs and ATen still
+executes exact GELU; the custom boundary removes Python/dispatcher transitions
+and finishes with the existing 128-bit residual/mask kernel. Nonidentity
+LayerNorm parameters, unsupported devices/dtypes/layouts, build failures, and
+failed numerical preflight retain the native fallback.
 
 The NeurIPS run-length-tokenization follow-up adds a strictly guarded valid-row
 compaction path. Setup caches row indices only when the exact supplied mask has
@@ -133,13 +136,15 @@ The primary-sampling short full-block result was 0.969x and its p90 regressed
 Current validated source commit: `fd7b8d7`. `UserOptimizedTransformer` and
 Person 3 dispatch remain unchanged.
 
-The active Task 2 follow-up starts from documentation commit `436aac6` and
-tests a single inference-only C++ custom op that orchestrates identity
-LayerNorm, native cuBLAS up projection, exact ATen GELU, native down
-projection, and the existing vectorized residual/mask kernel. The objective is
-to reduce framework launch overhead without replacing either GEMM or changing
-numerical order. It is experimental until strict T4 profiling and all gates
-pass; the padded-row compaction and `fd7b8d7` source remain the fallback.
+The Task 2 full-op candidate passed all 19 tests at `16cf403` on the Colab T4.
+Across three independent five-shape isolated FP16 sweeps, its lowest speedup
+was 1.023x; all 15 p90 comparisons improved and every accuracy comparison had
+zero failed elements. A reduced-sampling full-block sweep produced one 0.858x
+medium outlier. Primary-sampling diagnosis did not reproduce it: three medium
+full-block processes measured 1.016x, 1.011x, and 1.013x with improved p90,
+while the short primary result was 1.037x. The outlier remains disclosed in
+`PERSON2_EXPERIMENTS.md`; the isolated universal 1.005x claim is validated,
+and full-block evidence is reported with that variance caveat.
 
 ### Person 3 — integration, profiling, and dispatch
 

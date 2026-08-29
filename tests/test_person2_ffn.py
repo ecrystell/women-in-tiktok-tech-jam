@@ -359,6 +359,33 @@ class Person2BlockTests(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
 class Person2CudaTests(unittest.TestCase):
+    def test_cuda_full_op_masked_and_unmasked(self) -> None:
+        from torch.utils.cpp_extension import CUDA_HOME
+
+        if CUDA_HOME is None:
+            self.skipTest("a CUDA toolkit is unavailable for extension build")
+        device = torch.device("cuda")
+        baseline, optimized = Person2BlockTests.make_blocks(
+            device, torch.float16
+        )
+        x = torch.randn(2, 16, 32, device=device, dtype=torch.float16)
+        all_valid = torch.ones(2, 16, device=device, dtype=torch.bool)
+        for mask in (None, all_valid):
+            self.assertTrue(
+                optimized.prepare_fast_ffn(x, mask), optimized.fast_ffn_error
+            )
+            with torch.inference_mode():
+                reference = x + baseline.ffn_out(
+                    torch.nn.functional.gelu(
+                        baseline.ffn_in(baseline.norm2(x)), approximate="none"
+                    )
+                )
+                candidate = optimized._ffn_residual_fast(x, mask)
+                repeated = optimized._ffn_residual_fast(x, mask)
+            assert_or_close(self, reference, candidate)
+            self.assertTrue(torch.equal(candidate, repeated))
+            self.assertNotEqual(candidate.data_ptr(), repeated.data_ptr())
+
     def test_cuda_fast_ffn_extension_and_compile(self) -> None:
         from torch.utils.cpp_extension import CUDA_HOME
 
