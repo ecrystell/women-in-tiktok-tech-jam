@@ -168,11 +168,13 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         self._norm2_weight_version = self.norm2.weight._version
         self._norm2_bias_version = self.norm2.bias._version
         self._fast_ffn_enabled = False
+        self._prenorm_fusion_enabled = False
         self._compact_ffn_enabled = False
         self._compact_mask: Optional[torch.Tensor] = None
         self._compact_mask_version = -1
         self._compact_valid_rows: Optional[torch.Tensor] = None
         self.fast_ffn_error: Optional[str] = None
+        self.prenorm_fusion_error: Optional[str] = None
         self.compact_ffn_error: Optional[str] = None
         self.register_load_state_dict_post_hook(self._refresh_after_load)
 
@@ -191,10 +193,12 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         self._norm2_weight_version = self.norm2.weight._version
         self._norm2_bias_version = self.norm2.bias._version
         self._fast_ffn_enabled = False
+        self._prenorm_fusion_enabled = False
         self._compact_ffn_enabled = False
         self._compact_mask = None
         self._compact_mask_version = -1
         self._compact_valid_rows = None
+        self.prenorm_fusion_error = None
 
     def _fast_parameters_are_current(self) -> bool:
         if torch.compiler.is_compiling():
@@ -222,6 +226,31 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
             and (valid_token_mask is None or valid_token_mask.is_contiguous())
             and not self.training
             and not torch.is_grad_enabled()
+        )
+
+    def _supports_prenorm_fusion(
+        self,
+        x: torch.Tensor,
+        attention_update: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> bool:
+        """Return whether the fused attention-residual/norm kernel is safe.
+
+        The operator is deliberately narrower than the established FFN path:
+        its single CTA performs a FP32 reduction over one token row and is an
+        eager inference optimization only.  Unsupported cases use the exact
+        native add followed by ``nn.LayerNorm``.
+        """
+        return (
+            not torch.compiler.is_compiling()
+            and self._norm2_affine_is_identity
+            and self._supports_fast_ffn(x, valid_token_mask)
+            and attention_update.is_cuda
+            and attention_update.dtype == torch.float16
+            and attention_update.is_contiguous()
+            and attention_update.shape == x.shape
+            and attention_update.device == x.device
+            and 0 < x.shape[-1] <= 1024
         )
 
     def _ffn_residual_native(
@@ -319,6 +348,49 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         output.index_copy_(0, self._compact_valid_rows, valid_output)
         return output.reshape(batch, seq_len, d_model)
 
+    def _attention_residual_ffn_fast(
+        self,
+        x: torch.Tensor,
+        attention_update: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run the fused attention residual/identity-norm FFN path.
+
+        This keeps the attention calculation untouched.  The extension rounds
+        the attention residual to FP16, computes LayerNorm statistics in FP32,
+        and then invokes the same exact-GELU/down-projection post sequence as
+        the validated Person 2 path.
+        """
+        batch, seq_len, d_model = x.shape
+        residual = x.reshape(batch * seq_len, d_model)
+        attention_flat = attention_update.reshape(batch * seq_len, d_model)
+        if valid_token_mask is None:
+            output = (
+                person2_ffn_post.attention_residual_identity_layer_norm_ffn_unmasked(
+                    residual,
+                    attention_flat,
+                    self.ffn_in.weight,
+                    self.ffn_in.bias,
+                    self._ffn_out_weight_nt,
+                    self.ffn_out.bias,
+                    self.norm2.eps,
+                )
+            )
+        else:
+            output = (
+                person2_ffn_post.attention_residual_identity_layer_norm_ffn_masked(
+                    residual,
+                    attention_flat,
+                    self.ffn_in.weight,
+                    self.ffn_in.bias,
+                    self._ffn_out_weight_nt,
+                    self.ffn_out.bias,
+                    valid_token_mask.reshape(-1),
+                    self.norm2.eps,
+                )
+            )
+        return output.reshape(batch, seq_len, d_model)
+
     def _compact_mask_is_current(
         self,
         valid_token_mask: Optional[torch.Tensor],
@@ -401,6 +473,63 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
             self.fast_ffn_error = f"{type(error).__name__}: {error}"
             return False
 
+    def prepare_prenorm_fusion(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        causal: bool,
+    ) -> bool:
+        """Preflight the fused attention residual/LayerNorm FFN outside timing."""
+        self._prenorm_fusion_enabled = False
+        self.prenorm_fusion_error = None
+        with torch.inference_mode():
+            attention_update = self.attention(
+                self.norm1(x), valid_token_mask, causal
+            )
+            attention_residual = x + attention_update
+
+        # Keep the established full-op preflight as the first gate.  If it is
+        # unavailable, the fused candidate cannot be an improvement.
+        if not self.prepare_fast_ffn(attention_residual, valid_token_mask):
+            self.prenorm_fusion_error = (
+                "FFN fast-path preflight failed: "
+                + (self.fast_ffn_error or "unknown error")
+            )
+            return False
+        if not self._supports_prenorm_fusion(
+            x, attention_update, valid_token_mask
+        ):
+            self.prenorm_fusion_error = (
+                "unsupported device, dtype, layout, norm parameters, or mode"
+            )
+            return False
+
+        try:
+            with torch.inference_mode():
+                reference = self._ffn_residual_native(
+                    attention_residual, valid_token_mask
+                )
+                candidate = self._attention_residual_ffn_fast(
+                    x, attention_update, valid_token_mask
+                )
+            ref = reference.float()
+            opt = candidate.float()
+            error = (opt - ref).abs()
+            passed = torch.isfinite(ref) & torch.isfinite(opt)
+            passed &= (error <= 0.001) | (error <= 0.01 * ref.abs())
+            if not bool(passed.all().item()):
+                self.prenorm_fusion_error = (
+                    "strict numerical preflight failed: "
+                    f"max_abs={error.max().item():.6g}, "
+                    f"failed={int((~passed).sum().item())}"
+                )
+                return False
+            self._prenorm_fusion_enabled = True
+            return True
+        except (ImportError, OSError, RuntimeError) as error:
+            self.prenorm_fusion_error = f"{type(error).__name__}: {error}"
+            return False
+
     def _ffn_residual(
         self,
         x: torch.Tensor,
@@ -426,7 +555,18 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         causal: bool,
     ) -> torch.Tensor:
         # Keep the pre-LayerNorm attention order identical to the reference.
-        x = x + self.attention(self.norm1(x), valid_token_mask, causal)
+        attention_update = self.attention(self.norm1(x), valid_token_mask, causal)
+        if (
+            self._prenorm_fusion_enabled
+            and self._fast_parameters_are_current()
+            and self._supports_prenorm_fusion(
+                x, attention_update, valid_token_mask
+            )
+        ):
+            return self._attention_residual_ffn_fast(
+                x, attention_update, valid_token_mask
+            )
+        x = x + attention_update
         return self._ffn_residual(x, valid_token_mask)
 
 

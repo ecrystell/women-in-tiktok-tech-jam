@@ -170,6 +170,72 @@ class Person2BlockTests(unittest.TestCase):
         self.assertTrue(torch.equal(first, second))
         self.assertNotEqual(first.data_ptr(), second.data_ptr())
 
+    def test_prenorm_fusion_preflight_and_parameter_invalidation(self) -> None:
+        baseline, optimized = self.make_blocks()
+        x = torch.randn(2, 5, 32)
+        mask = torch.tensor([[True] * 5, [True, True, True, False, False]])
+
+        def fused(
+            residual,
+            attention_update,
+            up_weight,
+            up_bias,
+            down_weight,
+            down_bias,
+            valid,
+            eps,
+        ):
+            attention_residual = residual + attention_update
+            normalized = torch.nn.functional.layer_norm(
+                attention_residual,
+                (attention_residual.shape[-1],),
+                None,
+                None,
+                eps,
+            )
+            preactivation = torch.nn.functional.linear(
+                normalized, up_weight, up_bias
+            )
+            update = torch.addmm(
+                down_bias,
+                torch.nn.functional.gelu(preactivation, approximate="none"),
+                down_weight,
+            )
+            return (update + attention_residual).masked_fill(
+                ~valid[:, None], 0
+            )
+
+        with (
+            mock.patch.object(optimized, "prepare_fast_ffn", return_value=True),
+            mock.patch.object(
+                optimized, "_supports_prenorm_fusion", return_value=True
+            ),
+            mock.patch(
+                "person2_ffn_post.attention_residual_identity_layer_norm_ffn_masked",
+                side_effect=fused,
+            ),
+        ):
+            self.assertTrue(optimized.prepare_prenorm_fusion(x, mask, False))
+            self.assertTrue(optimized._prenorm_fusion_enabled)
+            with torch.inference_mode():
+                reference = baseline(x, mask, False)
+                candidate = optimized(x, mask, False)
+                repeated = optimized(x, mask, False)
+        assert_or_close(self, reference, candidate)
+        self.assertTrue(torch.equal(candidate, repeated))
+        self.assertNotEqual(candidate.data_ptr(), repeated.data_ptr())
+
+        # A changed LayerNorm affine parameter must invalidate the narrow
+        # identity-affine fusion before the next real forward call.
+        with torch.no_grad():
+            optimized.norm2.weight[0] = 0.75
+            baseline.norm2.weight[0] = 0.75
+        with torch.inference_mode():
+            candidate = optimized(x, mask, False)
+            reference = baseline(x, mask, False)
+        self.assertFalse(optimized._prenorm_fusion_enabled)
+        assert_or_close(self, reference, candidate)
+
     def test_compact_mask_guard_rejects_changed_or_mutated_masks(self) -> None:
         _baseline, optimized = self.make_blocks()
         mask = torch.tensor([[True, True, False], [True, False, False]])
@@ -230,6 +296,31 @@ class Person2BlockTests(unittest.TestCase):
         self.assertEqual(
             person2_ffn_post.identity_layer_norm_ffn_unmasked(
                 residual,
+                up_weight,
+                up_bias,
+                weight,
+                bias,
+                1e-5,
+            ).shape,
+            (4, 8),
+        )
+        self.assertEqual(
+            person2_ffn_post.attention_residual_identity_layer_norm_ffn_masked(
+                residual,
+                update,
+                up_weight,
+                up_bias,
+                weight,
+                bias,
+                mask,
+                1e-5,
+            ).shape,
+            (4, 8),
+        )
+        self.assertEqual(
+            person2_ffn_post.attention_residual_identity_layer_norm_ffn_unmasked(
+                residual,
+                update,
                 up_weight,
                 up_bias,
                 weight,
@@ -346,6 +437,22 @@ class Person2BlockTests(unittest.TestCase):
         )
         self.assertEqual(event_device_time_us(cpu_only), 0.0)
 
+    def test_tensorrt_backend_is_lazy_and_optional(self) -> None:
+        import person2_tensorrt
+
+        with mock.patch.object(
+            person2_tensorrt,
+            "_load_modules",
+            side_effect=person2_tensorrt.TensorRTUnavailableError(
+                "simulated missing TensorRT"
+            ),
+        ):
+            availability = person2_tensorrt.probe_tensorrt()
+        self.assertFalse(availability.available)
+        self.assertIn("simulated missing TensorRT", availability.reason or "")
+        with self.assertRaises(ValueError):
+            person2_tensorrt.TensorRTFFNCache(max_entries=0)
+
     def test_article_gemm_shapes_are_derived_from_tokens(self) -> None:
         from bench_person2_ffn import Case
 
@@ -359,6 +466,39 @@ class Person2BlockTests(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
 class Person2CudaTests(unittest.TestCase):
+    def test_cuda_prenorm_fusion_masks_and_ownership(self) -> None:
+        from torch.utils.cpp_extension import CUDA_HOME
+
+        if CUDA_HOME is None:
+            self.skipTest("a CUDA toolkit is unavailable for extension build")
+        device = torch.device("cuda")
+        baseline, optimized = Person2BlockTests.make_blocks(
+            device, torch.float16
+        )
+        x = torch.randn(2, 16, 32, device=device, dtype=torch.float16)
+        padded = torch.tensor(
+            [[True] * 16, [True] * 12 + [False] * 4], device=device
+        )
+        for causal, mask in ((False, None), (True, padded)):
+            self.assertTrue(
+                optimized.prepare_prenorm_fusion(x, mask, causal),
+                optimized.prenorm_fusion_error,
+            )
+            with torch.inference_mode():
+                reference = baseline(x, mask, causal)
+                candidate = optimized(x, mask, causal)
+                repeated = optimized(x, mask, causal)
+            assert_or_close(self, reference, candidate)
+            assert_or_close(self, reference, repeated)
+            self.assertNotEqual(candidate.data_ptr(), repeated.data_ptr())
+            if mask is not None:
+                self.assertTrue(bool((candidate[~mask] == 0).all().item()))
+
+        noncontiguous = x.transpose(1, 2).contiguous().transpose(1, 2)
+        self.assertFalse(noncontiguous.is_contiguous())
+        self.assertFalse(
+            optimized.prepare_prenorm_fusion(noncontiguous, padded, False)
+        )
     def test_cuda_full_op_masked_and_unmasked(self) -> None:
         from torch.utils.cpp_extension import CUDA_HOME
 

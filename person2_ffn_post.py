@@ -59,6 +59,39 @@ def load_extension():
     return _EXTENSION
 
 
+def fused_attention_residual_identity_layer_norm(
+    x: torch.Tensor,
+    attention_update: torch.Tensor,
+    norm2: torch.nn.LayerNorm,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expose the pre-norm CUDA kernel to the standalone profiler.
+
+    This helper intentionally performs eligibility validation outside any timed
+    benchmark loop.  The block itself additionally performs strict numerical
+    preflight before enabling the full fused FFN operator.
+    """
+    if (
+        x.ndim != 3
+        or attention_update.shape != x.shape
+        or not x.is_cuda
+        or x.dtype != torch.float16
+        or not x.is_contiguous()
+        or not attention_update.is_contiguous()
+        or x.shape[-1] > 1024
+    ):
+        raise RuntimeError("unsupported pre-norm fusion inputs or norm parameters")
+    batch, seq_len, d_model = x.shape
+    residual, normalized = load_extension().attention_residual_layer_norm(
+        x.reshape(batch * seq_len, d_model),
+        attention_update.reshape(batch * seq_len, d_model),
+        norm2.eps,
+    )
+    return (
+        residual.reshape(batch, seq_len, d_model),
+        normalized.reshape(batch, seq_len, d_model),
+    )
+
+
 @torch.library.custom_op("person2_post::residual_masked_v2", mutates_args=())
 def residual_masked(
     update: torch.Tensor,
@@ -236,4 +269,99 @@ def _identity_layer_norm_ffn_unmasked_fake(
     eps: float,
 ) -> torch.Tensor:
     del up_weight, up_bias, down_weight_nt, down_bias, eps
+    return torch.empty_like(residual)
+
+
+@torch.library.custom_op(
+    "person2_post::attention_residual_identity_layer_norm_ffn_masked_v1",
+    mutates_args=(),
+)
+def attention_residual_identity_layer_norm_ffn_masked(
+    residual: torch.Tensor,
+    attention_update: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    down_weight_nt: torch.Tensor,
+    down_bias: torch.Tensor,
+    valid_token_mask: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Fuse the attention residual and identity LayerNorm before the FFN.
+
+    The CUDA extension rounds ``residual + attention_update`` to FP16 first,
+    computes the LayerNorm statistics in FP32, and then keeps the established
+    exact-GELU/down-projection/residual post path.  Callers must preflight it
+    outside timing and retain the dense fallback on every unsupported path.
+    """
+    return load_extension().attention_residual_identity_layer_norm_ffn_masked(
+        residual,
+        attention_update,
+        up_weight,
+        up_bias,
+        down_weight_nt,
+        down_bias,
+        valid_token_mask,
+        eps,
+    )
+
+
+@attention_residual_identity_layer_norm_ffn_masked.register_fake
+def _attention_residual_identity_layer_norm_ffn_masked_fake(
+    residual: torch.Tensor,
+    attention_update: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    down_weight_nt: torch.Tensor,
+    down_bias: torch.Tensor,
+    valid_token_mask: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    del (
+        attention_update,
+        up_weight,
+        up_bias,
+        down_weight_nt,
+        down_bias,
+        valid_token_mask,
+        eps,
+    )
+    return torch.empty_like(residual)
+
+
+@torch.library.custom_op(
+    "person2_post::attention_residual_identity_layer_norm_ffn_unmasked_v1",
+    mutates_args=(),
+)
+def attention_residual_identity_layer_norm_ffn_unmasked(
+    residual: torch.Tensor,
+    attention_update: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    down_weight_nt: torch.Tensor,
+    down_bias: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Fuse the unmasked attention residual and identity LayerNorm FFN."""
+    return load_extension().attention_residual_identity_layer_norm_ffn_unmasked(
+        residual,
+        attention_update,
+        up_weight,
+        up_bias,
+        down_weight_nt,
+        down_bias,
+        eps,
+    )
+
+
+@attention_residual_identity_layer_norm_ffn_unmasked.register_fake
+def _attention_residual_identity_layer_norm_ffn_unmasked_fake(
+    residual: torch.Tensor,
+    attention_update: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    down_weight_nt: torch.Tensor,
+    down_bias: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    del attention_update, up_weight, up_bias, down_weight_nt, down_bias, eps
     return torch.empty_like(residual)

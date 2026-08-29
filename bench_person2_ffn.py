@@ -88,15 +88,17 @@ class FullBlock(nn.Module):
     ) -> bool:
         if not isinstance(self.block, OptimizedTransformerBlock):
             return False
-        with torch.inference_mode():
-            ffn_input = x + self.block.attention(
-                self.block.norm1(x), valid_token_mask, self.causal
-            )
-        return self.block.prepare_fast_ffn(ffn_input, valid_token_mask)
+        return self.block.prepare_prenorm_fusion(
+            x, valid_token_mask, self.causal
+        )
 
     @property
     def prepare_error(self) -> Optional[str]:
-        return getattr(self.block, "fast_ffn_error", None)
+        return getattr(
+            self.block,
+            "prenorm_fusion_error",
+            getattr(self.block, "fast_ffn_error", None),
+        )
 
 
 @dataclass(frozen=True)
