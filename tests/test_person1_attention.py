@@ -173,7 +173,7 @@ class Person1AttentionTests(unittest.TestCase):
         causal: bool,
     ) -> None:
         torch.manual_seed(17)
-        shape = (2, 2, 19, 16)
+        shape = (2, 2, 32, 64)
         q_base = torch.randn(shape, device=device, dtype=dtype)
         k_base = torch.randn_like(q_base)
         v_base = torch.randn_like(q_base)
@@ -213,18 +213,22 @@ class Person1AttentionTests(unittest.TestCase):
             )
 
         if valid_token_mask is not None:
-            invalid_keys = ~valid_token_mask
+            invalid_tokens = (~valid_token_mask)[:, None, :, None]
             self.assertEqual(
-                int(k_opt.grad[:, :, invalid_keys.any(dim=0), :].abs().sum().item()),
-                0,
+                float(k_opt.grad.masked_select(invalid_tokens).abs().sum().item()),
+                0.0,
             )
             self.assertEqual(
-                int(v_opt.grad[:, :, invalid_keys.any(dim=0), :].abs().sum().item()),
-                0,
+                float(v_opt.grad.masked_select(invalid_tokens).abs().sum().item()),
+                0.0,
+            )
+            self.assertEqual(
+                float(q_opt.grad.masked_select(invalid_tokens).abs().sum().item()),
+                0.0,
             )
 
     def test_cpu_fallback_backward(self):
-        mask = self._make_mask(2, 19, torch.device("cpu"))
+        mask = self._make_mask(2, 32, torch.device("cpu"))
         self._compare_gradients(torch.device("cpu"), torch.float32, mask, True)
 
     @unittest.skipUnless(
@@ -233,7 +237,7 @@ class Person1AttentionTests(unittest.TestCase):
     )
     def test_cuda_custom_backward(self):
         device = torch.device("cuda")
-        mask = self._make_mask(2, 19, device)
+        mask = self._make_mask(2, 32, device)
         self._compare_gradients(device, torch.float16, mask, True)
 
     @unittest.skipUnless(
@@ -244,7 +248,11 @@ class Person1AttentionTests(unittest.TestCase):
     )
     def test_torch_compile_smoke(self):
         device = torch.device("cuda")
-        module = TritonSelfAttention(64, 2, backend="triton").to(device).eval()
+        module = (
+            TritonSelfAttention(64, 2, backend="triton")
+            .to(device=device, dtype=torch.float16)
+            .eval()
+        )
         x = torch.randn(2, 32, 64, device=device, dtype=torch.float16)
         compiled = torch.compile(module, backend="inductor")
         output = compiled(x)
