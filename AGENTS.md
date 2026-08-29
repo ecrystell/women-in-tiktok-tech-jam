@@ -62,25 +62,35 @@ they can erase the benefit of packed QKV.
 
 ### Person 1 — self-attention pipeline
 
-Own the standalone `FastSelfAttention` implementation:
+Own the standalone `TritonSelfAttention` package in
+`person1_triton_attention.py`:
 
-- packed QKV projection;
-- SDPA attention as the guaranteed path;
-- causal and padding masks;
-- zeroing invalid query tokens;
-- baseline-compatible weight transfer;
-- attention accuracy and latency measurements.
+- packed QKV projection and baseline-compatible weight transfer;
+- PyTorch SDPA as the guaranteed and default path;
+- causal and right-padding masks;
+- exact zeroing of invalid query/output tokens;
+- standalone correctness tests and attention-only benchmarks.
 
-Custom Triton FlashAttention with online softmax is a stretch path only. FP32
-should be used for numerically sensitive online-softmax statistics; do not
-force every matrix operation to FP32 without measurements.
+`PackedQKVSDPAAttention` is the explicit packed-QKV SDPA implementation.
+`TritonSelfAttention(backend="auto")` also selects SDPA unconditionally for
+the current safe submission path. The custom online-softmax Triton kernel is
+opt-in with `backend="triton"` and falls back to SDPA when Triton, the shape,
+dtype, mask, or compatibility conditions are unsupported. FP32 is retained
+for numerically sensitive online-softmax statistics.
 
 Current Person 1 branch: `person1/attention-sdpa`.
 
-Current Person 1 commit: `85cfc14 Add packed QKV SDPA attention module`.
+Current Person 1 commit: `bbd0cc8 Harden Triton attention fallbacks and dispatch`.
 
-The current implementation adds `FastSelfAttention` but intentionally does not
-modify `UserOptimizedTransformer` integration. Person 3 owns final assembly.
+The implementation adds `triton_scaled_dot_product_attention`,
+`TritonSelfAttention`, `PackedQKVSDPAAttention`,
+`tests/test_person1_attention.py`, and `bench_person1_attention.py` without
+modifying `UserOptimizedTransformer`; Person 3 owns final assembly.
+
+Validation on the RTX 4050 Laptop GPU passed all 8 standalone tests with
+PyTorch 2.13.0+cu126 and Triton 3.7.1. At the default attention shape
+(`B=8, S=128, head_dim=64, float16`), packed SDPA is currently faster than the
+custom Triton path, so SDPA remains the production choice.
 
 ### Person 2 — FFN, LayerNorm, and residuals
 
@@ -105,7 +115,7 @@ the required forward signature.
 ## Integration rules
 
 - Keep `BaselineSelfAttention` and all reference behavior unchanged.
-- `FastSelfAttention` must expose the same forward signature as the baseline.
+- `TritonSelfAttention` must expose the same forward signature as the baseline.
 - Packed QKV weights must be copied in Q/K/V row order.
 - Avoid CPU/GPU synchronization, unnecessary tensor-to-scalar conversions,
   and data-dependent Python control flow inside compiled forward paths.
