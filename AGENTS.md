@@ -165,13 +165,41 @@ and full-block evidence is reported with that variance caveat.
 Current integration branch: `person3/integrate-person1`.
 
 Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
-`f50ef57` are combined at merge commit `f6d897a`. The combined local suite
-passed 28 tests with six hardware/toolkit skips, and the strict CPU harness
-smoke passed two trials with zero failed elements. `UserOptimizedTransformer`
-remains unchanged. Tesla T4 validation is still required before the branch is
-eligible for a pull request or merge. Keep SDPA as the default attention
-backend until T4 profiling proves that explicitly selecting Triton is
-beneficial.
+`f50ef57` are combined at merge commit `f6d897a`; validation source commit is
+`d57502e`. The combined local suite passed 28 tests with six hardware/toolkit
+skips, and the strict CPU harness smoke passed two trials with zero failed
+elements.
+
+Combined T4 validation used a Tesla T4 (15,360 MiB), driver 580.82.07,
+PyTorch 2.11.0+cu128, CUDA 12.8, and FP16. All 28 tests passed, including the
+Person 1 Triton CUDA paths and Person 2 custom-op paths. The strict CUDA harness
+smoke passed two trials with zero failed elements (`0.8313 ms` baseline median,
+`0.8337 ms` optimized median); because `UserOptimizedTransformer` remains
+unchanged, this noisy `0.997x` result is a safety check rather than a speedup
+claim.
+
+The representative attention matrix covered sequence lengths 128 and 4096,
+causal and non-causal execution, and unpadded and 25%-padded masks. Packed SDPA
+passed every strict comparison with zero failed elements and improved median
+latency in all eight cases (`1.341x` to `12.254x`). Triton also passed strict
+correctness but ranged from `0.119x` to `2.208x`; the long-sequence cases
+regressed substantially. Keep packed SDPA as the production attention path and
+Triton as an explicit experiment only; do not dispatch to Triton by default.
+
+T4 attention timings below use batch 1, model width 512, 8 heads, FP16, 5
+warmups, and 20 CUDA-event repetitions. Throughput is tokens/second; all rows
+had zero failed elements at `atol=0.001`, `rtol=0.01`.
+
+| Seq / mode / padding | Baseline median / p90 (ms) | Packed SDPA median / p90 (ms), speedup, tok/s | Triton median / p90 (ms), speedup, tok/s | Max abs error |
+| --- | ---: | ---: | ---: | ---: |
+| 128 / non-causal / none | 0.7108 / 0.9181 | 0.1943 / 0.2898, 3.658x, 658,775 | 0.3677 / 0.4176, 1.933x, 348,110 | 0.00012207 |
+| 128 / causal / none | 0.4928 / 0.5958 | 0.1559 / 0.1851, 3.160x, 821,039 | 0.5359 / 0.5638, 0.920x, 238,851 | 0.000488281 |
+| 128 / non-causal / 25% | 0.5181 / 0.5572 | 0.3864 / 0.4241, 1.341x, 331,263 | 0.4608 / 0.5389, 1.124x, 277,778 | 0.00012207 |
+| 128 / causal / 25% | 1.1022 / 1.2813 | 0.7260 / 0.9109, 1.518x, 176,309 | 0.4992 / 0.5428, 2.208x, 256,410 | 0.000488281 |
+| 4096 / non-causal / none | 17.0902 / 19.9334 | 3.1335 / 3.2119, 5.454x, 1,307,165 | 30.5717 / 30.5827, 0.559x, 133,980 | 0.0000610352 |
+| 4096 / causal / none | 22.8837 / 25.7587 | 1.8675 / 1.9661, 12.254x, 2,193,307 | 39.5864 / 39.6987, 0.578x, 103,470 | 0.000488281 |
+| 4096 / non-causal / 25% | 22.2259 / 23.4281 | 4.3809 / 4.4221, 5.073x, 934,968 | 186.1327 / 186.6188, 0.119x, 22,006 | 0.0000610352 |
+| 4096 / causal / 25% | 27.8329 / 30.0444 | 5.7226 / 5.7611, 4.864x, 715,759 | 219.6946 / 220.4763, 0.127x, 18,644 | 0.000488281 |
 
 Own `UserOptimizedTransformer`, weight-copy integration, benchmark-driven
 dispatch, profiling, README/reproducibility, and the final demo. Dispatch keys
