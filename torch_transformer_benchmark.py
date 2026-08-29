@@ -496,9 +496,14 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
                 + (self.fast_ffn_error or "unknown error")
             )
             return False
-        if not self._supports_prenorm_fusion(
-            x, attention_update, valid_token_mask
-        ):
+        # Match ``prepare_fast_ffn``: setup may be invoked from normal Python
+        # mode, but the candidate itself is inference-only.  The forward-path
+        # guard still rejects training / grad-enabled execution.
+        with torch.inference_mode():
+            supported = self._supports_prenorm_fusion(
+                x, attention_update, valid_token_mask
+            )
+        if not supported:
             self.prenorm_fusion_error = (
                 "unsupported device, dtype, layout, norm parameters, or mode"
             )
