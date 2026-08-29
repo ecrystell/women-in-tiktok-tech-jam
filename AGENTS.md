@@ -99,6 +99,67 @@ Own FFN and normalization optimization. Start with `torch.compile`, exact
 fusion. Do not assume that a hand-written single kernel for both large Linear
 GEMMs is faster than optimized PyTorch/cuBLAS. Custom Triton is a stretch path.
 
+Current Person 2 branch: `person2/ffn-fullop-t4`.
+
+Current Person 2 core commit: `d6bfab0 Add standalone Person 2 FFN optimization`.
+
+Current Person 2 validated Task 2 head: `c319ab4` (source implementation
+`16cf403`, followed by documentation and explicit CUDA coverage).
+
+The standalone, baseline-weight-compatible `OptimizedTransformerBlock`, focused
+unit tests, and `bench_person2_ffn.py` are implemented. Final
+`UserOptimizedTransformer` assembly remains owned by Person 3. The implementation
+uses exact GELU and a token-major FFN view; no custom Triton kernel was added.
+
+Detailed Person 2 benchmark history, profiler evidence, and rejected
+variants now live in `PERSON2_EXPERIMENTS.md`. Keep `AGENTS.md` focused on
+the active handoff.
+
+The current validation branch is `person2/ffn-fullop-t4`. Source commit
+`16cf403` extends the strongest balanced implementation with a single
+inference-only custom-op boundary for the complete identity-affine LayerNorm
+and FFN sequence. PyTorch/cuBLAS still execute both GEMMs and ATen still
+executes exact GELU; the custom boundary removes Python/dispatcher transitions
+and finishes with the existing 128-bit residual/mask kernel. Nonidentity
+LayerNorm parameters, unsupported devices/dtypes/layouts, build failures, and
+failed numerical preflight retain the native fallback.
+
+The NeurIPS run-length-tokenization follow-up adds a strictly guarded valid-row
+compaction path. Setup caches row indices only when the exact supplied mask has
+padding; timed inference may use them only for that same mask object and tensor
+version. It computes the FFN only for valid rows and scatters into a fixed-shape
+zero tensor. Changed masks, unpadded inputs, compilation, unsupported devices,
+and failed numerical preflight use the dense implementation.
+
+On the Colab Tesla T4 (`sm_75`, 14.56 GiB), PyTorch 2.11.0+cu128 and CUDA
+12.8, the guarded candidate passed all 19 CUDA/CPU tests. Padded-case isolated
+speedups were 1.048x, 1.040x, and 1.035x in three processes with zero failed
+elements. One complete three-process restored-candidate run cleared the 1.005x
+median threshold on all five shapes, but a later independent run measured
+0.980x on the shortest shape in one process; one short p90 and the short
+full-block case also regressed. Therefore there is no repeatable universal
+1.005x or full-block safety claim. Exact measurements and rejected experiments
+are in `PERSON2_EXPERIMENTS.md`.
+
+The all-valid-mask bypass was later retested at `ce762be`. It passed all 20 T4
+tests, but failed the universal gate: short-shape isolated speedups were
+0.960x, 0.984x, and 1.086x across three processes, with two p90 regressions.
+The primary-sampling short full-block result was 0.969x and its p90 regressed
+6.4%; compiled short measured 0.888x. The optimization remains reverted.
+Current validated source commit: `fd7b8d7`. `UserOptimizedTransformer` and
+Person 3 dispatch remain unchanged.
+
+The final Task 2 head `c319ab4` passed all 20 tests on the Colab T4, including
+explicit real-CUDA masked and unmasked full-op execution.
+Across three independent five-shape isolated FP16 sweeps, its lowest speedup
+was 1.023x; all 15 p90 comparisons improved and every accuracy comparison had
+zero failed elements. A reduced-sampling full-block sweep produced one 0.858x
+medium outlier. Primary-sampling diagnosis did not reproduce it: three medium
+full-block processes measured 1.016x, 1.011x, and 1.013x with improved p90,
+while the short primary result was 1.037x. The outlier remains disclosed in
+`PERSON2_EXPERIMENTS.md`; the isolated universal 1.005x claim is validated,
+and full-block evidence is reported with that variance caveat.
+
 ### Person 3 — integration, profiling, and dispatch
 
 Current integration branch: `person3/integrate-person1`.
