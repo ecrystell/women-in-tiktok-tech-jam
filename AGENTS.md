@@ -165,10 +165,11 @@ and full-block evidence is reported with that variance caveat.
 Current integration branch: `person3/integrate-person1`.
 
 Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
-`f50ef57` are combined at merge commit `f6d897a`; validation source commit is
-`d57502e`. The combined local suite passed 28 tests with six hardware/toolkit
-skips, and the strict CPU harness smoke passed two trials with zero failed
-elements.
+`f50ef57` are both contained by integration merge `99c1830` (Person 2 entered
+at merge `f6d897a`). The T4-validated source-code tree is `d57502e`; the final
+Person 1 ancestry merge did not change implementation files. The combined
+local suite passed 28 tests with six hardware/toolkit skips, and the strict CPU
+harness smoke passed two trials with zero failed elements.
 
 Combined T4 validation used a Tesla T4 (15,360 MiB), driver 580.82.07,
 PyTorch 2.11.0+cu128, CUDA 12.8, and FP16. All 28 tests passed, including the
