@@ -183,8 +183,43 @@ real variance rather than discarded as an outlier. Consequently the restored
 implementation and useful padded-row enhancement are delivered without a
 repeatable universal 1.005x claim.
 
+## All-valid-mask bypass rejection
+
 A final semantic experiment cached a proven all-true mask and selected the
-unmasked post kernel for that exact mask identity/version. It passed 20 local
-tests, but Colab disconnected and reached its GPU usage limit before the T4
-screen. Commit `ce762be` was therefore reverted by `fd7b8d7`; the unmeasured
-optimization is not in the validated source.
+unmasked post kernel only for that exact mask identity and tensor version.
+Changed or mutated masks fell back, and compiled execution deliberately used
+the dense masked path. Commit `ce762be` was initially reverted by `fd7b8d7`
+when the first Colab session exhausted its GPU quota.
+
+The experiment was subsequently rerun on a fresh Tesla T4 session using pinned
+`fd7b8d7` control and `ce762be` candidate clones. The candidate passed all 20
+tests in 117.786 seconds, including real CUDA extension execution, static
+full-graph compile fallback, output ownership, mask guards, exact zeroing,
+FP16, FP32, and runtime-supported BF16.
+
+The initial screen was strict-correct and measured 1.084x on the short shape
+and 1.037x on the medium unpadded shape. Its absolute short optimized median
+was 0.2369 ms versus 0.2520 ms for the pinned control in the preceding run.
+The required independent-process sweep did not reproduce that result:
+
+| Process | Five isolated FP16 speedups | Median 1.005x gate |
+| --- | --- | --- |
+| 1 | 0.960x, 1.028x, 1.046x, 1.053x, 1.052x | FAIL |
+| 2 | 0.984x, 1.032x, 1.055x, 1.053x, 1.052x | FAIL |
+| 3 | 1.086x, 1.032x, 1.034x, 1.045x, 1.051x | FAIL (p90) |
+
+All 15 outputs had zero failed elements. Process 2 short p90 regressed from
+0.2744 to 0.3852 ms, and process 3 short p90 regressed from 0.2747 to
+0.3668 ms. The candidate therefore failed both the median and p90 gates.
+
+The reduced-sampling full-block sweep remained strict-correct and measured
+0.992x, 0.998x, 1.010x, 1.007x, and 1.004x. A primary-sampling rerun of the
+short full block measured 0.969x, with p90 increasing from 0.8045 to
+0.8563 ms (6.4%). Static `default` compilation stayed correct but measured
+0.888x on the short isolated case. The official harness smoke test passed with
+zero error; its unchanged `UserOptimizedTransformer` measured 0.918x in that
+noisy small-shape run and remains Person 3's responsibility.
+
+The all-valid-mask bypass remains reverted at source commit `fd7b8d7`. It is
+rejected because its saved launch/mask work is smaller than short-shape
+variance and does not satisfy repeatable isolated or full-block safety gates.

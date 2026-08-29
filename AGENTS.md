@@ -125,10 +125,13 @@ full-block case also regressed. Therefore there is no repeatable universal
 1.005x or full-block safety claim. Exact measurements and rejected experiments
 are in `PERSON2_EXPERIMENTS.md`.
 
-The all-valid-mask bypass passed 20 local tests but was reverted because Colab
-disconnected and reached its GPU quota before T4 timing. Current validated
-source commit: `fd7b8d7`. `UserOptimizedTransformer` and Person 3 dispatch
-remain unchanged.
+The all-valid-mask bypass was later retested at `ce762be`. It passed all 20 T4
+tests, but failed the universal gate: short-shape isolated speedups were
+0.960x, 0.984x, and 1.086x across three processes, with two p90 regressions.
+The primary-sampling short full-block result was 0.969x and its p90 regressed
+6.4%; compiled short measured 0.888x. The optimization remains reverted.
+Current validated source commit: `fd7b8d7`. `UserOptimizedTransformer` and
+Person 3 dispatch remain unchanged.
 
 ### Person 3 — integration, profiling, and dispatch
 
