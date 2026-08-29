@@ -164,11 +164,14 @@ and full-block evidence is reported with that variance caveat.
 
 Current integration branch: `person3/integrate-person1`.
 
-Person 1 source tip `bbd0cc8` is merged there with the integration branch's
-padding-semantics fix. The resolved branch passed all 8 standalone Person 1
-tests, including the compiled smoke test and available CUDA/Triton coverage.
-Keep SDPA as the default integration backend until cross-machine/T4 profiling
-proves that explicitly selecting Triton is beneficial.
+Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
+`f50ef57` are combined at merge commit `f6d897a`. The combined local suite
+passed 28 tests with six hardware/toolkit skips, and the strict CPU harness
+smoke passed two trials with zero failed elements. `UserOptimizedTransformer`
+remains unchanged. Tesla T4 validation is still required before the branch is
+eligible for a pull request or merge. Keep SDPA as the default attention
+backend until T4 profiling proves that explicitly selecting Triton is
+beneficial.
 
 Own `UserOptimizedTransformer`, weight-copy integration, benchmark-driven
 dispatch, profiling, README/reproducibility, and the final demo. Dispatch keys
