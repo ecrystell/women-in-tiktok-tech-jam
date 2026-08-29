@@ -101,6 +101,36 @@ class FullBlock(nn.Module):
         )
 
 
+class FullOpControlBlock(FullBlock):
+    """Emulate the pre-pre-norm-fusion ``f50ef57`` full-block path.
+
+    The control intentionally prepares only the established FFN full-op.  It
+    computes the attention residual during untimed setup because that is the
+    exact tensor passed to ``prepare_fast_ffn`` in the original path.
+    """
+
+    def prepare(
+        self, x: torch.Tensor, valid_token_mask: Optional[torch.Tensor]
+    ) -> bool:
+        if not isinstance(self.block, OptimizedTransformerBlock):
+            return False
+        # A freshly constructed block has this disabled already.  Set it
+        # explicitly so this wrapper remains a reliable control if a caller
+        # reuses a block that was previously prepared as a pre-norm candidate.
+        self.block._prenorm_fusion_enabled = False
+        self.block.prenorm_fusion_error = None
+        with torch.inference_mode():
+            attention_update = self.block.attention(
+                self.block.norm1(x), valid_token_mask, self.causal
+            )
+            attention_residual = x + attention_update
+        return self.block.prepare_fast_ffn(attention_residual, valid_token_mask)
+
+    @property
+    def prepare_error(self) -> Optional[str]:
+        return getattr(self.block, "fast_ffn_error", None)
+
+
 @dataclass(frozen=True)
 class Case:
     batch: int
@@ -314,6 +344,40 @@ def make_models(
     )
 
 
+def make_prenorm_control_models(
+    case: Case,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[FullBlock, FullOpControlBlock, FullBlock]:
+    """Build matched baseline, ``f50ef57`` control, and fused candidates.
+
+    The two optimized blocks receive independent but bit-identical parameter
+    tensors.  This avoids sharing any setup state while ensuring that a timing
+    difference is attributable to the pre-norm fusion rather than weights.
+    """
+    baseline_block = BaselineTransformerBlock(
+        case.d_model, case.heads, case.ffn_dim
+    )
+    control_block = OptimizedTransformerBlock(
+        case.d_model, case.heads, case.ffn_dim
+    )
+    candidate_block = OptimizedTransformerBlock(
+        case.d_model, case.heads, case.ffn_dim
+    )
+    state_dict = baseline_block.state_dict()
+    control_block.load_state_dict(state_dict, strict=True)
+    candidate_block.load_state_dict(state_dict, strict=True)
+
+    baseline_block = baseline_block.to(device=device, dtype=dtype).eval()
+    control_block = control_block.to(device=device, dtype=dtype).eval()
+    candidate_block = candidate_block.to(device=device, dtype=dtype).eval()
+    return (
+        FullBlock(baseline_block, case.causal),
+        FullOpControlBlock(control_block, case.causal),
+        FullBlock(candidate_block, case.causal),
+    )
+
+
 def run_case(
     case: Case,
     scope: str,
@@ -413,6 +477,146 @@ def run_case(
             torch.cuda.empty_cache()
 
 
+def run_prenorm_control_case(
+    case: Case,
+    mode: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    args: argparse.Namespace,
+) -> None:
+    """Compare the eager pre-norm candidate with the validated full-op control.
+
+    This lane is deliberately separate from ``run_case``: the normal full-block
+    benchmark compares a baseline block with whatever fast path is currently
+    prepared, whereas this one isolates the incremental attention-residual /
+    LayerNorm fusion against the exact older Person 2 full-op implementation.
+    """
+    print(f"\n[full prenorm-control | {mode}] {case.label}")
+    try:
+        x, mask = make_input(case, device, dtype, args.seed)
+        baseline, control, candidate = make_prenorm_control_models(
+            case, device, dtype
+        )
+
+        control_enabled = control.prepare(x, mask)
+        candidate_enabled = candidate.prepare(x, mask)
+        control_block = control.block
+        candidate_block = candidate.block
+        print(
+            f"full_op_control={'ENABLED' if control_enabled else 'FALLBACK'}"
+            + (
+                f" | error={control.prepare_error}"
+                if control.prepare_error
+                else ""
+            )
+        )
+        print(
+            f"prenorm_candidate={'ENABLED' if candidate_enabled else 'FALLBACK'}"
+            + (
+                f" | error={candidate.prepare_error}"
+                if candidate.prepare_error
+                else ""
+            )
+            + (
+                " | full_op=ENABLED"
+                if getattr(candidate_block, "_fast_ffn_enabled", False)
+                else " | full_op=FALLBACK"
+            )
+            + (
+                f" | full_op_error={getattr(candidate_block, 'fast_ffn_error', None)}"
+                if getattr(candidate_block, "fast_ffn_error", None)
+                else ""
+            )
+        )
+        if getattr(control_block, "_prenorm_fusion_enabled", False):
+            raise RuntimeError("the full-op control unexpectedly enabled pre-norm fusion")
+        if mode != "eager" and candidate_enabled:
+            print(
+                "note: pre-norm fusion is eager-only; compiled candidate uses "
+                "the existing full-op/dense fallback"
+            )
+
+        baseline = compile_model(baseline, mode)
+        control = compile_model(control, mode)
+        candidate = compile_model(candidate, mode)
+        with torch.inference_mode():
+            baseline_output = accuracy_output(baseline, x, mask, device, mode)
+            control_output = accuracy_output(control, x, mask, device, mode)
+            candidate_output = accuracy_output(candidate, x, mask, device, mode)
+
+        control_accuracy = compare(
+            baseline_output, control_output, atol=args.atol, rtol=args.rtol
+        )
+        candidate_control_accuracy = compare(
+            control_output, candidate_output, atol=args.atol, rtol=args.rtol
+        )
+        candidate_baseline_accuracy = compare(
+            baseline_output, candidate_output, atol=args.atol, rtol=args.rtol
+        )
+        for label, accuracy in (
+            ("full_op_control vs baseline", control_accuracy),
+            ("prenorm_candidate vs full_op_control", candidate_control_accuracy),
+            ("prenorm_candidate vs baseline", candidate_baseline_accuracy),
+        ):
+            print(
+                f"{label} accuracy={'PASS' if accuracy.passed else 'FAIL'} | "
+                f"max_abs={accuracy.max_abs:.6g} | max_rel={accuracy.max_rel:.6g} | "
+                f"failed={accuracy.failed}/{accuracy.elements}"
+            )
+        if not (
+            control_accuracy.passed
+            and candidate_control_accuracy.passed
+            and candidate_baseline_accuracy.passed
+        ):
+            print("timing skipped because strict accuracy validation failed")
+            return
+        if not candidate_enabled:
+            print("timing skipped because pre-norm candidate preflight fell back")
+            return
+
+        warmup(control, x, mask, args.warmup, device, mode)
+        warmup(candidate, x, mask, args.warmup, device, mode)
+        control_samples: list[float] = []
+        candidate_samples: list[float] = []
+        for round_index in range(args.rounds):
+            if round_index % 2 == 0:
+                control_samples.extend(
+                    time_model(control, x, mask, args.repeats, device, mode)
+                )
+                candidate_samples.extend(
+                    time_model(candidate, x, mask, args.repeats, device, mode)
+                )
+            else:
+                candidate_samples.extend(
+                    time_model(candidate, x, mask, args.repeats, device, mode)
+                )
+                control_samples.extend(
+                    time_model(control, x, mask, args.repeats, device, mode)
+                )
+
+        control_median = statistics.median(control_samples)
+        candidate_median = statistics.median(candidate_samples)
+        tokens = case.batch * case.seq_len
+        print(
+            f"full_op_control median={control_median:.4f} ms | "
+            f"p90={percentile(control_samples, 0.90):.4f} ms | "
+            f"throughput={tokens * 1000.0 / control_median:.2f} token/s"
+        )
+        print(
+            f"prenorm_candidate median={candidate_median:.4f} ms | "
+            f"p90={percentile(candidate_samples, 0.90):.4f} ms | "
+            f"throughput={tokens * 1000.0 / candidate_median:.2f} token/s"
+        )
+        print(f"prenorm_vs_full_op_speedup={control_median / candidate_median:.3f}x")
+    except torch.OutOfMemoryError as error:
+        print(f"SKIP OOM: {error}")
+    except Exception as error:  # Keep a multi-mode sweep running after backend failures.
+        print(f"SKIP ERROR {type(error).__name__}: {error}")
+    finally:
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+
 def cases_from_args(args: argparse.Namespace) -> Iterable[Case]:
     if args.sweep:
         return (Case(*shape) for shape in SWEEP_SHAPES)
@@ -448,6 +652,15 @@ def parse_args() -> argparse.Namespace:
         "--scope", choices=("isolated", "full", "both"), default="isolated"
     )
     parser.add_argument(
+        "--compare-prenorm-control",
+        action="store_true",
+        help=(
+            "run the full-block pre-norm fusion candidate against an "
+            "f50ef57-equivalent prepared full-op control; requires "
+            "--scope full or both"
+        ),
+    )
+    parser.add_argument(
         "--compile-mode",
         choices=(
             "eager",
@@ -473,6 +686,10 @@ def main() -> int:
     args = parse_args()
     if not 0 <= args.padding_ratio < 1:
         raise ValueError("padding_ratio must be in [0, 1)")
+    if args.compare_prenorm_control and args.scope == "isolated":
+        raise ValueError(
+            "--compare-prenorm-control requires --scope full or --scope both"
+        )
     device = resolve_device(args.device)
     dtype = resolve_dtype(args.dtype)
     if dtype == torch.bfloat16 and device.type == "cuda":
@@ -504,6 +721,11 @@ def main() -> int:
         else (args.compile_mode,)
     )
     cases = tuple(cases_from_args(args))
+    if args.compare_prenorm_control:
+        for case in cases:
+            for mode in modes:
+                run_prenorm_control_case(case, mode, device, dtype, args)
+        return 0
     for case in cases:
         for scope in scopes:
             for mode in modes:
