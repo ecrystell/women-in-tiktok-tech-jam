@@ -89,7 +89,7 @@ Own FFN and normalization optimization. Start with `torch.compile`, exact
 fusion. Do not assume that a hand-written single kernel for both large Linear
 GEMMs is faster than optimized PyTorch/cuBLAS. Custom Triton is a stretch path.
 
-Current Person 2 branch: `person2/ffn-1005-t4`.
+Current Person 2 branch: `person2/ffn-fullop-t4`.
 
 Current Person 2 core commit: `d6bfab0 Add standalone Person 2 FFN optimization`.
 
@@ -132,6 +132,14 @@ The primary-sampling short full-block result was 0.969x and its p90 regressed
 6.4%; compiled short measured 0.888x. The optimization remains reverted.
 Current validated source commit: `fd7b8d7`. `UserOptimizedTransformer` and
 Person 3 dispatch remain unchanged.
+
+The active Task 2 follow-up starts from documentation commit `436aac6` and
+tests a single inference-only C++ custom op that orchestrates identity
+LayerNorm, native cuBLAS up projection, exact ATen GELU, native down
+projection, and the existing vectorized residual/mask kernel. The objective is
+to reduce framework launch overhead without replacing either GEMM or changing
+numerical order. It is experimental until strict T4 profiling and all gates
+pass; the padded-row compaction and `fd7b8d7` source remain the fallback.
 
 ### Person 3 — integration, profiling, and dispatch
 

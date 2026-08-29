@@ -123,11 +123,25 @@ class Person2BlockTests(unittest.TestCase):
         x = torch.randn(2, 5, 32)
         mask = torch.tensor([[True] * 5, [True, True, True, False, False]])
 
-        def combined(preactivation, weight, bias, residual, valid):
+        def combined(
+            residual,
+            up_weight,
+            up_bias,
+            down_weight,
+            down_bias,
+            valid,
+            eps,
+        ):
+            normalized = torch.nn.functional.layer_norm(
+                residual, (residual.shape[-1],), None, None, eps
+            )
+            preactivation = torch.nn.functional.linear(
+                normalized, up_weight, up_bias
+            )
             hidden = torch.nn.functional.gelu(
                 preactivation, approximate="none"
             )
-            update = torch.addmm(bias, hidden, weight)
+            update = torch.addmm(down_bias, hidden, down_weight)
             return (update + residual).masked_fill(~valid[:, None], 0)
 
         with (
@@ -136,7 +150,7 @@ class Person2BlockTests(unittest.TestCase):
             ),
             mock.patch("person2_ffn_post.load_extension"),
             mock.patch(
-                "person2_ffn_post.exact_gelu_down_masked",
+                "person2_ffn_post.identity_layer_norm_ffn_masked",
                 side_effect=combined,
             ),
         ):
@@ -196,6 +210,31 @@ class Person2BlockTests(unittest.TestCase):
         self.assertEqual(
             person2_ffn_post.exact_gelu_down_unmasked(
                 preactivation, weight, bias, residual
+            ).shape,
+            (4, 8),
+        )
+        up_weight = mode.from_tensor(torch.empty(16, 8))
+        up_bias = mode.from_tensor(torch.empty(16))
+        self.assertEqual(
+            person2_ffn_post.identity_layer_norm_ffn_masked(
+                residual,
+                up_weight,
+                up_bias,
+                weight,
+                bias,
+                mask,
+                1e-5,
+            ).shape,
+            (4, 8),
+        )
+        self.assertEqual(
+            person2_ffn_post.identity_layer_norm_ffn_unmasked(
+                residual,
+                up_weight,
+                up_bias,
+                weight,
+                bias,
+                1e-5,
             ).shape,
             (4, 8),
         )

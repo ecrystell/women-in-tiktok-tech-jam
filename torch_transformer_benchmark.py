@@ -245,19 +245,32 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         valid_token_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         batch, seq_len, d_model = x.shape
+        residual = x.reshape(batch * seq_len, d_model)
         if self._norm2_affine_is_identity:
-            normalized = F.layer_norm(
-                x,
-                self.norm2.normalized_shape,
-                None,
-                None,
-                self.norm2.eps,
-            )
+            if valid_token_mask is None:
+                output = person2_ffn_post.identity_layer_norm_ffn_unmasked(
+                    residual,
+                    self.ffn_in.weight,
+                    self.ffn_in.bias,
+                    self._ffn_out_weight_nt,
+                    self.ffn_out.bias,
+                    self.norm2.eps,
+                )
+            else:
+                output = person2_ffn_post.identity_layer_norm_ffn_masked(
+                    residual,
+                    self.ffn_in.weight,
+                    self.ffn_in.bias,
+                    self._ffn_out_weight_nt,
+                    self.ffn_out.bias,
+                    valid_token_mask.reshape(-1),
+                    self.norm2.eps,
+                )
+            return output.reshape(batch, seq_len, d_model)
         else:
             normalized = self.norm2(x)
         ffn_input = normalized.reshape(batch * seq_len, d_model)
         preactivation = self.ffn_in(ffn_input)
-        residual = x.reshape(batch * seq_len, d_model)
         if valid_token_mask is None:
             output = person2_ffn_post.exact_gelu_down_unmasked(
                 preactivation,

@@ -36,6 +36,49 @@ torch::Tensor exact_gelu_down_unmasked(
   return output;
 }
 
+torch::Tensor identity_layer_norm_ffn_masked(
+    const torch::Tensor& residual,
+    const torch::Tensor& up_weight,
+    const torch::Tensor& up_bias,
+    const torch::Tensor& down_weight_nt,
+    const torch::Tensor& down_bias,
+    const torch::Tensor& valid_token_mask,
+    double eps) {
+  const auto normalized = at::layer_norm(
+      residual,
+      {residual.size(-1)},
+      c10::nullopt,
+      c10::nullopt,
+      eps,
+      true);
+  auto preactivation = at::linear(normalized, up_weight, up_bias);
+  return exact_gelu_down_masked(
+      preactivation,
+      down_weight_nt,
+      down_bias,
+      residual,
+      valid_token_mask);
+}
+
+torch::Tensor identity_layer_norm_ffn_unmasked(
+    const torch::Tensor& residual,
+    const torch::Tensor& up_weight,
+    const torch::Tensor& up_bias,
+    const torch::Tensor& down_weight_nt,
+    const torch::Tensor& down_bias,
+    double eps) {
+  const auto normalized = at::layer_norm(
+      residual,
+      {residual.size(-1)},
+      c10::nullopt,
+      c10::nullopt,
+      eps,
+      true);
+  auto preactivation = at::linear(normalized, up_weight, up_bias);
+  return exact_gelu_down_unmasked(
+      preactivation, down_weight_nt, down_bias, residual);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def(
       "residual_masked_out",
@@ -53,4 +96,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       "exact_gelu_down_unmasked",
       &exact_gelu_down_unmasked,
       "Exact GELU, down projection, and residual add");
+  module.def(
+      "identity_layer_norm_ffn_masked",
+      &identity_layer_norm_ffn_masked,
+      "Identity LayerNorm, exact FFN, residual add, and invalid-row zeroing");
+  module.def(
+      "identity_layer_norm_ffn_unmasked",
+      &identity_layer_norm_ffn_unmasked,
+      "Identity LayerNorm, exact FFN, and residual add");
 }

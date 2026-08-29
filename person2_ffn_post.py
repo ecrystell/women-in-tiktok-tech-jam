@@ -155,3 +155,85 @@ def _exact_gelu_down_unmasked_fake(
 ) -> torch.Tensor:
     del preactivation, weight_nt, bias
     return torch.empty_like(residual)
+
+
+@torch.library.custom_op(
+    "person2_post::identity_layer_norm_ffn_masked_v1",
+    mutates_args=(),
+)
+def identity_layer_norm_ffn_masked(
+    residual: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    down_weight_nt: torch.Tensor,
+    down_bias: torch.Tensor,
+    valid_token_mask: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Orchestrate the complete identity-affine FFN behind one boundary."""
+    return load_extension().identity_layer_norm_ffn_masked(
+        residual,
+        up_weight,
+        up_bias,
+        down_weight_nt,
+        down_bias,
+        valid_token_mask,
+        eps,
+    )
+
+
+@identity_layer_norm_ffn_masked.register_fake
+def _identity_layer_norm_ffn_masked_fake(
+    residual: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    down_weight_nt: torch.Tensor,
+    down_bias: torch.Tensor,
+    valid_token_mask: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    del (
+        up_weight,
+        up_bias,
+        down_weight_nt,
+        down_bias,
+        valid_token_mask,
+        eps,
+    )
+    return torch.empty_like(residual)
+
+
+@torch.library.custom_op(
+    "person2_post::identity_layer_norm_ffn_unmasked_v1",
+    mutates_args=(),
+)
+def identity_layer_norm_ffn_unmasked(
+    residual: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    down_weight_nt: torch.Tensor,
+    down_bias: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Orchestrate the complete unmasked identity-affine FFN."""
+    return load_extension().identity_layer_norm_ffn_unmasked(
+        residual,
+        up_weight,
+        up_bias,
+        down_weight_nt,
+        down_bias,
+        eps,
+    )
+
+
+@identity_layer_norm_ffn_unmasked.register_fake
+def _identity_layer_norm_ffn_unmasked_fake(
+    residual: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    down_weight_nt: torch.Tensor,
+    down_bias: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    del up_weight, up_bias, down_weight_nt, down_bias, eps
+    return torch.empty_like(residual)
