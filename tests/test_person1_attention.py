@@ -111,6 +111,22 @@ class Person1AttentionTests(unittest.TestCase):
                 )
                 assert_or_close(self, reference, candidate)
 
+    def test_cpu_sdpa_fallback_exactly_zeros_invalid_queries(self):
+        torch.manual_seed(9)
+        q = torch.randn(2, 2, 11, 8)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        mask = self._make_mask(2, 11, q.device)
+
+        for causal in (False, True):
+            candidate = triton_scaled_dot_product_attention(
+                q, k, v, valid_token_mask=mask, causal=causal
+            )
+            invalid_queries = ~mask[:, None, :, None]
+            self.assertTrue(
+                bool((candidate.masked_select(invalid_queries) == 0).all())
+            )
+
     def test_packed_weight_transfer_matches_baseline(self):
         torch.manual_seed(11)
         baseline = BaselineSelfAttention(d_model=32, num_heads=4).eval()
@@ -213,13 +229,17 @@ class Person1AttentionTests(unittest.TestCase):
             )
 
         if valid_token_mask is not None:
-            invalid_keys = ~valid_token_mask
+            invalid_positions = ~valid_token_mask[:, None, :, None]
             self.assertEqual(
-                int(k_opt.grad[:, :, invalid_keys.any(dim=0), :].abs().sum().item()),
+                int(q_opt.grad.masked_select(invalid_positions).abs().sum().item()),
                 0,
             )
             self.assertEqual(
-                int(v_opt.grad[:, :, invalid_keys.any(dim=0), :].abs().sum().item()),
+                int(k_opt.grad.masked_select(invalid_positions).abs().sum().item()),
+                0,
+            )
+            self.assertEqual(
+                int(v_opt.grad.masked_select(invalid_positions).abs().sum().item()),
                 0,
             )
 

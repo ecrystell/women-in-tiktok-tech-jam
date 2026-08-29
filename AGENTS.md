@@ -77,10 +77,13 @@ force every matrix operation to FP32 without measurements.
 
 Current Person 1 branch: `person1/attention-sdpa`.
 
-Current Person 1 commit: `85cfc14 Add packed QKV SDPA attention module`.
+Current Person 1 commit: `653a558 Add standalone Triton attention package`.
 
-The current implementation adds `FastSelfAttention` but intentionally does not
-modify `UserOptimizedTransformer` integration. Person 3 owns final assembly.
+The current implementation adds the guaranteed packed-QKV `FastSelfAttention`
+SDPA path plus standalone guarded `TritonSelfAttention`, benchmarks, and tests.
+Neither implementation modifies `UserOptimizedTransformer`; Person 3 owns
+dispatch and final assembly. Triton remains experimental until T4 correctness
+and performance measurements justify selecting it.
 
 ### Person 2 — FFN, LayerNorm, and residuals
 
@@ -90,6 +93,12 @@ fusion. Do not assume that a hand-written single kernel for both large Linear
 GEMMs is faster than optimized PyTorch/cuBLAS. Custom Triton is a stretch path.
 
 ### Person 3 — integration, profiling, and dispatch
+
+Current integration branch: `person3/integrate-person1`.
+
+Person 1 source tip `653a558` is merged locally for validation. The pull
+request remains blocked until the complete local suite, strict harness smoke,
+and representative Tesla T4 attention checks pass.
 
 Own `UserOptimizedTransformer`, weight-copy integration, benchmark-driven
 dispatch, profiling, README/reproducibility, and the final demo. Dispatch keys

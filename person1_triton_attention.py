@@ -126,14 +126,20 @@ def _sdpa_attention(
     )
 
     if attention_mask is None:
-        return F.scaled_dot_product_attention(q, k, v, is_causal=causal)
-    return F.scaled_dot_product_attention(
-        q,
-        k,
-        v,
-        attn_mask=attention_mask,
-        is_causal=False,
-    )
+        output = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+    else:
+        output = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attention_mask,
+            is_causal=False,
+        )
+    if valid_token_mask is not None:
+        output = output.masked_fill(
+            ~valid_token_mask[:, None, :, None], 0
+        )
+    return output
 
 
 def supports_triton_attention(
