@@ -93,6 +93,9 @@ Current Person 2 branch: `person2/ffn-fullop-t4`.
 
 Current Person 2 core commit: `d6bfab0 Add standalone Person 2 FFN optimization`.
 
+Current Person 2 validated Task 2 head: `c319ab4` (source implementation
+`16cf403`, followed by documentation and explicit CUDA coverage).
+
 The standalone, baseline-weight-compatible `OptimizedTransformerBlock`, focused
 unit tests, and `bench_person2_ffn.py` are implemented. Final
 `UserOptimizedTransformer` assembly remains owned by Person 3. The implementation
@@ -136,7 +139,8 @@ The primary-sampling short full-block result was 0.969x and its p90 regressed
 Current validated source commit: `fd7b8d7`. `UserOptimizedTransformer` and
 Person 3 dispatch remain unchanged.
 
-The Task 2 full-op candidate passed all 19 tests at `16cf403` on the Colab T4.
+The final Task 2 head `c319ab4` passed all 20 tests on the Colab T4, including
+explicit real-CUDA masked and unmasked full-op execution.
 Across three independent five-shape isolated FP16 sweeps, its lowest speedup
 was 1.023x; all 15 p90 comparisons improved and every accuracy comparison had
 zero failed elements. A reduced-sampling full-block sweep produced one 0.858x

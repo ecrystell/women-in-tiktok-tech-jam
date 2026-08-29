@@ -235,10 +235,12 @@ removes Python and custom-op transitions between the stages. Nonidentity
 LayerNorm parameters and unsupported environments retain the native fallback.
 
 On Tesla T4 (`sm_75`, 15,360 MiB), driver 580.82.07, PyTorch 2.11.0+cu128,
-and CUDA 12.8, all 19 tests passed in 102.240 seconds. This included actual
+and CUDA 12.8, the source checkpoint passed all 19 tests. This included actual
 CUDA extension execution, strict state loading, fake/meta tracing, static
 full-graph compilation, masks, repeated output ownership, exact invalid
 zeroing, FP16, FP32 fallback, and runtime-supported BF16 fallback.
+Final head `c319ab4` added explicit real-CUDA masked and unmasked full-op
+coverage and passed all 20 tests in 8.846 seconds with the extension cached.
 
 The five-shape isolated FP16 gate used seed 1234, `atol=0.001`, `rtol=0.01`,
 20 warmups, 100 CUDA-event repetitions, five alternating rounds, and three
