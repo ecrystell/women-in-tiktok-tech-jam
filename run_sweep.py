@@ -388,6 +388,28 @@ def print_evaluation(evaluation: CandidateEvaluation) -> None:
     )
 
 
+def select_relative_winner(
+    evaluations: list[CandidateEvaluation],
+) -> CandidateEvaluation | None:
+    """Select only candidates that materially beat the first control."""
+    if not evaluations or not evaluations[0].accepted:
+        return None
+    control = evaluations[0]
+    improved = [
+        evaluation
+        for evaluation in evaluations[1:]
+        if evaluation.improves_on(control)
+    ]
+    return max(
+        (control, *improved),
+        key=lambda evaluation: statistics.median(
+            evaluation.relative_speedups(control)
+        )
+        if evaluation is not control
+        else 1.0,
+    )
+
+
 def calibrate_case(
     case: Case,
     *,
@@ -415,18 +437,10 @@ def calibrate_case(
         attention_evaluations.append(evaluation)
         print_evaluation(evaluation)
 
-    accepted_attention = [
-        evaluation for evaluation in attention_evaluations if evaluation.accepted
-    ]
-    if not accepted_attention:
-        print("no attention candidate cleared all gates")
+    attention_winner = select_relative_winner(attention_evaluations)
+    if attention_winner is None:
+        print("baseline-attention control did not clear the baseline gates")
         return None
-    # Each benchmark invocation measures its own paired baseline. Selecting by
-    # speedup is therefore less sensitive to thermal drift between candidates
-    # than comparing absolute candidate latency from separate processes.
-    attention_winner = max(
-        accepted_attention, key=lambda evaluation: evaluation.median_speedup
-    )
 
     packed_depth = attention_winner.candidate.packed_sdpa_suffix_layers
     print(f"\n[{case.label}] FFN calibration with packed={packed_depth}")
@@ -445,23 +459,10 @@ def calibrate_case(
         ffn_evaluations.append(evaluation)
         print_evaluation(evaluation)
 
-    native_ffn = ffn_evaluations[0]
-    if not native_ffn.accepted:
+    winner = select_relative_winner(ffn_evaluations)
+    if winner is None:
         print("native-FFN control did not clear the baseline gates")
         return None
-    improved_ffn = [
-        evaluation
-        for evaluation in ffn_evaluations[1:]
-        if evaluation.improves_on(native_ffn)
-    ]
-    winner = max(
-        (native_ffn, *improved_ffn),
-        key=lambda evaluation: statistics.median(
-            evaluation.relative_speedups(native_ffn)
-        )
-        if evaluation is not native_ffn
-        else 1.0,
-    )
     print(f"\nselected {winner.candidate.label}")
     return winner
 

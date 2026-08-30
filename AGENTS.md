@@ -321,6 +321,16 @@ narrow branch's 1D masked-residual grid remains relevant to ID 6 and other
 workloads above 65,535 token rows, but ID 2's all-valid-mask bypass does not
 exercise that fix.
 
+Official ID 7 (`B64/S128/D32/H4/FFN32/L4`, causal, FP16) passed strict
+correctness at every packed-attention suffix depth. Depth 0 measured 3.7509 ms;
+depths 1 through 4 measured 3.7639, 3.7704, 3.7770, and 3.7848 ms. Their
+median speedups differed from depth 0 by less than 0.3%, far below the 2%
+relative-selection gate, so packed attention is rejected for this shape. The
+first calibration incorrectly reported depth 4 because attention selection
+used absolute baseline speedup rather than the relative-control gate already
+used for FFN. The gate is now applied symmetrically. FFN must be recalibrated
+with packed depth 0 before ID 7 receives a final policy.
+
 Official ID 14 is B32/S100000/D1024/H16/FFN1024/L2. In FP16, a full input is
 6.10 GiB and input plus output is 12.21 GiB, while explicit scores require
 9536.74 GiB before the baseline's FP32 softmax probabilities. The ordinary

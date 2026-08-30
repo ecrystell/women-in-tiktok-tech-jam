@@ -22,6 +22,7 @@ from run_sweep import (
     build_command,
     failed_summary,
     parse_result,
+    select_relative_winner,
     shape14_memory_summary,
 )
 from torch_transformer_benchmark import (
@@ -463,6 +464,14 @@ speedup  : 2.000x based on median latency
             Candidate(1, 1), (faster, passing, faster)
         )
         self.assertFalse(mixed.improves_on(accepted))
+
+        self.assertEqual(
+            select_relative_winner([accepted, improved]), improved
+        )
+        self.assertEqual(
+            select_relative_winner([accepted, mixed]), accepted
+        )
+        self.assertIsNone(select_relative_winner([rejected]))
 
     def test_calibration_parses_failure_and_builds_strict_command(self) -> None:
         output = (
