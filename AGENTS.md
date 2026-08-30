@@ -504,17 +504,26 @@ Local validation on the RTX 4050 Laptop GPU with PyTorch 2.13.0+cu126:
 The prevalidated automatic table entries are exact T4 keys on PyTorch 2.11.0,
 compute capability 7.5: B8/S512/D512/H8 FP16 non-causal unpadded with a 1.327x
 median speedup, official Shape 3 (B4/S128/D128/H4) FP16 causal unpadded with a
-1.481x median speedup, and official Shape 4 (B16/S128/D128/H4) FP16 causal
-unpadded with a 1.448x median speedup. Each uses a one-layer packed-SDPA
-suffix, passed strict correctness and three-process timing gates, and is not
-generalized to nearby shapes, padding modes, devices, or versions.
+1.481x median speedup, official Shape 4 (B16/S128/D128/H4) FP16 causal
+unpadded with a 1.448x median speedup, and official Shape 12
+(B64/S32/D128/H4) FP16 causal unpadded with a 1.480x median speedup. Each uses
+a one-layer packed-SDPA suffix, passed strict correctness and three-process
+timing gates, and is not generalized to nearby shapes, padding modes, devices,
+or versions.
+
+The follow-up candidate experiment did not promote official Shape 2
+(B1/S128/D128/H4): it passed correctness and improved median latency, but a
+repeated process still exceeded the 2% optimized-p90 gate. Shape 7
+(B64/S128/D32/H4) failed strict correctness by one FP16 output element. Both
+remain native fallback cases.
 
 The updated T4 checkout passed strict correctness for the full official 1–13
-smoke sweep. Automatic dispatch selected packed SDPA only for IDs 3 and 4; all
-other official IDs used native fallback. ID 9 was correctness-safe but received
-`SMOKE-REVIEW` because of p90 timing variability. The dedicated final-mode
-three-process runs for IDs 3 and 4 also passed. The full-batch ID 14 harness
-remains blocked; its validated path is the batch-blocked streaming evaluator.
+smoke sweep. Automatic dispatch selected packed SDPA only for IDs 3, 4, and
+12; all other official IDs used native fallback. ID 9 was correctness-safe but
+received `SMOKE-REVIEW` because of p90 timing variability. The dedicated
+final-mode three-process runs for IDs 3, 4, and 12 also passed. The full-batch
+ID 14 harness remains blocked; its validated path is the batch-blocked
+streaming evaluator.
 
 Recommended commands:
 
