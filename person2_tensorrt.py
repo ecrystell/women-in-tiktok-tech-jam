@@ -468,11 +468,20 @@ def _require_modern_tensorrt_api(trt: Any) -> None:
     missing = []
     if not hasattr(trt, "Builder"):
         missing.append("Builder")
-    if not hasattr(getattr(trt, "UnaryOperation", object()), "GELU_ERF"):
-        missing.append("UnaryOperation.GELU_ERF")
-    if not hasattr(getattr(trt, "NetworkDefinitionCreationFlag", object()), "EXPLICIT_BATCH"):
-        missing.append("NetworkDefinitionCreationFlag.EXPLICIT_BATCH")
-    if not hasattr(getattr(trt, "BuilderFlag", object()), "FP16"):
+    activation_gelu = hasattr(
+        getattr(trt, "ActivationType", object()), "GELU_ERF"
+    )
+    unary_gelu = hasattr(getattr(trt, "UnaryOperation", object()), "GELU_ERF")
+    if not (activation_gelu or unary_gelu):
+        missing.append("ActivationType.GELU_ERF")
+    network_flags = getattr(trt, "NetworkDefinitionCreationFlag", object())
+    strongly_typed = hasattr(network_flags, "STRONGLY_TYPED")
+    explicit_batch = hasattr(network_flags, "EXPLICIT_BATCH")
+    if not (strongly_typed or explicit_batch):
+        missing.append("a strongly-typed or explicit-batch network flag")
+    if not strongly_typed and not hasattr(
+        getattr(trt, "BuilderFlag", object()), "FP16"
+    ):
         missing.append("BuilderFlag.FP16")
     if missing:
         raise TensorRTUnsupportedError(
@@ -535,17 +544,23 @@ def _build_serialized_engine(
     logger = trt.Logger(trt.Logger.ERROR)
     try:
         builder = trt.Builder(logger)
-        flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+        network_flags = trt.NetworkDefinitionCreationFlag
+        strongly_typed = hasattr(network_flags, "STRONGLY_TYPED")
+        if strongly_typed:
+            flags = 1 << int(network_flags.STRONGLY_TYPED)
+        else:
+            flags = 1 << int(network_flags.EXPLICIT_BATCH)
         network = builder.create_network(flags)
         if network is None:
-            raise TensorRTBuildError("TensorRT failed to create an explicit-batch network")
+            raise TensorRTBuildError("TensorRT failed to create a static FFN network")
         config = builder.create_builder_config()
         if config is None:
             raise TensorRTBuildError("TensorRT failed to create a builder config")
-        config.set_flag(trt.BuilderFlag.FP16)
-        obey = getattr(trt.BuilderFlag, "OBEY_PRECISION_CONSTRAINTS", None)
-        if obey is not None:
-            config.set_flag(obey)
+        if not strongly_typed:
+            config.set_flag(trt.BuilderFlag.FP16)
+            obey = getattr(trt.BuilderFlag, "OBEY_PRECISION_CONSTRAINTS", None)
+            if obey is not None:
+                config.set_flag(obey)
         if hasattr(config, "set_memory_pool_limit") and hasattr(trt, "MemoryPoolType"):
             config.set_memory_pool_limit(
                 trt.MemoryPoolType.WORKSPACE, int(key.workspace_bytes)
@@ -575,7 +590,8 @@ def _build_serialized_engine(
                 "installed TensorRT cannot request FP32 LayerNorm statistics"
             )
         norm.compute_precision = trt.DataType.FLOAT
-        _set_layer_precision(norm, trt.DataType.HALF, "LayerNorm output")
+        if not strongly_typed:
+            _set_layer_precision(norm, trt.DataType.HALF, "LayerNorm output")
 
         up_matrix = _add_constant(network, up_weight, "up-projection weight")
         up = _require_layer(
@@ -587,7 +603,8 @@ def _build_serialized_engine(
             ),
             "up-projection GEMM",
         )
-        _set_layer_precision(up, trt.DataType.HALF, "up-projection GEMM")
+        if not strongly_typed:
+            _set_layer_precision(up, trt.DataType.HALF, "up-projection GEMM")
         up_bias_tensor = _add_constant(network, up_bias.reshape(1, key.ffn_dim), "up bias")
         up_bias_add = _require_layer(
             network.add_elementwise(
@@ -595,16 +612,28 @@ def _build_serialized_engine(
             ),
             "up-projection bias",
         )
-        _set_layer_precision(up_bias_add, trt.DataType.HALF, "up-projection bias")
+        if not strongly_typed:
+            _set_layer_precision(up_bias_add, trt.DataType.HALF, "up-projection bias")
 
         # GELU_ERF is TensorRT's erf-form GELU.  Do not replace it with the
         # faster GELU_TANH variant: exact-GELU is part of this repository's
         # correctness contract.
-        gelu = _require_layer(
-            network.add_unary(up_bias_add.get_output(0), trt.UnaryOperation.GELU_ERF),
-            "GELU_ERF",
-        )
-        _set_layer_precision(gelu, trt.DataType.HALF, "GELU_ERF")
+        if hasattr(getattr(trt, "ActivationType", object()), "GELU_ERF"):
+            gelu = _require_layer(
+                network.add_activation(
+                    up_bias_add.get_output(0), trt.ActivationType.GELU_ERF
+                ),
+                "GELU_ERF",
+            )
+        else:
+            gelu = _require_layer(
+                network.add_unary(
+                    up_bias_add.get_output(0), trt.UnaryOperation.GELU_ERF
+                ),
+                "GELU_ERF",
+            )
+        if not strongly_typed:
+            _set_layer_precision(gelu, trt.DataType.HALF, "GELU_ERF")
 
         down_matrix = _add_constant(network, down_weight, "down-projection weight")
         down = _require_layer(
@@ -616,7 +645,8 @@ def _build_serialized_engine(
             ),
             "down-projection GEMM",
         )
-        _set_layer_precision(down, trt.DataType.HALF, "down-projection GEMM")
+        if not strongly_typed:
+            _set_layer_precision(down, trt.DataType.HALF, "down-projection GEMM")
         down_bias_tensor = _add_constant(
             network, down_bias.reshape(1, key.d_model), "down bias"
         )
@@ -626,7 +656,8 @@ def _build_serialized_engine(
             ),
             "down-projection bias",
         )
-        _set_layer_precision(update, trt.DataType.HALF, "down-projection bias")
+        if not strongly_typed:
+            _set_layer_precision(update, trt.DataType.HALF, "down-projection bias")
         output = update.get_output(0)
         output.name = "update"
         network.mark_output(output)
@@ -685,6 +716,11 @@ class TensorRTFFNEngine:
             raise TensorRTBuildError(
                 f"TensorRT engine I/O mismatch: expected {expected_names}, got {names}"
             )
+        for name in expected_names:
+            if engine.get_tensor_dtype(name) != modules.trt.DataType.HALF:
+                raise TensorRTBuildError(
+                    f"TensorRT engine {name} tensor is not FP16"
+                )
 
     @property
     def device(self) -> torch.device:

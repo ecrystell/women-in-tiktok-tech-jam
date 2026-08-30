@@ -453,6 +453,31 @@ class Person2BlockTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             person2_tensorrt.TensorRTFFNCache(max_entries=0)
 
+    def test_tensorrt_api_probe_accepts_strongly_typed_gelu(self) -> None:
+        import person2_tensorrt
+
+        tensorrt_11 = SimpleNamespace(
+            Builder=object(),
+            ActivationType=SimpleNamespace(GELU_ERF=object()),
+            UnaryOperation=SimpleNamespace(),
+            NetworkDefinitionCreationFlag=SimpleNamespace(
+                STRONGLY_TYPED=object()
+            ),
+            BuilderFlag=SimpleNamespace(),
+        )
+        person2_tensorrt._require_modern_tensorrt_api(tensorrt_11)
+
+        tensorrt_legacy = SimpleNamespace(
+            Builder=object(),
+            ActivationType=SimpleNamespace(),
+            UnaryOperation=SimpleNamespace(GELU_ERF=object()),
+            NetworkDefinitionCreationFlag=SimpleNamespace(
+                EXPLICIT_BATCH=object()
+            ),
+            BuilderFlag=SimpleNamespace(FP16=object()),
+        )
+        person2_tensorrt._require_modern_tensorrt_api(tensorrt_legacy)
+
     def test_article_gemm_shapes_are_derived_from_tokens(self) -> None:
         from bench_person2_ffn import Case
 
