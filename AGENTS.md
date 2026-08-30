@@ -27,8 +27,9 @@ The main benchmark is `torch_transformer_benchmark.py`.
 - `valid_token_mask` masks invalid key positions and invalid query outputs.
 - The benchmark compares every output element using an OR condition:
   `abs_error <= atol` or `abs_error <= rtol * abs(reference)`.
-- The script defaults to `atol=0.001` and `rtol=0.01`; use these stricter
-  values for local validation even if external instructions allow looser ones.
+- The organizer harness defaults to `atol=0.002` and `rtol=0.02`. Use the
+  stricter `atol=0.001`, `rtol=0.01` gate for local candidate screening, then
+  report judge-equivalent results with the organizer defaults explicitly.
 - Timing uses CUDA events after warmup. Do not include random-data generation
   in performance measurements.
 - Keep dtype, matmul precision, and TF32 settings identical for reference and
