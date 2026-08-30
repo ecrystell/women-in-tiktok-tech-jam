@@ -767,10 +767,6 @@ class TensorRTFFNEngine:
         with torch.cuda.device(self.key.device_index):
             chosen = stream or torch.cuda.current_stream(self.key.device_index)
             stream_handle = int(chosen.cuda_stream)
-            if stream_handle == 0:
-                raise TensorRTUnsupportedError(
-                    "TensorRT requires a concrete CUDA stream handle"
-                )
             with self._context_lock:
                 if stream_handle in self._contexts:
                     return
