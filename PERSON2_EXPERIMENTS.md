@@ -273,3 +273,72 @@ reformulation was also screened: it had zero strict failures on short and
 medium shapes, but was not promoted because it changes floating-point
 evaluation and would require a new fused statistics/correction kernel. It
 remains a separately gated future experiment rather than part of this result.
+
+## T4 pre-norm fusion and TensorRT pass
+
+Branch `person2/tensorrt-ffn-t4` started from the validated `f50ef57` full-op
+control. Source head `70bce22` retains that full-op as the default and exposes
+the two new candidates only through explicit experimental benchmarks. Neither
+candidate changes `UserOptimizedTransformer`, public signatures, parameter
+names, or state-dict layout.
+
+The native candidate uses one FP16 CUDA kernel to compute the attention
+residual and identity-affine LayerNorm with FP32 Welford statistics. It emits
+both the rounded FP16 residual and normalized tensor, then reuses PyTorch /
+cuBLAS for both GEMMs, exact ATen GELU, and the existing residual/mask kernel.
+Training, compilation, non-contiguous inputs, nonidentity affine parameters,
+unsupported dtypes/devices, extension failures, and failed strict preflight
+retain the validated path.
+
+On Tesla T4 (`sm_75`, 15,360 MiB), driver 580.82.07, PyTorch 2.11.0+cu128,
+and CUDA 12.8, the short isolated FFN control profile measured 0.2519 ms.
+CUDA profiler shares were 87.47% GEMM, 3.41% LayerNorm, 2.54% exact GELU,
+3.68% copy/layout, and 2.90% other, giving a theoretical all-non-GEMM Amdahl
+ceiling of 1.143x. The focused residual-add plus LayerNorm microbenchmark
+measured the native fused kernel at 0.0407 ms median / 0.0450 ms p90 and a
+1.401x median speedup. This micro-result did not translate into a universal
+full-block win.
+
+The full-block control/candidate benchmark used identical weights, seed 1234,
+`atol=0.001`, `rtol=0.01`, 20 warmups, 100 CUDA-event repetitions, and five
+alternating rounds. The short case was repeated in three independent Python
+processes:
+
+| Case / process | Full-op control median / p90 (ms) | Pre-norm median / p90 (ms) | Speedup | Accuracy / gate |
+| --- | ---: | ---: | ---: | --- |
+| short / 1 | 0.7796 / 0.8541 | 0.7655 / 0.8560 | 1.018x | zero failures / pass |
+| short / 2 | 0.7882 / 0.8632 | 0.7573 / 0.8868 | 1.041x | zero failures / **p90 fail (+2.7%)** |
+| short / 3 | 0.7767 / 0.9331 | 0.7490 / 0.8617 | 1.037x | zero failures / pass |
+| medium unpadded | 4.5281 / 4.5621 | 4.5583 / 4.5957 | 0.993x | zero failures / no win |
+| medium causal, padded | 5.1507 / 5.1692 | 5.1771 / 5.2174 | 0.995x | zero failures / no win |
+
+Short maximum absolute error was 0.000976562. The medium unpadded and padded
+maximum absolute errors were 0.00195312 and 0.00390625 respectively, with zero
+failed elements under the required OR tolerance. A static `default` compiled
+short check deliberately used the established fallback and measured 1.001x;
+its candidate p90 was 0.9736 ms versus 0.9454 ms control (+3.0%). The native
+candidate was therefore disqualified before costly long-shape repeats: it had
+already failed the p90 gate and was slower on both medium screens. No
+five-shape or universal speedup is claimed.
+
+The optional TensorRT lane was tested with TensorRT 11.2.1.2, CUDA Python
+12.9.4, CUDA bindings 12.9.7, CUDA core 0.3.2, and NumPy restored to Colab's
+2.1.3. TensorRT 11 required a strongly typed network and exposes exact GELU as
+`ActivationType.GELU_ERF`; explicit casts make LayerNorm input/statistics FP32
+and return its output to FP16 before the GEMMs. Engine/tactic construction and
+stream-context preparation remained outside timing. The short fixed-shape
+engine built and executed, but strict preflight failed:
+
+- max absolute error: 0.00683594;
+- max relative error: 89.1225 (dominated by near-zero references);
+- failed elements: 2,079 / 65,536.
+
+Correctness failure stopped TensorRT timing as designed. It remains an
+optional, lazy, eager-only experiment with native fallback and is not a
+runtime dependency. The final selected source passed all 24 T4 tests in
+115.685 seconds, including actual CUDA extension execution, FP16, FP32,
+runtime-supported BF16, masks, ownership, non-contiguous fallback, static
+compile fallback, and TensorRT availability/API fallback checks. The strict
+official harness passed two trials with zero error; its small safety run was
+0.8894 / 0.9679 ms baseline median/p90 and 0.8867 / 0.9617 ms optimized
+median/p90 (1.003x), which is not treated as a new speedup claim.

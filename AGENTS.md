@@ -92,13 +92,24 @@ GEMMs is faster than optimized PyTorch/cuBLAS. Custom Triton is a stretch path.
 Current Person 2 branch: `person2/tensorrt-ffn-t4`, created from validated
 control `person2/ffn-fullop-t4` at `f50ef57`.
 
-This pass evaluates two separately gated T4 inference candidates: a native
-CUDA fusion of the attention residual add with FP32-statistics identity
-`norm2`, and an optional fixed-shape TensorRT FFN engine using exact
-`GELU_ERF`. Both retain the current PyTorch/CUDA full-op as rollback; neither
-may modify `UserOptimizedTransformer`, state-dict layout, or the public
-forward signature. Transformer Engine / FP8 is excluded on the Tesla T4
-(`sm_75`).
+Validated source head: `70bce22`. The existing `f50ef57` PyTorch/CUDA full-op
+remains the selected default. The native CUDA fusion of attention residual add
+with FP32-statistics identity `norm2` is retained only behind the explicit
+pre-norm comparison benchmark: it passed strict correctness, but one of three
+short runs exceeded the 2% p90 regression limit and the two medium screens
+measured 0.993x and 0.995x. The TensorRT 11.2.1.2 fixed-shape engine builds and
+executes on the T4 using strongly typed FP16 GEMMs, explicit FP32 LayerNorm
+casts, and `GELU_ERF`, but strict preflight failed with max absolute error
+0.00683594 and 2,079/65,536 failed elements, so it is never timed or selected.
+
+The final Colab environment was Tesla T4 (`sm_75`, 15,360 MiB), driver
+580.82.07, PyTorch 2.11.0+cu128, CUDA 12.8, CUDA Python 12.9.4, and TensorRT
+11.2.1.2. All 24 tests passed, including real CUDA extension execution,
+TensorRT API/fallback coverage, masks, ownership, compile fallback, FP16,
+FP32, and runtime-supported BF16. The strict official-harness smoke passed two
+trials with zero failed elements. `UserOptimizedTransformer`, signatures, and
+state-dict layout remain unchanged. Transformer Engine / FP8 stays excluded on
+the Tesla T4 (`sm_75`). Full measurements are in `PERSON2_EXPERIMENTS.md`.
 
 Current Person 2 core commit: `d6bfab0 Add standalone Person 2 FFN optimization`.
 
