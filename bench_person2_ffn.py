@@ -88,6 +88,25 @@ class FullBlock(nn.Module):
     ) -> bool:
         if not isinstance(self.block, OptimizedTransformerBlock):
             return False
+        with torch.inference_mode():
+            ffn_input = x + self.block.attention(
+                self.block.norm1(x), valid_token_mask, self.causal
+            )
+        return self.block.prepare_fast_ffn(ffn_input, valid_token_mask)
+
+    @property
+    def prepare_error(self) -> Optional[str]:
+        return getattr(self.block, "fast_ffn_error", None)
+
+
+class PrenormCandidateBlock(FullBlock):
+    """Opt in to the experimental attention-residual/LayerNorm fusion."""
+
+    def prepare(
+        self, x: torch.Tensor, valid_token_mask: Optional[torch.Tensor]
+    ) -> bool:
+        if not isinstance(self.block, OptimizedTransformerBlock):
+            return False
         return self.block.prepare_prenorm_fusion(
             x, valid_token_mask, self.causal
         )
@@ -348,7 +367,7 @@ def make_prenorm_control_models(
     case: Case,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[FullBlock, FullOpControlBlock, FullBlock]:
+) -> tuple[FullBlock, FullOpControlBlock, PrenormCandidateBlock]:
     """Build matched baseline, ``f50ef57`` control, and fused candidates.
 
     The two optimized blocks receive independent but bit-identical parameter
@@ -374,7 +393,7 @@ def make_prenorm_control_models(
     return (
         FullBlock(baseline_block, case.causal),
         FullOpControlBlock(control_block, case.causal),
-        FullBlock(candidate_block, case.causal),
+        PrenormCandidateBlock(candidate_block, case.causal),
     )
 
 
