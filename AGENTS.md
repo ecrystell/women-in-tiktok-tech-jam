@@ -175,9 +175,17 @@ compilation and timing, while unsupported paths retain native fallbacks.
 Local CPU validation of the assembly passed all 34 tests with eight expected
 CUDA/Triton skips. Strict non-causal/unpadded and causal/25%-padded harness
 smokes each passed with zero failed elements. These CPU timings are not GPU
-speedup evidence. End-to-end T4 validation and dispatch decisions remain
-pending; do not merge the candidate into the shared integration branch until
-those measurements pass.
+speedup evidence.
+
+The first end-to-end T4 smoke rejected the candidate before timing. All four
+tested shapes prepared the fast FFN in 6/6 layers, but strict five-trial
+accuracy failed after six combined layers. Failed elements ranged from 1,190
+of 327,680 for B1/S128 to 10,712 of 10,485,760 for causal padded B8/S512;
+maximum absolute error ranged from 0.0078125 to 0.00976562. Standalone component
+correctness therefore does not establish full-model correctness. Use
+`diagnose_integration.py` to separate attention drift, FFN drift, and their
+interaction before adding dispatch. Do not benchmark on failure or merge the
+candidate into the shared integration branch until strict T4 accuracy passes.
 
 Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
 `f50ef57` are both contained by integration merge `99c1830` (Person 2 entered
