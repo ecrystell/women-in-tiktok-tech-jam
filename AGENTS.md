@@ -448,11 +448,12 @@ unpadded with a 1.448x median speedup. Each uses a one-layer packed-SDPA
 suffix, passed strict correctness and three-process timing gates, and is not
 generalized to nearby shapes, padding modes, devices, or versions.
 
-The updated T4 checkout passed the full official 1–13 smoke sweep. Automatic
-dispatch selected packed SDPA only for IDs 3 and 4; all other official IDs
-used native fallback. The dedicated final-mode three-process runs for IDs 3
-and 4 also passed. The full-batch ID 14 harness remains blocked; its validated
-path is the batch-blocked streaming evaluator.
+The updated T4 checkout passed strict correctness for the full official 1–13
+smoke sweep. Automatic dispatch selected packed SDPA only for IDs 3 and 4; all
+other official IDs used native fallback. ID 9 was correctness-safe but received
+`SMOKE-REVIEW` because of p90 timing variability. The dedicated final-mode
+three-process runs for IDs 3 and 4 also passed. The full-batch ID 14 harness
+remains blocked; its validated path is the batch-blocked streaming evaluator.
 
 Recommended commands:
 
