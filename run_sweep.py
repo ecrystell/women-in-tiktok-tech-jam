@@ -44,6 +44,7 @@ class RunResult:
     optimized_median_ms: float
     optimized_p90_ms: float
     speedup: float
+    backend: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -175,6 +176,9 @@ def parse_timing(output: str, label: str) -> tuple[float, float]:
 
 
 def parse_result(output: str) -> RunResult:
+    backend_match = re.search(
+        r"^attention_backend=(\S+)$", output, flags=re.MULTILINE
+    )
     baseline_median, baseline_p90 = parse_timing(output, "baseline")
     optimized_median, optimized_p90 = parse_timing(output, "optimized")
     speedup_match = re.search(
@@ -191,6 +195,7 @@ def parse_result(output: str) -> RunResult:
         optimized_median_ms=optimized_median,
         optimized_p90_ms=optimized_p90,
         speedup=float(speedup_match.group(1)),
+        backend=backend_match.group(1) if backend_match else "unknown",
     )
 
 
@@ -202,10 +207,11 @@ def build_command(
     repeats: int,
     rounds: int,
     fast_ffn_suffix_layers: int,
-    packed_sdpa_suffix_layers: int,
+    packed_sdpa_suffix_layers: int | None,
     atol: float = 0.001,
     rtol: float = 0.01,
     accuracy_trials: int = 20,
+    dispatch_mode: str = "auto",
 ) -> list[str]:
     command = [
         sys.executable,
@@ -238,13 +244,17 @@ def build_command(
         str(accuracy_trials),
         "--fast-ffn-suffix-layers",
         str(fast_ffn_suffix_layers),
-        "--packed-sdpa-suffix-layers",
-        str(packed_sdpa_suffix_layers),
+        "--dispatch-mode",
+        dispatch_mode,
         "--atol",
         str(atol),
         "--rtol",
         str(rtol),
     ]
+    if packed_sdpa_suffix_layers is not None:
+        command.extend(
+            ["--packed-sdpa-suffix-layers", str(packed_sdpa_suffix_layers)]
+        )
     if case.causal:
         command.append("--causal")
     return command
@@ -274,7 +284,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--processes", type=int)
     parser.add_argument("--fast-ffn-suffix-layers", type=int, default=0)
-    parser.add_argument("--packed-sdpa-suffix-layers", type=int, default=0)
+    parser.add_argument("--packed-sdpa-suffix-layers", type=int, default=None)
+    parser.add_argument(
+        "--dispatch-mode",
+        choices=("auto", "native"),
+        default="auto",
+    )
     parser.add_argument(
         "--calibrate",
         action="store_true",
@@ -296,7 +311,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--processes must be positive")
     if args.fast_ffn_suffix_layers < 0:
         parser.error("--fast-ffn-suffix-layers must be nonnegative")
-    if args.packed_sdpa_suffix_layers < 0:
+    if (
+        args.packed_sdpa_suffix_layers is not None
+        and args.packed_sdpa_suffix_layers < 0
+    ):
         parser.error("--packed-sdpa-suffix-layers must be nonnegative")
     if args.case_id is not None and args.suite != "official":
         parser.error("--case-id requires --suite official")
@@ -545,10 +563,11 @@ def main() -> int:
 
     print(
         f"suite={args.suite} mode={args.mode} device={device} dtype={dtype} "
-        f"processes={processes} "
+            f"processes={processes} "
         f"warmup={warmup} repeats={repeats} rounds={rounds} "
         f"fast_ffn_suffix_layers={args.fast_ffn_suffix_layers} "
-        f"packed_sdpa_suffix_layers={args.packed_sdpa_suffix_layers}"
+        f"packed_sdpa_suffix_layers={args.packed_sdpa_suffix_layers if args.packed_sdpa_suffix_layers is not None else 'auto'} "
+        f"dispatch_mode={args.dispatch_mode}"
     )
     correctness_failed = False
     execution_failed = False
@@ -565,6 +584,7 @@ def main() -> int:
             rounds,
             args.fast_ffn_suffix_layers,
             args.packed_sdpa_suffix_layers,
+            dispatch_mode=args.dispatch_mode,
         )
         for process_index in range(processes):
             completed = subprocess.run(command, capture_output=True, text=True)
@@ -587,6 +607,7 @@ def main() -> int:
             print(
                 f"process {process_index + 1}: "
                 f"{'PASS' if result.correct else 'FAIL'} | "
+                f"backend={result.backend} | "
                 f"median={result.optimized_median_ms:.4f} ms | "
                 f"p90={result.optimized_p90_ms:.4f} ms | "
                 f"speedup={result.speedup:.3f}x"

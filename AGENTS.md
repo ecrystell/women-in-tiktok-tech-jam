@@ -4,8 +4,8 @@
 
 Optimize the provided PyTorch Transformer benchmark for the target GPU while
 preserving the reference output within the benchmark's numerical tolerance.
-The team has three members and approximately 3–5 days. The preferred strategy
-is a reliable PyTorch optimization ladder:
+The team has three members. The preferred strategy is a reliable PyTorch
+optimization ladder:
 
 1. PyTorch scaled dot-product attention (SDPA).
 2. Packed QKV projection.
@@ -461,13 +461,58 @@ when possible.
   `attention_kernels.py`, `ffn_kernels.py`, and `dispatch.py`, leaving the
   benchmark file as a stable harness.
 
-## Suggested execution order
+## Isolated Person 3 dispatcher experiment
 
-1. Establish baseline numbers for every supplied configuration.
-2. Implement and validate SDPA.
-3. Add packed QKV and validate weight equivalence.
-4. Compile and benchmark each relevant mode.
-5. Add shape/mask dispatch based on measured results.
-6. Attempt one custom kernel only for a demonstrated remaining bottleneck.
-7. Freeze code, run regression tests, and prepare the reproducibility report
-   and 2–3 minute demo.
+This worktree is the isolated branch `codex/person3-dispatch-shape14`, based on
+the locally available `origin/person3/integrate-person1` ref. It must not push
+or modify `main`, `person3/integrate-person1`, or Person 1's branch.
+
+The production-safe policy is setup-time, exact-key dispatch:
+
+1. Unknown or unvalidated keys use native attention.
+2. Packed-QKV SDPA is selected automatically only when an exact correctness,
+   median-speed, and p90 gate has been recorded for the full key.
+3. Triton remains opt-in and is never selected by this dispatcher.
+4. Timing is skipped when strict correctness fails.
+5. Official Shape #14 is evaluated only by the batch-blocked streaming runner;
+   the original full-batch reference harness is blocked before allocation.
+
+`person3_dispatch.py` owns the immutable workload key, measured candidate gate,
+and plan selection. `torch_transformer_benchmark.py` performs the selection
+before model construction and reports `attention_backend` and the dispatch
+reason. `run_sweep.py` covers official IDs 1–14, reports the selected backend,
+and marks a hardware memory refusal as `RESOURCE-BLOCKED` rather than timing an
+unsafe run.
+
+`bench_shape14_streaming.py` keeps one block on the GPU and repeats it
+sequentially for the logical batch. It never runs the explicit baseline at
+S=100,000 and does not claim that sequential latency is full-batch throughput.
+The reduced exact and opt-in full 100k smoke tests live in
+`tests/test_person3_integration.py`.
+
+Local validation on the RTX 4050 Laptop GPU with PyTorch 2.13.0+cu126:
+
+- 21 isolated integration tests passed; the 100k test is opt-in.
+- The reduced CUDA Shape #14 exact test and streaming smoke passed.
+- A reduced B1/S100000/D64/H1/L1 FP16 run passed with 0.09 GiB peak GPU
+  allocation and no `[B,H,S,S]` matrix.
+- Official IDs 1–5 and 7–13 passed strict smoke validation with native
+  fallback. ID 6 was resource-blocked by the local 4050's full-batch reference
+  memory guard; rerun on the T4 or use a blockwise evaluator before making an
+  official ID 6 performance claim.
+
+The only prevalidated automatic table entry is the exact T4 key B8/S512/D512,
+H8, FP16, non-causal, unpadded, PyTorch 2.11.0, compute capability 7.5. Its
+one-layer packed-SDPA suffix passed strict correctness and three-process timing
+gates with a 1.327x median speedup. This result is not generalized to the
+organizer appendix shapes; those remain native until independently measured on
+the acceptance GPU.
+
+Recommended commands:
+
+```text
+python run_sweep.py --suite official --skip-long --device cuda --dtype float16 --processes 1 --mode smoke
+python bench_shape14_streaming.py --logical-batch 1 --batch-block 1 --seq-len 100000 --d-model 64 --heads 1 --ffn-dim 64 --layers 1 --dtype float16 --device cuda --warmup 0 --repeats 1
+set RUN_SHAPE14_100K=1
+python -m unittest tests.test_person3_integration -v
+```

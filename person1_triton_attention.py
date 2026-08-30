@@ -46,6 +46,9 @@ _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _MAX_CUSTOM_HEAD_DIM = 128
 _MAX_CUSTOM_BACKWARD_SEQ_LEN = 32
 _CUSTOM_HEAD_DIMS = (64,)
+_OFFICIAL_HEAD_DIMS = (8, 32, 64, 128, 256)
+_MAX_EXPLICIT_SEQ_LEN = 2048
+_LONG_SDPA_QUERY_BLOCK = 32
 
 
 def triton_available() -> bool:
@@ -104,6 +107,12 @@ def _build_sdpa_mask(
         # convention.  The singleton dimensions broadcast over heads/queries.
         return valid_keys[:, None, None, :]
 
+    if seq_len > _MAX_EXPLICIT_SEQ_LEN:
+        raise RuntimeError(
+            "dense causal attention masks are disabled for long sequences; "
+            "use an unmasked SDPA/Triton path or query-tiled fallback"
+        )
+
     causal_allowed = torch.ones(
         (seq_len, seq_len), device=device, dtype=torch.bool
     ).tril()
@@ -127,6 +136,11 @@ def _explicit_compatibility_attention(
     """
 
     _, _, seq_len, _ = q.shape
+    if seq_len > _MAX_EXPLICIT_SEQ_LEN:
+        raise RuntimeError(
+            "explicit attention is restricted to short sequences; "
+            "long sequences require memory-efficient SDPA or Triton"
+        )
     scores = torch.matmul(q, k.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
     if causal:
         causal_mask = torch.ones(
@@ -145,6 +159,62 @@ def _explicit_compatibility_attention(
     return output
 
 
+def _query_tiled_masked_sdpa_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    valid_token_mask: torch.Tensor,
+    causal: bool,
+) -> torch.Tensor:
+    """Run masked SDPA in query tiles without constructing an ``S x S`` mask.
+
+    This is a safety fallback for long causal-plus-padding inputs when a
+    backend cannot consume both a causal flag and a key-padding mask directly.
+    It is intentionally not a performance claim: the SDPA kernel still does
+    the exact attention work, while the temporary mask and score tile are
+    bounded by ``_LONG_SDPA_QUERY_BLOCK``.
+    """
+
+    batch, _heads, seq_len, _ = q.shape
+    outputs: list[torch.Tensor] = []
+    valid_keys = valid_token_mask.to(device=q.device, dtype=torch.bool)
+    for query_start in range(0, seq_len, _LONG_SDPA_QUERY_BLOCK):
+        query_end = min(query_start + _LONG_SDPA_QUERY_BLOCK, seq_len)
+        key_end = query_end if causal else seq_len
+        q_tile = q[:, :, query_start:query_end, :]
+        k_tile = k[:, :, :key_end, :]
+        v_tile = v[:, :, :key_end, :]
+
+        key_mask = valid_keys[:, None, None, :key_end]
+        if causal:
+            query_positions = torch.arange(
+                query_start, query_end, device=q.device
+            )
+            key_positions = torch.arange(key_end, device=q.device)
+            causal_mask = key_positions[None, :] <= query_positions[:, None]
+            attention_mask = key_mask & causal_mask[None, None, :, :]
+        else:
+            attention_mask = key_mask
+
+        output_tile = F.scaled_dot_product_attention(
+            q_tile,
+            k_tile,
+            v_tile,
+            attn_mask=attention_mask,
+            is_causal=False,
+        )
+        valid_queries = valid_token_mask[:, query_start:query_end]
+        outputs.append(
+            output_tile.masked_fill(
+                ~valid_queries[:, None, :, None].to(device=q.device), 0
+            )
+        )
+
+    if not outputs:
+        return q.new_empty((batch, q.shape[1], 0, q.shape[-1]))
+    return torch.cat(outputs, dim=2)
+
+
 def _sdpa_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -155,17 +225,35 @@ def _sdpa_attention(
     """Correct PyTorch fallback matching the benchmark's mask semantics."""
 
     _, _, seq_len, _ = q.shape
-    if (
-        q.dtype == torch.bfloat16
+
+    # An all-valid mask is semantically equivalent to no mask.  Detecting it
+    # here keeps the functional API memory-safe even when callers do not use
+    # ``UserOptimizedTransformer.prepare_for_inference`` first.
+    effective_mask = valid_token_mask
+    if valid_token_mask is not None and bool(valid_token_mask.all().item()):
+        effective_mask = None
+
+    # Preserve exact explicit-reference behavior only where it is useful for
+    # compatibility checks.  Official head dimensions use SDPA on the normal
+    # GPU path; they are accepted by the dispatcher only after strict gates.
+    use_explicit = (
+        q.device.type == "cpu"
+        or q.dtype == torch.bfloat16
         or seq_len < 32
-        or q.shape[-1] not in _CUSTOM_HEAD_DIMS
-    ):
+        or q.shape[-1] not in _OFFICIAL_HEAD_DIMS
+    )
+    if use_explicit and seq_len <= _MAX_EXPLICIT_SEQ_LEN:
         return _explicit_compatibility_attention(
-            q, k, v, valid_token_mask, causal
+            q, k, v, effective_mask, causal
+        )
+
+    if seq_len > _MAX_EXPLICIT_SEQ_LEN and effective_mask is not None:
+        return _query_tiled_masked_sdpa_attention(
+            q, k, v, effective_mask, causal
         )
 
     attention_mask = _build_sdpa_mask(
-        valid_token_mask=valid_token_mask,
+        valid_token_mask=effective_mask,
         seq_len=seq_len,
         causal=causal,
         device=q.device,
@@ -185,7 +273,7 @@ def _sdpa_attention(
     # requires invalid query rows to be exactly zero, including their
     # gradients.  Apply that query-side rule after SDPA so the functional API
     # and the module wrapper have identical semantics.
-    valid_queries = valid_token_mask.to(device=q.device, dtype=torch.bool)
+    valid_queries = effective_mask.to(device=q.device, dtype=torch.bool)
     return output.masked_fill(~valid_queries[:, None, :, None], 0)
 
 

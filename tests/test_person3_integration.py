@@ -13,7 +13,14 @@ from bench_shape14_blockwise import (
     SeparateQKVSDPAAttention,
     SeparateQKVTritonAttention,
 )
+from bench_shape14_streaming import Shape14MemoryEstimate, validate_memory_budget
 from person1_triton_attention import PackedQKVSDPAAttention
+from person3_dispatch import (
+    AttentionDispatchKey,
+    DispatchMeasurement,
+    make_dispatch_key,
+    select_attention_plan,
+)
 from run_sweep import (
     OFFICIAL_CASES,
     Candidate,
@@ -57,6 +64,98 @@ def assert_or_close(
 
 
 class Person3IntegrationTests(unittest.TestCase):
+    def test_dispatch_key_distinguishes_padding_and_runtime(self) -> None:
+        no_padding = make_dispatch_key(
+            batch_size=2,
+            seq_len=7,
+            d_model=32,
+            num_heads=4,
+            dtype=torch.float32,
+            causal=True,
+            valid_token_mask=torch.ones(2, 7, dtype=torch.bool),
+            device=torch.device("cpu"),
+        )
+        padded = make_dispatch_key(
+            batch_size=2,
+            seq_len=7,
+            d_model=32,
+            num_heads=4,
+            dtype=torch.float32,
+            causal=True,
+            valid_token_mask=torch.tensor(
+                [[True] * 7, [True, True, True, True, False, False, False]]
+            ),
+            device=torch.device("cpu"),
+        )
+        self.assertIsInstance(no_padding, AttentionDispatchKey)
+        self.assertEqual(no_padding.padding, "none")
+        self.assertEqual(padded.padding, "padded")
+        self.assertNotEqual(no_padding, padded)
+
+    def test_dispatch_uses_only_exact_measured_candidates(self) -> None:
+        key = make_dispatch_key(
+            batch_size=2,
+            seq_len=7,
+            d_model=32,
+            num_heads=4,
+            dtype=torch.float32,
+            causal=False,
+            valid_token_mask=None,
+            device=torch.device("cpu"),
+        )
+        passing = DispatchMeasurement(
+            key=key,
+            suffix_layers=1,
+            correctness_passed=True,
+            process_speedups=(1.10, 1.08, 1.09),
+            baseline_p90_ms=(10.0, 10.0, 10.0),
+            optimized_p90_ms=(9.0, 9.5, 9.2),
+        )
+        failing = DispatchMeasurement(
+            key=key,
+            suffix_layers=2,
+            correctness_passed=False,
+            process_speedups=(1.50, 1.50, 1.50),
+            baseline_p90_ms=(10.0, 10.0, 10.0),
+            optimized_p90_ms=(1.0, 1.0, 1.0),
+        )
+        plan = select_attention_plan(
+            key, num_layers=2, measurements=(passing, failing)
+        )
+        self.assertEqual(plan.label, "packed-sdpa-suffix:1")
+        self.assertEqual(
+            select_attention_plan(key, num_layers=2).label, "native"
+        )
+
+    def test_dispatch_manual_override_is_explicit(self) -> None:
+        key = make_dispatch_key(
+            batch_size=1,
+            seq_len=8,
+            d_model=32,
+            num_heads=4,
+            dtype=torch.float32,
+            causal=True,
+            valid_token_mask=None,
+            device=torch.device("cpu"),
+        )
+        plan = select_attention_plan(
+            key, num_layers=2, manual_suffix_layers=1
+        )
+        self.assertEqual(plan.label, "packed-sdpa-suffix:1")
+        self.assertIn("manual experiment", plan.reason)
+
+    def test_shape14_memory_guard_rejects_unsafe_block(self) -> None:
+        unsafe = Shape14MemoryEstimate(
+            batch_block=32,
+            seq_len=100_000,
+            d_model=1024,
+            dtype=torch.float16,
+            working_set_bytes=100,
+            free_bytes=100,
+        )
+        with self.assertRaises(MemoryError):
+            validate_memory_budget(unsafe, free_fraction=0.01)
+
     def test_query_tiled_reference_matches_baseline_attention(self) -> None:
         torch.manual_seed(99)
         baseline = BaselineSelfAttention(32, 4).eval()

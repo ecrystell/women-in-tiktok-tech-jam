@@ -27,6 +27,12 @@ import torch.nn.functional as F
 
 import person2_ffn_post
 from person1_triton_attention import PackedQKVSDPAAttention
+from person3_dispatch import (
+    AttentionDispatchPlan,
+    historical_t4_measurements,
+    make_dispatch_key,
+    select_attention_plan,
+)
 
 
 @dataclass(frozen=True)
@@ -607,7 +613,20 @@ class UserOptimizedTransformer(BaselineTransformer):
         self,
         config: TransformerConfig,
         packed_sdpa_suffix_layers: int = 0,
+        attention_plan: Optional[AttentionDispatchPlan] = None,
     ) -> None:
+        if attention_plan is not None:
+            if (
+                packed_sdpa_suffix_layers
+                and packed_sdpa_suffix_layers
+                != attention_plan.packed_sdpa_suffix_layers
+            ):
+                raise ValueError(
+                    "attention_plan and packed_sdpa_suffix_layers disagree"
+                )
+            packed_sdpa_suffix_layers = (
+                attention_plan.packed_sdpa_suffix_layers
+            )
         if not 0 <= packed_sdpa_suffix_layers <= config.num_layers:
             raise ValueError(
                 "packed_sdpa_suffix_layers must be between 0 and num_layers"
@@ -617,6 +636,7 @@ class UserOptimizedTransformer(BaselineTransformer):
         nn.Module.__init__(self)
         self.config = config
         self.packed_sdpa_suffix_layers = packed_sdpa_suffix_layers
+        self._attention_plan = attention_plan
         first_packed_layer = config.num_layers - packed_sdpa_suffix_layers
         self.layers = nn.ModuleList(
             [
@@ -734,9 +754,17 @@ class UserOptimizedTransformer(BaselineTransformer):
 
     @property
     def attention_backend(self) -> str:
+        if self._attention_plan is not None:
+            return self._attention_plan.label
         if self.packed_sdpa_suffix_layers:
             return f"packed-sdpa-suffix:{self.packed_sdpa_suffix_layers}"
         return "baseline"
+
+    @property
+    def attention_dispatch_reason(self) -> str:
+        if self._attention_plan is None:
+            return "manual constructor selection"
+        return self._attention_plan.reason
 
     @property
     def mask_dispatch(self) -> str:
@@ -1234,8 +1262,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--packed-sdpa-suffix-layers",
         type=int,
-        default=0,
+        default=None,
         help="experimentally use packed SDPA in only the final N layers",
+    )
+    parser.add_argument(
+        "--dispatch-mode",
+        choices=("auto", "native"),
+        default="auto",
+        help="use the exact measured dispatch table or force native attention",
     )
     parser.add_argument(
         "--matmul-precision",
@@ -1266,7 +1300,10 @@ def validate_args(args: argparse.Namespace, device: torch.device, dtype: torch.d
         raise ValueError("repeats and benchmark_rounds must be positive")
     if not 0 <= args.fast_ffn_suffix_layers <= args.layers:
         raise ValueError("fast_ffn_suffix_layers must be between 0 and --layers")
-    if not 0 <= args.packed_sdpa_suffix_layers <= args.layers:
+    if (
+        args.packed_sdpa_suffix_layers is not None
+        and not 0 <= args.packed_sdpa_suffix_layers <= args.layers
+    ):
         raise ValueError(
             "packed_sdpa_suffix_layers must be between 0 and --layers"
         )
@@ -1298,11 +1335,45 @@ def main() -> int:
         torch.backends.cuda.matmul.allow_tf32 = args.allow_tf32
         torch.backends.cudnn.allow_tf32 = args.allow_tf32
 
-    baseline = BaselineTransformer(config)
-    optimized = UserOptimizedTransformer(
-        config,
-        packed_sdpa_suffix_layers=args.packed_sdpa_suffix_layers,
+    benchmark_case = generate_random_case(
+        config=config,
+        device=device,
+        dtype=dtype,
+        seed=args.seed + 100000,
+        padding_ratio=args.padding_ratio,
+        input_scale=args.input_scale,
     )
+    dispatch_key = make_dispatch_key(
+        batch_size=config.batch_size,
+        seq_len=config.seq_len,
+        d_model=config.d_model,
+        num_heads=config.num_heads,
+        dtype=dtype,
+        causal=config.causal,
+        valid_token_mask=benchmark_case[1],
+        device=device,
+    )
+    if args.dispatch_mode == "native":
+        dispatch_plan = select_attention_plan(
+            dispatch_key,
+            num_layers=config.num_layers,
+            manual_suffix_layers=0,
+        )
+    elif args.packed_sdpa_suffix_layers is not None:
+        dispatch_plan = select_attention_plan(
+            dispatch_key,
+            num_layers=config.num_layers,
+            manual_suffix_layers=args.packed_sdpa_suffix_layers,
+        )
+    else:
+        dispatch_plan = select_attention_plan(
+            dispatch_key,
+            num_layers=config.num_layers,
+            measurements=historical_t4_measurements(),
+        )
+
+    baseline = BaselineTransformer(config)
+    optimized = UserOptimizedTransformer(config, attention_plan=dispatch_plan)
     copy_model_weights(
         baseline,
         optimized,
@@ -1315,14 +1386,6 @@ def main() -> int:
     # Prepare extension-backed paths and mask-specific caches with the exact
     # tensors used by the timed eager benchmark. Compilation and setup costs
     # are deliberately excluded from latency measurements.
-    benchmark_case = generate_random_case(
-        config=config,
-        device=device,
-        dtype=dtype,
-        seed=args.seed + 100000,
-        padding_ratio=args.padding_ratio,
-        input_scale=args.input_scale,
-    )
     prepared_ffn_layers = optimized.prepare_for_inference(
         *benchmark_case,
         fast_ffn_suffix_layers=args.fast_ffn_suffix_layers,
@@ -1342,10 +1405,11 @@ def main() -> int:
     if device.type == "cuda":
         print(f"gpu={torch.cuda.get_device_name(device)}")
     print(f"attention_backend={attention_backend}")
+    print(f"attention_dispatch_reason={optimized.attention_dispatch_reason}")
     print(f"mask_dispatch={mask_dispatch}")
     print(
         "requested_packed_sdpa_suffix_layers="
-        f"{args.packed_sdpa_suffix_layers}"
+        f"{args.packed_sdpa_suffix_layers if args.packed_sdpa_suffix_layers is not None else 'auto'}"
     )
     print(f"requested_fast_ffn_suffix_layers={args.fast_ffn_suffix_layers}")
     print(
