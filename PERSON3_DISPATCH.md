@@ -27,6 +27,8 @@ The validated automatic T4 entries are:
 
 - B8/S512/D512/H8, FP16, non-causal, unpadded: one-layer packed SDPA,
   1.327x median process speedup.
+- Official Shape 2 (B1/S128/D128/H4), FP16, causal, unpadded: one-layer
+  packed SDPA, 1.363x median process speedup.
 - Official Shape 3 (B4/S128/D128/H4), FP16, causal, unpadded: one-layer
   packed SDPA, 1.481x median process speedup.
 - Official Shape 4 (B16/S128/D128/H4), FP16, causal, unpadded: one-layer
@@ -37,12 +39,11 @@ The validated automatic T4 entries are:
 These results are not generalized to nearby shapes, padding modes, devices,
 or PyTorch versions.
 
-The follow-up candidate experiment deliberately did not promote Shape 2
-(B1/S128/D128/H4): it passed correctness and improved median latency, but one
-of the repeated timing processes still exceeded the 2% optimized-p90 gate.
-Shape 7 (B64/S128/D32/H4) was rejected before timing because one FP16 output
-element failed the exact benchmark OR rule. Both shapes therefore retain the
-native fallback.
+An earlier Shape 2 experiment had p90 variability, but the later strict
+20-trial, three-process run cleared correctness, median, and paired-baseline
+p90 gates and supersedes it. Shape 7 (B64/S128/D32/H4) passed strict
+correctness at every packed depth, but every packed candidate missed the 2%
+relative improvement gate, so it retains native attention.
 
 ## Shape #14 safety path
 
@@ -66,7 +67,7 @@ allocated.
 
 The updated T4 checkout passes 54 tests with one expected opt-in skip. The
 official CUDA smoke sweep passed strict correctness for IDs 1–13; automatic
-dispatch selected packed SDPA only for IDs 3, 4, and 12, with native fallback
+dispatch selected packed SDPA only for IDs 2, 3, 4, and 12, with native fallback
 for every other official shape. ID 9 was correctness-safe but received
 `SMOKE-REVIEW` because of p90 timing variability. Dedicated three-process final
 runs for IDs 3, 4, and 12 passed correctness, repeatability, and p90 gates.

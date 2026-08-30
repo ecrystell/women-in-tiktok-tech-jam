@@ -222,6 +222,19 @@ def historical_t4_measurements() -> Tuple[DispatchMeasurement, ...]:
         compute_capability=(7, 5),
         torch_version="2.11.0",
     )
+    shape2_key = AttentionDispatchKey(
+        batch_size=1,
+        seq_len=128,
+        d_model=128,
+        num_heads=4,
+        dtype="torch.float16",
+        causal=True,
+        padding="none",
+        device_type="cuda",
+        device_index=0,
+        compute_capability=(7, 5),
+        torch_version="2.11.0",
+    )
     shape3_key = AttentionDispatchKey(
         batch_size=4,
         seq_len=128,
@@ -269,6 +282,14 @@ def historical_t4_measurements() -> Tuple[DispatchMeasurement, ...]:
             process_speedups=(1.333, 1.325, 1.327),
             baseline_p90_ms=(27.8528, 28.3276, 29.0056),
             optimized_p90_ms=(21.0168, 21.4778, 21.9393),
+        ),
+        DispatchMeasurement(
+            key=shape2_key,
+            suffix_layers=1,
+            correctness_passed=True,
+            process_speedups=(1.383, 1.363, 1.335),
+            baseline_p90_ms=(3.8862, 3.6755, 3.5051),
+            optimized_p90_ms=(2.5692, 2.5445, 2.9584),
         ),
         DispatchMeasurement(
             key=shape3_key,
