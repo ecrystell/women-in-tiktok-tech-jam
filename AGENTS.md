@@ -188,6 +188,15 @@ correctness therefore does not establish full-model correctness. Use
 interaction before adding dispatch. Do not benchmark on failure or merge the
 candidate into the shared integration branch until strict T4 accuracy passes.
 
+The first fallback smoke then selected baseline attention plus fast FFN in all
+six layers. B1/S128 passed five strict trials with exact output, but performance
+was not repeatable: the direct run measured 0.987x with worse p90 while the
+sweep process measured 1.015x. B8/S512 unpadded, B8/S512 causal with 20%
+padding, and B2/S2048 unpadded all failed strict accuracy before timing, with
+maximum absolute errors from 0.0078125 and thousands of failed elements across
+five trials. The next diagnostic must test partial FFN layer selection; the
+six-layer FFN fallback is not a valid universal production dispatch.
+
 Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
 `f50ef57` are both contained by integration merge `99c1830` (Person 2 entered
 at merge `f6d897a`). The T4-validated source-code tree is `d57502e`; the final

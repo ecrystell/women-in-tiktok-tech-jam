@@ -91,6 +91,15 @@ def print_comparison(
     return result.passed
 
 
+def select_fast_ffn_layers(
+    model: FFNOnlyTransformer,
+    selected_layers: set[int],
+) -> None:
+    """Toggle only FFN paths that already passed numerical preflight."""
+    for index, layer in enumerate(model.layers):
+        layer._fast_ffn_enabled = index in selected_layers
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -191,6 +200,42 @@ def main() -> int:
             args.rtol,
             args.atol,
         )
+
+        print("\nFast-FFN prefix with baseline attention:")
+        for fast_layers in range(config.num_layers + 1):
+            select_fast_ffn_layers(ffn_only, set(range(fast_layers)))
+            print_comparison(
+                f"first {fast_layers}/{config.num_layers} layers",
+                reference,
+                ffn_only(x, valid_mask),
+                args.rtol,
+                args.atol,
+            )
+
+        print("\nFast-FFN suffix with baseline attention:")
+        for fast_layers in range(config.num_layers + 1):
+            first_fast = config.num_layers - fast_layers
+            select_fast_ffn_layers(
+                ffn_only, set(range(first_fast, config.num_layers))
+            )
+            print_comparison(
+                f"last {fast_layers}/{config.num_layers} layers",
+                reference,
+                ffn_only(x, valid_mask),
+                args.rtol,
+                args.atol,
+            )
+
+        print("\nIndividual fast FFN layers with baseline attention:")
+        for layer_index in range(config.num_layers):
+            select_fast_ffn_layers(ffn_only, {layer_index})
+            print_comparison(
+                f"layer {layer_index + 1}/{config.num_layers}",
+                reference,
+                ffn_only(x, valid_mask),
+                args.rtol,
+                args.atol,
+            )
 
         print("\nPacked-SDPA prefix with native FFN:")
         for packed_layers, prefix_model in enumerate(prefix_models):
