@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import statistics
 import time
-from dataclasses import dataclass
-from typing import Iterable, Optional
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+from typing import Any, Iterable, Optional
 
 import torch
 import torch.nn as nn
@@ -27,6 +29,26 @@ SWEEP_SHAPES = (
     (8, 512, 512, 8, 2048, True, 0.2),
     (4, 2048, 1024, 16, 4096, False, 0.0),
     (2, 4096, 1024, 16, 4096, True, 0.0),
+)
+
+# Organizer Appendix configurations 1-13. Configuration 14 is intentionally
+# excluded: its activation alone exceeds practical T4 memory and its dominant
+# 100,000-token attention workload is outside Person 2 ownership.
+OFFICIAL_CASES = (
+    # batch, sequence, model, heads, FFN, causal, padding ratio, official IDs
+    (64, 128, 128, 4, 128, True, 0.0, (1,)),
+    (1, 128, 128, 4, 128, True, 0.0, (2,)),
+    (4, 128, 128, 4, 128, True, 0.0, (3,)),
+    (16, 128, 128, 4, 128, True, 0.0, (4,)),
+    (128, 128, 128, 4, 128, True, 0.0, (5,)),
+    (10000, 128, 128, 4, 128, True, 0.0, (6,)),
+    (64, 128, 32, 4, 32, True, 0.0, (7,)),
+    (64, 128, 1024, 4, 1024, True, 0.0, (8,)),
+    (64, 128, 128, 1, 128, True, 0.0, (9,)),
+    (64, 128, 128, 2, 128, True, 0.0, (10,)),
+    (64, 128, 128, 16, 128, True, 0.0, (11,)),
+    (64, 32, 128, 4, 128, True, 0.0, (12,)),
+    (64, 1024, 128, 4, 128, True, 0.0, (13,)),
 )
 
 CUDA_GRAPH_MODES = frozenset(("reduce-overhead", "max-autotune"))
@@ -108,11 +130,21 @@ class Case:
     ffn_dim: int
     causal: bool
     padding_ratio: float
+    official_ids: tuple[int, ...] = ()
+
+    @property
+    def tokens(self) -> int:
+        return self.batch * self.seq_len
 
     @property
     def label(self) -> str:
+        official = (
+            f"official={','.join(str(value) for value in self.official_ids)},"
+            if self.official_ids
+            else ""
+        )
         return (
-            f"B={self.batch},S={self.seq_len},D={self.d_model},"
+            f"{official}B={self.batch},S={self.seq_len},D={self.d_model},"
             f"H={self.heads},FFN={self.ffn_dim},causal={self.causal},"
             f"padding={self.padding_ratio:g}"
         )
@@ -125,6 +157,52 @@ class Accuracy:
     max_rel: float
     failed: int
     elements: int
+
+
+class StaticCudaGraphFFN(nn.Module):
+    """Diagnostic fixed-pointer replay wrapper; never a production backend."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        capture_warmups: int,
+    ) -> None:
+        super().__init__()
+        if not x.is_cuda:
+            raise RuntimeError("CUDA-graph replay requires CUDA")
+        self.model = model
+        self.static_x = x
+        self.static_mask = mask
+        side_stream = torch.cuda.Stream(device=x.device)
+        side_stream.wait_stream(torch.cuda.current_stream(x.device))
+        with torch.cuda.stream(side_stream), torch.inference_mode():
+            for _ in range(max(3, capture_warmups)):
+                model(x, mask)
+        torch.cuda.current_stream(x.device).wait_stream(side_stream)
+        torch.cuda.synchronize(x.device)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph), torch.inference_mode():
+            self.static_output = model(self.static_x, self.static_mask)
+        torch.cuda.synchronize(x.device)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if x.data_ptr() != self.static_x.data_ptr():
+            raise RuntimeError("CUDA graph requires the captured input pointer")
+        if mask.data_ptr() != self.static_mask.data_ptr():
+            raise RuntimeError("CUDA graph requires the captured mask pointer")
+        self.graph.replay()
+        return self.static_output
+
+    def output_ownership(self) -> tuple[bool, str]:
+        with torch.inference_mode():
+            first = self(self.static_x, self.static_mask)
+            first_pointer = first.data_ptr()
+            second = self(self.static_x, self.static_mask)
+        if first_pointer == second.data_ptr():
+            return False, "replay reuses and may overwrite the previous output buffer"
+        return True, "each replay owns distinct output storage"
 
 
 def resolve_device(name: str) -> torch.device:
@@ -319,14 +397,28 @@ def run_case(
     device: torch.device,
     dtype: torch.dtype,
     args: argparse.Namespace,
-) -> None:
-    print(f"\n[{scope} | {mode}] {case.label}")
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "case": asdict(case),
+        "scope": scope,
+        "backend": args.backend,
+        "mode": mode,
+        "process_index": args.process_index,
+        "status": "error",
+        "eligible": False,
+    }
+    print(f"\n[{scope} | {args.backend} | {mode}] {case.label}")
     try:
+        if args.backend == "cuda-graph" and scope != "isolated":
+            raise RuntimeError("CUDA-graph diagnostics support isolated FFN only")
+        if args.backend == "cuda-graph" and mode != "eager":
+            raise RuntimeError("CUDA-graph diagnostics require eager mode")
         x, mask = make_input(case, device, dtype, args.seed)
         baseline, candidate = make_models(case, scope, device, dtype)
+        fast_enabled = False
         prepare = getattr(candidate, "prepare", None)
         if prepare is not None:
-            enabled = prepare(x, mask)
+            fast_enabled = prepare(x, mask)
             reason = getattr(candidate, "prepare_error", None)
             block = getattr(candidate, "block", None)
             compact_enabled = bool(
@@ -334,7 +426,7 @@ def run_case(
             )
             compact_reason = getattr(block, "compact_ffn_error", None)
             print(
-                f"fast_ffn={'ENABLED' if enabled else 'FALLBACK'}"
+                f"fast_ffn={'ENABLED' if fast_enabled else 'FALLBACK'}"
                 + (f" | reason={reason}" if reason else "")
                 + (
                     " | valid_row_compaction=ENABLED"
@@ -348,7 +440,18 @@ def run_case(
                 )
             )
         baseline = compile_model(baseline, mode)
-        candidate = compile_model(candidate, mode)
+        graph_owns_outputs = True
+        graph_ownership_reason = "not applicable"
+        if args.backend == "cuda-graph":
+            candidate = StaticCudaGraphFFN(candidate, x, mask, args.warmup)
+            graph_owns_outputs, graph_ownership_reason = candidate.output_ownership()
+            print(
+                "cuda_graph_output_ownership="
+                f"{'PASS' if graph_owns_outputs else 'FAIL'} | "
+                f"reason={graph_ownership_reason}"
+            )
+        else:
+            candidate = compile_model(candidate, mode)
 
         with torch.inference_mode():
             reference_output = accuracy_output(baseline, x, mask, device, mode)
@@ -366,7 +469,14 @@ def run_case(
         )
         if not accuracy.passed:
             print("timing skipped because strict accuracy validation failed")
-            return
+            result.update(
+                status="accuracy-failed",
+                accuracy=asdict(accuracy),
+                graph_output_ownership=graph_owns_outputs,
+                graph_ownership_reason=graph_ownership_reason,
+                fast_path_enabled=fast_enabled,
+            )
+            return result
 
         warmup(baseline, x, mask, args.warmup, device, mode)
         warmup(candidate, x, mask, args.warmup, device, mode)
@@ -390,29 +500,98 @@ def run_case(
 
         baseline_median = statistics.median(baseline_samples)
         candidate_median = statistics.median(candidate_samples)
-        tokens = case.batch * case.seq_len
+        baseline_p90 = percentile(baseline_samples, 0.90)
+        candidate_p90 = percentile(candidate_samples, 0.90)
+        speedup = baseline_median / candidate_median
+        tokens = case.tokens
         print(
             f"baseline median={baseline_median:.4f} ms | "
-            f"p90={percentile(baseline_samples, 0.90):.4f} ms | "
+            f"p90={baseline_p90:.4f} ms | "
             f"throughput={tokens * 1000.0 / baseline_median:.2f} token/s"
         )
         print(
             f"optimized median={candidate_median:.4f} ms | "
-            f"p90={percentile(candidate_samples, 0.90):.4f} ms | "
+            f"p90={candidate_p90:.4f} ms | "
             f"throughput={tokens * 1000.0 / candidate_median:.2f} token/s"
         )
-        print(f"speedup={baseline_median / candidate_median:.3f}x")
+        print(f"speedup={speedup:.3f}x")
+        if scope == "isolated":
+            median_gate = speedup >= args.isolated_gate
+            p90_gate = candidate_p90 <= baseline_p90
+        else:
+            median_gate = speedup >= args.full_block_gate
+            p90_gate = candidate_p90 <= baseline_p90 * args.full_block_p90_limit
+        eligible = (
+            accuracy.passed
+            and median_gate
+            and p90_gate
+            and graph_owns_outputs
+            and fast_enabled
+        )
+        result.update(
+            status="measured",
+            eligible=eligible,
+            accuracy=asdict(accuracy),
+            graph_output_ownership=graph_owns_outputs,
+            graph_ownership_reason=graph_ownership_reason,
+            fast_path_enabled=fast_enabled,
+            baseline_median_ms=baseline_median,
+            baseline_p90_ms=baseline_p90,
+            baseline_throughput_tokens_s=tokens * 1000.0 / baseline_median,
+            optimized_median_ms=candidate_median,
+            optimized_p90_ms=candidate_p90,
+            optimized_throughput_tokens_s=tokens * 1000.0 / candidate_median,
+            speedup=speedup,
+            median_gate_passed=median_gate,
+            p90_gate_passed=p90_gate,
+        )
+        print(f"selection_gate={'PASS' if eligible else 'FAIL'}")
+        return result
     except torch.OutOfMemoryError as error:
         print(f"SKIP OOM: {error}")
+        result.update(status="oom", error=str(error))
+        return result
     except Exception as error:  # Keep a multi-mode sweep running after backend failures.
         print(f"SKIP ERROR {type(error).__name__}: {error}")
+        result.update(
+            status="error", error_type=type(error).__name__, error=str(error)
+        )
+        return result
     finally:
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
 
-def cases_from_args(args: argparse.Namespace) -> Iterable[Case]:
-    if args.sweep:
+def official_cases() -> tuple[Case, ...]:
+    return tuple(Case(*shape) for shape in OFFICIAL_CASES)
+
+
+def official_isolated_cases() -> tuple[Case, ...]:
+    """Deduplicate official cases that generate the same Person 2 workload."""
+    unique: dict[tuple[int, int, int], Case] = {}
+    for case in official_cases():
+        key = (case.tokens, case.d_model, case.ffn_dim)
+        previous = unique.get(key)
+        if previous is None:
+            unique[key] = case
+        else:
+            unique[key] = replace(
+                previous,
+                official_ids=previous.official_ids + case.official_ids,
+            )
+    return tuple(unique.values())
+
+
+def cases_from_args(args: argparse.Namespace, scope: str) -> Iterable[Case]:
+    if args.suite == "official":
+        cases = official_isolated_cases() if scope == "isolated" else official_cases()
+        if args.official_case:
+            requested = set(args.official_case)
+            cases = tuple(
+                case for case in cases if requested.intersection(case.official_ids)
+            )
+        return cases
+    if args.suite == "legacy" or args.sweep:
         return (Case(*shape) for shape in SWEEP_SHAPES)
     return (
         Case(
@@ -429,6 +608,15 @@ def cases_from_args(args: argparse.Namespace) -> Iterable[Case]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--suite", choices=("custom", "legacy", "official"), default="custom"
+    )
+    parser.add_argument(
+        "--official-case",
+        action="append",
+        type=int,
+        help="limit the official suite to one or more organizer case IDs",
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--d-model", type=int, default=512)
@@ -444,6 +632,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--scope", choices=("isolated", "full", "both"), default="isolated"
+    )
+    parser.add_argument(
+        "--backend", choices=("full-op", "cuda-graph"), default="full-op"
     )
     parser.add_argument(
         "--compile-mode",
@@ -463,12 +654,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=100)
-    parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--rounds", type=int)
+    parser.add_argument("--process-index", type=int, default=1)
+    parser.add_argument("--isolated-gate", type=float, default=1.005)
+    parser.add_argument("--full-block-gate", type=float, default=0.99)
+    parser.add_argument("--full-block-p90-limit", type=float, default=1.02)
+    parser.add_argument("--json-output", type=Path)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.sweep and args.suite != "custom":
+        raise ValueError("--sweep is a legacy-suite alias and cannot be combined")
+    if args.official_case and args.suite != "official":
+        raise ValueError("--official-case requires --suite official")
+    if args.official_case and not set(args.official_case).issubset(range(1, 14)):
+        raise ValueError("official case IDs must be between 1 and 13")
+    if args.rounds is None:
+        args.rounds = 5 if args.suite == "official" else 3
     if not 0 <= args.padding_ratio < 1:
         raise ValueError("padding_ratio must be in [0, 1)")
     device = resolve_device(args.device)
@@ -481,8 +685,22 @@ def main() -> int:
     torch.manual_seed(args.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
+    environment: dict[str, Any] = {
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "device": str(device),
+        "dtype": str(dtype),
+        "compile_available": hasattr(torch, "compile"),
+    }
     print(f"torch={torch.__version__} | device={device} | dtype={dtype}")
     if device.type == "cuda":
+        properties = torch.cuda.get_device_properties(device)
+        environment.update(
+            gpu=properties.name,
+            capability=list(torch.cuda.get_device_capability(device)),
+            total_memory_bytes=properties.total_memory,
+            bf16_supported=torch.cuda.is_bf16_supported(),
+        )
         print(
             f"gpu={torch.cuda.get_device_name(device)} | "
             f"capability={torch.cuda.get_device_capability(device)} | "
@@ -501,11 +719,31 @@ def main() -> int:
         if args.all_compile_modes
         else (args.compile_mode,)
     )
-    cases = tuple(cases_from_args(args))
-    for case in cases:
-        for scope in scopes:
+    results: list[dict[str, Any]] = []
+    for scope in scopes:
+        cases = tuple(cases_from_args(args, scope))
+        for case in cases:
             for mode in modes:
-                run_case(case, scope, mode, device, dtype, args)
+                results.append(run_case(case, scope, mode, device, dtype, args))
+
+    if args.json_output is not None:
+        args.json_output.parent.mkdir(parents=True, exist_ok=True)
+        serializable_args = {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        }
+        args.json_output.write_text(
+            json.dumps(
+                {
+                    "environment": environment,
+                    "arguments": serializable_args,
+                    "results": results,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"wrote {args.json_output}")
     return 0
 
 
