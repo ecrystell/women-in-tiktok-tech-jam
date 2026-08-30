@@ -237,6 +237,15 @@ remains disabled independently, and invalid suffix counts are rejected. Start
 T4 validation with N=1 and increase only after five-trial strict correctness;
 this is an experimental control, not a production dispatch or speedup claim.
 
+Initial T4 suffix validation used B8/S512/D512/H8/FFN2048/L6, non-causal,
+unpadded FP16 with the all-valid-mask bypass and native FFN. N=1 passed 20
+random trials plus the exact prepared case with zero failed elements across
+44,040,192 comparisons; its one-round smoke measured 1.336x end-to-end. N=2
+is rejected: 16 of 20 random trials and the prepared case failed, totaling 45
+failed elements across the same comparison count with maximum absolute error
+0.0078125. Performance was correctly skipped. Keep N=1 experimental pending
+three-process timing, and do not dispatch N=2 for this shape.
+
 Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
 `f50ef57` are both contained by integration merge `99c1830` (Person 2 entered
 at merge `f6d897a`). The T4-validated source-code tree is `d57502e`; the final
