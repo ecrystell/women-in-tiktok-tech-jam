@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 try:
     import torch
@@ -126,6 +127,46 @@ class Person1AttentionTests(unittest.TestCase):
             self.assertTrue(
                 bool((candidate.masked_select(invalid_queries) == 0).all())
             )
+
+    def test_long_causal_padding_avoids_dense_mask_builder(self):
+        torch.manual_seed(10)
+        q = torch.randn(1, 1, 2049, 8)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        mask = torch.ones(1, 2049, dtype=torch.bool)
+        mask[:, -17:] = False
+
+        # The long masked fallback must use bounded query tiles rather than
+        # constructing the dense causal mask used by short compatibility cases.
+        with mock.patch(
+            "person1_triton_attention._build_sdpa_mask",
+            side_effect=AssertionError("dense mask builder was called"),
+        ):
+            candidate = triton_scaled_dot_product_attention(
+                q, k, v, valid_token_mask=mask, causal=True
+            )
+        self.assertEqual(tuple(candidate.shape), (1, 1, 2049, 8))
+        self.assertTrue(torch.isfinite(candidate).all())
+        self.assertTrue(bool((candidate[:, :, -17:, :] == 0).all()))
+
+    @unittest.skipUnless(
+        _TORCH_AVAILABLE and torch.cuda.is_available(),
+        "CUDA is required for CUDA SDPA coverage",
+    )
+    def test_cuda_sdpa_accepts_official_head_dimensions(self):
+        device = torch.device("cuda")
+        with mock.patch(
+            "person1_triton_attention.F.scaled_dot_product_attention",
+            wraps=F.scaled_dot_product_attention,
+        ) as sdpa:
+            for head_dim in (8, 32, 128, 256):
+                q = torch.randn(
+                    1, 1, 32, head_dim, device=device, dtype=torch.float16
+                )
+                output = triton_scaled_dot_product_attention(q, q, q, causal=True)
+                self.assertEqual(tuple(output.shape), tuple(q.shape))
+                self.assertTrue(torch.isfinite(output).all())
+        self.assertEqual(sdpa.call_count, 4)
 
     def test_packed_weight_transfer_matches_baseline(self):
         torch.manual_seed(11)

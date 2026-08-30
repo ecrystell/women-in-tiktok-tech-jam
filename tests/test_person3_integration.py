@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import inspect
+import os
 import unittest
 from unittest import mock
 
 import torch
 
 from bench_shape14_blockwise import QueryTiledSelfAttention, SeparateQKVSDPAAttention
+from bench_shape14_streaming import (
+    Shape14MemoryEstimate,
+    validate_memory_budget,
+)
 from person1_triton_attention import PackedQKVSDPAAttention
+from person3_dispatch import (
+    AttentionDispatchKey,
+    DispatchMeasurement,
+    make_dispatch_key,
+    select_attention_plan,
+)
 from run_sweep import OFFICIAL_CASES, parse_result, shape14_memory_summary
 from torch_transformer_benchmark import (
     BaselineSelfAttention,
@@ -18,6 +29,8 @@ from torch_transformer_benchmark import (
     UserOptimizedTransformer,
     UserOptimizedTransformerBlock,
     copy_model_weights,
+    estimate_reference_working_set_bytes,
+    validate_reference_memory_budget,
 )
 
 
@@ -43,6 +56,185 @@ def assert_or_close(
 
 
 class Person3IntegrationTests(unittest.TestCase):
+    def test_dispatch_key_distinguishes_padding_and_runtime(self) -> None:
+        cpu = torch.device("cpu")
+        no_padding = make_dispatch_key(
+            batch_size=2,
+            seq_len=7,
+            d_model=32,
+            num_heads=4,
+            dtype=torch.float32,
+            causal=True,
+            valid_token_mask=torch.ones(2, 7, dtype=torch.bool),
+            device=cpu,
+        )
+        padded = make_dispatch_key(
+            batch_size=2,
+            seq_len=7,
+            d_model=32,
+            num_heads=4,
+            dtype=torch.float32,
+            causal=True,
+            valid_token_mask=torch.tensor(
+                [[True] * 7, [True, True, True, True, False, False, False]]
+            ),
+            device=cpu,
+        )
+        self.assertIsInstance(no_padding, AttentionDispatchKey)
+        self.assertEqual(no_padding.padding, "none")
+        self.assertEqual(padded.padding, "padded")
+        self.assertNotEqual(no_padding, padded)
+
+    def test_dispatch_uses_only_exact_measured_candidates(self) -> None:
+        key = make_dispatch_key(
+            batch_size=2,
+            seq_len=7,
+            d_model=32,
+            num_heads=4,
+            dtype=torch.float32,
+            causal=False,
+            valid_token_mask=None,
+            device=torch.device("cpu"),
+        )
+        passing = DispatchMeasurement(
+            key=key,
+            suffix_layers=1,
+            correctness_passed=True,
+            process_speedups=(1.10, 1.08, 1.09),
+            baseline_p90_ms=(10.0, 10.0, 10.0),
+            optimized_p90_ms=(9.0, 9.5, 9.2),
+        )
+        failing = DispatchMeasurement(
+            key=key,
+            suffix_layers=2,
+            correctness_passed=False,
+            process_speedups=(1.50, 1.50, 1.50),
+            baseline_p90_ms=(10.0, 10.0, 10.0),
+            optimized_p90_ms=(1.0, 1.0, 1.0),
+        )
+        plan = select_attention_plan(
+            key,
+            num_layers=2,
+            measurements=(passing, failing),
+        )
+        self.assertEqual(plan.label, "packed-sdpa-suffix:1")
+        self.assertIn("exact measured candidate", plan.reason)
+
+        unknown = select_attention_plan(
+            key,
+            num_layers=2,
+            measurements=(),
+        )
+        self.assertEqual(unknown.label, "native")
+
+    def test_dispatch_manual_override_is_explicit(self) -> None:
+        key = make_dispatch_key(
+            batch_size=1,
+            seq_len=8,
+            d_model=32,
+            num_heads=4,
+            dtype=torch.float32,
+            causal=True,
+            valid_token_mask=None,
+            device=torch.device("cpu"),
+        )
+        plan = select_attention_plan(
+            key,
+            num_layers=2,
+            manual_suffix_layers=1,
+        )
+        self.assertEqual(plan.label, "packed-sdpa-suffix:1")
+        self.assertIn("manual experiment", plan.reason)
+
+    def test_shape14_memory_guard_rejects_unsafe_block(self) -> None:
+        unsafe = Shape14MemoryEstimate(
+            batch_block=32,
+            seq_len=100_000,
+            d_model=1024,
+            dtype=torch.float16,
+            working_set_bytes=100,
+            free_bytes=100,
+        )
+        with self.assertRaises(MemoryError):
+            validate_memory_budget(unsafe, free_fraction=0.01)
+
+    def test_full_batch_reference_memory_guard_rejects_unsafe_shape(self) -> None:
+        config = TransformerConfig(10_000, 128, 128, 4, 128, 4, True)
+        estimate = estimate_reference_working_set_bytes(config, torch.float16)
+        with self.assertRaises(MemoryError):
+            validate_reference_memory_budget(
+                config,
+                torch.float16,
+                free_bytes=estimate - 1,
+            )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for streaming smoke")
+    def test_shape14_streaming_small_smoke(self) -> None:
+        from bench_shape14_streaming import run_streaming_shape14
+
+        result = run_streaming_shape14(
+            logical_batch=2,
+            batch_block=1,
+            seq_len=128,
+            d_model=32,
+            heads=4,
+            ffn_dim=32,
+            layers=1,
+            dtype=torch.float16,
+            device=torch.device("cuda"),
+            warmup=0,
+            repeats=1,
+        )
+        self.assertEqual(result["blocks"], 2)
+        self.assertEqual(result["backend"], "packed-sdpa-suffix:1")
+        self.assertGreater(result["peak_gpu_gib"], 0.0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for streaming correctness")
+    def test_shape14_streaming_reduced_exact_correctness(self) -> None:
+        from bench_shape14_streaming import build_shape14_models
+
+        torch.manual_seed(120)
+        baseline, optimized = build_shape14_models(
+            batch_block=1,
+            seq_len=128,
+            d_model=64,
+            heads=1,
+            ffn_dim=64,
+            layers=1,
+            device=torch.device("cuda"),
+            dtype=torch.float16,
+        )
+        x = torch.randn(1, 128, 64, device="cuda", dtype=torch.float16)
+        mask = torch.ones(1, 128, device="cuda", dtype=torch.bool)
+        optimized.prepare_for_inference(x, mask, fast_ffn_suffix_layers=0)
+        with torch.inference_mode():
+            reference = baseline(x, mask)
+            candidate = optimized(x, mask)
+        assert_or_close(self, reference, candidate, atol=0.001, rtol=0.01)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and os.environ.get("RUN_SHAPE14_100K") == "1",
+        "set RUN_SHAPE14_100K=1 with CUDA to run the 100k smoke test",
+    )
+    def test_shape14_100k_finite_no_oom_smoke(self) -> None:
+        from bench_shape14_streaming import run_streaming_shape14
+
+        result = run_streaming_shape14(
+            logical_batch=1,
+            batch_block=1,
+            seq_len=100_000,
+            d_model=64,
+            heads=1,
+            ffn_dim=64,
+            layers=1,
+            dtype=torch.float16,
+            device=torch.device("cuda"),
+            warmup=0,
+            repeats=1,
+        )
+        self.assertEqual(result["blocks"], 1)
+        self.assertTrue(torch.isfinite(torch.tensor(result["median_ms"])))
+
     def test_query_tiled_reference_matches_baseline_attention(self) -> None:
         torch.manual_seed(99)
         baseline = BaselineSelfAttention(32, 4).eval()
@@ -399,6 +591,7 @@ class Person3IntegrationTests(unittest.TestCase):
 
     def test_sweep_parser_reads_strict_result_and_timings(self) -> None:
         output = """
+attention_backend=packed-sdpa-suffix:1
 summary: PASS | max_abs=0.0001 | max_rel=0.02 | failed=0/1024
 baseline : median=4.2000 ms | mean=4.2500 ms | p90=4.5000 ms | min=4.0000 ms
 optimized: median=2.1000 ms | mean=2.1500 ms | p90=2.3000 ms | min=2.0000 ms
@@ -406,6 +599,7 @@ speedup  : 2.000x based on median latency
 """
         result = parse_result(output)
         self.assertTrue(result.correct)
+        self.assertEqual(result.backend, "packed-sdpa-suffix:1")
         self.assertEqual(result.baseline_median_ms, 4.2)
         self.assertEqual(result.baseline_p90_ms, 4.5)
         self.assertEqual(result.optimized_median_ms, 2.1)
