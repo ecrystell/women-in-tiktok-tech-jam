@@ -149,13 +149,23 @@ class Person3IntegrationTests(unittest.TestCase):
 
     def test_historical_t4_measurements_are_exact_passing_entries(self) -> None:
         measurements = historical_t4_measurements()
-        self.assertEqual(len(measurements), 3)
+        self.assertEqual(len(measurements), 4)
         self.assertEqual(
             {
-                (measurement.key.batch_size, measurement.key.d_model)
+                (
+                    measurement.key.batch_size,
+                    measurement.key.seq_len,
+                    measurement.key.d_model,
+                    measurement.key.num_heads,
+                )
                 for measurement in measurements
             },
-            {(8, 512), (4, 128), (16, 128)},
+            {
+                (8, 512, 512, 8),
+                (4, 128, 128, 4),
+                (16, 128, 128, 4),
+                (64, 32, 128, 4),
+            },
         )
         for measurement in measurements:
             self.assertTrue(measurement.passes_gate)
@@ -165,6 +175,29 @@ class Person3IntegrationTests(unittest.TestCase):
                 measurements=measurements,
             )
             self.assertEqual(plan.label, "packed-sdpa-suffix:1")
+
+    def test_unvalidated_official_candidates_remain_native(self) -> None:
+        measurements = historical_t4_measurements()
+        for batch_size, seq_len, d_model in ((1, 128, 128), (64, 128, 32)):
+            key = AttentionDispatchKey(
+                batch_size=batch_size,
+                seq_len=seq_len,
+                d_model=d_model,
+                num_heads=4,
+                dtype="torch.float16",
+                causal=True,
+                padding="none",
+                device_type="cuda",
+                device_index=0,
+                compute_capability=(7, 5),
+                torch_version="2.11.0",
+            )
+            plan = select_attention_plan(
+                key,
+                num_layers=4,
+                measurements=measurements,
+            )
+            self.assertEqual(plan.label, "native")
 
     def test_shape14_memory_guard_rejects_unsafe_block(self) -> None:
         unsafe = Shape14MemoryEstimate(
