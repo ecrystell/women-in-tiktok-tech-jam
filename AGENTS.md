@@ -64,6 +64,33 @@ the duplicate in-file `FastSelfAttention` implementation has been removed.
 Person 1's optimized attention remains in the standalone package, and Person 3
 owns wiring it into `UserOptimizedTransformer`.
 
+## Organizer appendix: required test shapes
+
+In this table, `QKV Dim` maps to the benchmark's `d_model` argument. Cases 1–13
+are ordinary correctness/performance cases. Case 14 is an extreme stress case:
+the explicit baseline would need `32 * 16 * 100000^2 = 5.12e12` score
+elements, or about 20.48 TB in FP32 before other tensors. Do not run it
+blindly on the RTX 4050 or include it in an ordinary full-baseline timing
+sweep. Treat it as a capability/dispatch case with an explicit memory guard,
+an analytical resource note, or a separately approved long-context strategy.
+
+| # | Batch | QKV Dim | Heads | Seq Len | Layers | Causal | FFN Dim |
+|--:|------:|--------:|------:|--------:|-------:|:------:|--------:|
+| 1 | 64 | 128 | 4 | 128 | 4 | TRUE | 128 |
+| 2 | 1 | 128 | 4 | 128 | 4 | TRUE | 128 |
+| 3 | 4 | 128 | 4 | 128 | 4 | TRUE | 128 |
+| 4 | 16 | 128 | 4 | 128 | 4 | TRUE | 128 |
+| 5 | 128 | 128 | 4 | 128 | 4 | TRUE | 128 |
+| 6 | 10000 | 128 | 4 | 128 | 4 | TRUE | 128 |
+| 7 | 64 | 32 | 4 | 128 | 4 | TRUE | 32 |
+| 8 | 64 | 1024 | 4 | 128 | 4 | TRUE | 1024 |
+| 9 | 64 | 128 | 1 | 128 | 4 | TRUE | 128 |
+| 10 | 64 | 128 | 2 | 128 | 4 | TRUE | 128 |
+| 11 | 64 | 128 | 16 | 128 | 4 | TRUE | 128 |
+| 12 | 64 | 128 | 4 | 32 | 4 | TRUE | 128 |
+| 13 | 64 | 128 | 4 | 1024 | 4 | TRUE | 128 |
+| 14 | 32 | 1024 | 16 | 100000 | 2 | TRUE | 1024 |
+
 ## Team ownership
 
 ### Person 1 — self-attention pipeline
