@@ -39,6 +39,35 @@ authority for correctness and speed.
    This supplies general lessons about fused operations, avoiding repeated
    conversions, layout-aware execution, and caching reusable representations.
    The duplicated link supplied in the project discussion is one source.
+6. **Panopoulos et al., ["Exploring the Performance and Efficiency of
+   Transformer Models for NLP on Mobile Devices"](https://arxiv.org/pdf/2306.11426).**
+   This shows that accelerator coverage, accuracy, and latency depend on the
+   model, device, delegate, and precision; a nominal accelerator is not
+   automatically the fastest or most accurate execution path.
+7. **Kluska et al., ["QAttn: Efficient GPU Kernels for Mixed-precision Vision
+   Transformers"](https://openaccess.thecvf.com/content/CVPR2024W/ELVM/html/Kluska_QAttn_Efficient_GPU_Kernels_for_Mixed-precision_Vision_Transformers_CVPRW_2024_paper.html),
+   CVPR Workshops 2024.** This supplies useful Triton integration, tile-boundary,
+   mixed-precision-attention, and quantization-overhead lessons. Its accuracy
+   criterion, A100 platform, ViT workloads, and INT8 semantics differ from this
+   project.
+8. **Du et al., ["Improving Computation and Memory Efficiency for Real-world
+   Transformer Inference on GPUs"](https://doi.org/10.1145/3617689), ACM TACO
+   2023.** This motivates valid-block attention, dense valid-token FFN execution,
+   block-organized layouts, and reusable memory planning for variable-length
+   inputs, while explicitly exposing indexing and layout-switch overhead.
+9. **Mittal and Vaishay, ["A Survey of Techniques for Optimizing Deep Learning
+   on GPUs"](https://doi.org/10.1016/j.sysarc.2019.101635), Journal of Systems
+   Architecture 2019.** This provides the broader GPU principles behind tiling,
+   batching, coalescing, bank-conflict avoidance, fusion, occupancy, low-precision
+   conversion cost, and hardware-aware sparsity.
+10. **Gerami and Duraiswami, ["Transformer Based Linear Attention with
+    Optimized GPU Kernel Implementation"](https://arxiv.org/pdf/2510.21956).**
+    This demonstrates algebra/implementation co-design for data reuse and
+    coalesced CUDA execution. Linear attention changes the model's attention
+    equation, so only its kernel-engineering lessons transfer to this project.
+
+The supplied local `2603.28708v1.pdf` is the same work as source 4. It is not
+counted as a separate source or as independent corroboration.
 
 ### Supplied implementation references
 
@@ -95,6 +124,21 @@ installed runtime actually support.
 - Never transfer a speedup claim from B300, H100, A100, RTX 3090, or a CPU
   comparison to the T4. Re-measure the exact repository shapes on the T4.
 
+### Backend coverage and deployment
+
+- Verify that the intended backend executes every operation in the candidate
+  graph. Partial delegation can insert transfers or fallbacks that dominate
+  latency, and a successfully loaded model does not prove full acceleration.
+- Treat device, model shape, precision, and backend version as one performance
+  configuration. There is no presumed globally optimal accelerator or library
+  setting.
+- Validate elementwise output on the target device, not only through a host
+  interpreter. A backend may be fast while producing unacceptable target-device
+  accuracy.
+- When measuring a thermally constrained or shared device, document idle/cooldown
+  policy and competing load. For the Colab T4, record runtime resets and process
+  isolation instead of assuming a stable cloud allocation.
+
 ## 3. Shared optimization ladder
 
 Use this order for project decisions:
@@ -135,6 +179,26 @@ Apply the NVIDIA GEMM article's shape-first method to inference.
 - Profile the generated kernels or backend dispatch. A requested backend that
   silently falls back is not evidence that the backend ran.
 
+### Tile, batch, and layout selection
+
+- Select tile size and work assignment jointly with batch size and exact
+  `M/K/N`; a tile that maximizes reuse can reduce thread-level parallelism, and
+  a tile that maximizes occupancy can increase traffic or idle lanes.
+- Include awkward and boundary dimensions in tuning. Odd sequence lengths and
+  dimensions that are not multiples of a tensor-core tile can change masking,
+  wasted work, and the winning kernel.
+- Require global-memory accesses to be coalesced and inspect shared-memory bank
+  conflicts. Transposing or padding a shared-memory tile is useful only when its
+  extra instructions and storage are cheaper than the conflicts removed.
+- Balance registers and shared memory against occupancy. Keeping intermediates
+  on-chip is beneficial only while enough warps remain resident to hide latency.
+- Autotune only a bounded set of legal candidates during setup, then cache the
+  winning plan for the complete configuration. Do not infer a T4 tile from an
+  A100, V100, A6000, or mobile result.
+- Reducing FLOPs through sparsity or compaction is insufficient when irregular
+  addressing loses dense GEMM tiling and coalescing. Measure realized latency,
+  not the nominal operation count.
+
 ## 5. Person 1: attention directives
 
 - Keep packed Q/K/V projection in Q, K, V row order and preserve baseline
@@ -154,6 +218,26 @@ Apply the NVIDIA GEMM article's shape-first method to inference.
 - Benchmark short and long sequences separately because attention changes from
   launch/overhead-sensitive to quadratic compute/memory pressure as sequence
   length grows.
+
+### Exact-attention boundary
+
+- The benchmark fixes scaled softmax attention. Linear attention, sparse
+  attention, learned token pruning, approximate softmax, or another attention
+  kernel function changes the model and cannot enter the submission path even
+  if it performs well on downstream model-quality metrics.
+- Transfer the linear-attention paper's implementation principles instead:
+  factor repeated work where algebraically exact, organize adjacent threads for
+  adjacent memory, maximize reuse from registers/shared memory, and minimize
+  intermediate global-memory round trips.
+- Compare a reformulation against SDPA/FlashAttention at the repository's actual
+  sequence and head dimensions. An asymptotic crossover reported for very long
+  sequences on an A6000 is not a T4 crossover measurement.
+- Keep normalization and denominator handling numerically stable and explicitly
+  test causal/padding tile boundaries. Algebraic equivalence alone does not
+  establish floating-point equivalence or correct masking.
+- QAttn's pattern of low-precision score computation followed by FP32 softmax is
+  an experiment only. INT8 Q/K/V or outputs require strict elementwise preflight;
+  downstream top-1 or mIOU preservation is not the benchmark contract.
 
 ## 6. Person 2: FFN, LayerNorm, and residual directives
 
@@ -198,6 +282,27 @@ with this fixed benchmark contract.
 - For attention, packed variable-length execution requires semantically correct
   sequence boundaries; never let tokens from different examples attend to one
   another.
+
+### Valid-block execution
+
+- For padded attention, valid mini-block scheduling is permitted only when it
+  computes the same scaled-softmax result as the dense baseline. Cache the block
+  schedule from immutable mask metadata outside timing and invalidate it on
+  object, version, shape, stride, device, causal-mode, or block-size changes.
+- Choose block granularity from a measured trade-off: smaller blocks reduce
+  padding FLOPs but enlarge index structures and worsen locality; larger blocks
+  preserve regular tensor-core work but compute more invalid elements.
+- Avoid atomics when each output tile can have one owner. If accumulation cannot
+  be uniquely owned, measure contention and preserve the baseline reduction
+  order closely enough to pass strict correctness.
+- Treat transitions between dense valid-token FFN layout and block-padded
+  attention layout as first-class kernels. Count index construction, gather,
+  scatter, transpose, padding, and layout-switch latency unless safely reused
+  under the exact cache guards above.
+- The current fixed-shape benchmark does not justify a dynamic chunk allocator
+  in timed inference. Reuse PyTorch's allocator and fixed buffers unless memory
+  profiling across changing shapes proves allocation churn or peak memory is a
+  limiting bottleneck.
 
 ## 8. Person 3: integration and dispatch directives
 
@@ -280,6 +385,14 @@ setup costs and sampling parameters explicit.
 - If the current task defines a numerical or speed gate, that gate overrides
   aspirational article results. Failed candidates remain experiments, not
   production dispatch choices.
+- For quantized or mixed-precision experiments, report conversion/calibration
+  cost separately and include quantize/dequantize kernels in end-to-end latency.
+  A prequantized kernel-only result may explain a bottleneck but is not a model
+  speedup.
+- Compare operation coverage as well as timing: record which graph segments ran
+  in PyTorch, compiled CUDA/Triton, cuBLASLt, TensorRT, or fallback code.
+- Add tile-adversarial cases around expected block multiples when validating a
+  custom kernel, even if the official five shapes do not expose every boundary.
 
 ## 12. Evidence and reporting rules
 
@@ -306,6 +419,19 @@ setup costs and sampling parameters explicit.
 - Transformer Engine examples for newer architectures do not make Transformer
   Engine a T4 dependency or prove its fused layers preserve this state dict and
   forward contract.
+- Mobile delegate results do not predict T4 behavior, and their suggestions to
+  replace GELU or LayerNorm are forbidden by this benchmark's exact semantics.
+- QAttn's A100 INT8 throughput and downstream accuracy do not establish strict
+  elementwise correctness, a T4 speedup, or permission to quantize this model.
+- The valid-block and chunk-allocation results for variable-length BERT serving
+  do not prove a gain for fixed benchmark shapes; their index, layout-switch,
+  and allocation costs must be included and can produce negative cases.
+- The GPU survey does not imply that tiling, pruning, batching, fusion, or lower
+  precision is independently beneficial. These techniques interact and sparse
+  execution can be slower than dense execution on a highly parallel GPU.
+- The linear-attention paper does not authorize replacing exact softmax
+  attention. Its reported A6000 results at much longer sequences are neither a
+  T4 performance claim nor numerical equivalence evidence.
 - A profiler share does not itself prove an optimization; it only bounds the
   opportunity. A reduction in kernel count, FLOPs, or memory traffic is not a
   speedup until CUDA-event measurements show one.
@@ -329,6 +455,11 @@ Before accepting any optimization, answer all of the following:
    reversible?
 8. Are the commit, environment, commands, measurements, failures, and
    limitations documented reproducibly?
+9. Does the measured graph actually execute the intended backend for every
+   operation, without hidden host/device transfer or native fallback?
+10. If the method changes precision, sparsity, token count, or attention
+    algebra, is it still exactly within the benchmark contract? If not, has it
+    been kept out of the submission path?
 
 If any required answer is no, keep the candidate experimental and retain the
 last validated implementation.
