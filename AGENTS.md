@@ -255,6 +255,14 @@ correctness, speedup, and p90 gates. The next isolated experiment may combine
 this one-layer attention suffix with one final fast FFN layer; broader FFN or
 attention suffixes remain disabled.
 
+That combined one-layer attention plus one-layer fast-FFN experiment also
+passed all 132,120,576 comparisons in three primary-sampling processes.
+Speedups were 1.329x, 1.326x, and 1.324x (median-of-processes 1.326x), and all
+p90 latencies improved against baseline. This does not improve on the 1.327x
+packed-only median and is therefore rejected as a performance dispatch for
+this shape. Keep the native FFN with the validated mask bypass plus final-layer
+packed SDPA; the fast FFN remains available only as an explicit experiment.
+
 Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
 `f50ef57` are both contained by integration merge `99c1830` (Person 2 entered
 at merge `f6d897a`). The T4-validated source-code tree is `d57502e`; the final
