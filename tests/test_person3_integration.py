@@ -8,7 +8,7 @@ from unittest import mock
 
 import torch
 
-from bench_shape14_blockwise import QueryTiledSelfAttention
+from bench_shape14_blockwise import QueryTiledSelfAttention, SeparateQKVSDPAAttention
 from person1_triton_attention import PackedQKVSDPAAttention
 from run_sweep import OFFICIAL_CASES, parse_result, shape14_memory_summary
 from torch_transformer_benchmark import (
@@ -65,6 +65,16 @@ class Person3IntegrationTests(unittest.TestCase):
                     expected = baseline(x, mask, causal)
                     actual = tiled(x, mask, causal)
                 self.assertTrue(torch.equal(expected, actual))
+
+    def test_separate_qkv_sdpa_preserves_baseline_parameters(self) -> None:
+        torch.manual_seed(100)
+        baseline = BaselineSelfAttention(32, 4).eval()
+        sdpa = SeparateQKVSDPAAttention(32, 4).eval()
+        sdpa.load_state_dict(baseline.state_dict())
+        self.assertTrue(torch.equal(sdpa.q_proj.weight, baseline.q_proj.weight))
+        self.assertTrue(torch.equal(sdpa.k_proj.bias, baseline.k_proj.bias))
+        self.assertTrue(torch.equal(sdpa.v_proj.weight, baseline.v_proj.weight))
+        self.assertTrue(torch.equal(sdpa.out_proj.bias, baseline.out_proj.bias))
 
     def test_official_shape_table_matches_appendix(self) -> None:
         self.assertEqual(len(OFFICIAL_CASES), 14)

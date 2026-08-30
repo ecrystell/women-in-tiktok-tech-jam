@@ -298,7 +298,14 @@ batch dimension and uses a query-tiled reference whose score working set is
 `[batch_block, heads, query_block, seq_len]`; every query still evaluates and
 masks all S keys, preserving the reference softmax domain. Its timing is a
 sequential blockwise projection and must not be reported as full-batch GPU
-utilization. T4 correctness and performance remain unmeasured.
+utilization. A reduced B2/S1024/D128/H4/L2 T4 validation passed strict
+correctness and measured a 17.408x blockwise speedup. At B2/S4096/D1024/H16,
+packing QKV in both layers failed one of 4,194,304 output elements with maximum
+absolute error 0.0078125, so that plan is rejected before timing. The harness
+now exposes `--attention-plan separate-then-packed` to preserve baseline
+Q/K/V projection rounding in layer 1 while retaining an SDPA core in both
+layers and packed QKV in the final layer. Full ID 14 correctness and
+performance remain unmeasured.
 
 Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
 `f50ef57` are both contained by integration merge `99c1830` (Person 2 entered

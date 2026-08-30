@@ -14,6 +14,7 @@ import statistics
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from torch_transformer_benchmark import (
     BaselineSelfAttention,
@@ -77,6 +78,41 @@ class QueryTiledSelfAttention(BaselineSelfAttention):
         return output
 
 
+class SeparateQKVSDPAAttention(BaselineSelfAttention):
+    """Memory-efficient SDPA core with baseline Q/K/V projection rounding."""
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: torch.Tensor | None = None,
+        causal: bool = False,
+    ) -> torch.Tensor:
+        batch, seq_len, _ = x.shape
+        q = self._split_heads(self.q_proj(x))
+        k = self._split_heads(self.k_proj(x))
+        v = self._split_heads(self.v_proj(x))
+
+        if valid_token_mask is None:
+            context = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+        else:
+            allowed = valid_token_mask[:, None, None, :]
+            if causal:
+                allowed = allowed & torch.ones(
+                    seq_len, seq_len, device=x.device, dtype=torch.bool
+                ).tril()[None, None]
+            context = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=allowed, is_causal=False
+            )
+
+        merged = context.transpose(1, 2).contiguous().view(
+            batch, seq_len, self.d_model
+        )
+        output = self.out_proj(merged)
+        if valid_token_mask is not None:
+            output = output.masked_fill(~valid_token_mask[..., None], 0)
+        return output
+
+
 class QueryTiledReferenceTransformer(BaselineTransformer):
     """Baseline-equivalent transformer using query-tiled reference attention."""
 
@@ -118,6 +154,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ffn-dim", type=int, default=1024)
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--query-block", type=int, default=16)
+    parser.add_argument(
+        "--attention-plan",
+        choices=("packed-all", "separate-all", "separate-then-packed"),
+        default="packed-all",
+        help="choose projection rounding while retaining an SDPA attention core",
+    )
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1234)
@@ -156,6 +198,16 @@ def main() -> int:
     optimized = UserOptimizedTransformer(
         config, packed_sdpa_suffix_layers=config.num_layers
     )
+    if args.attention_plan == "separate-all":
+        separate_layers = range(config.num_layers)
+    elif args.attention_plan == "separate-then-packed":
+        separate_layers = range(max(0, config.num_layers - 1))
+    else:
+        separate_layers = ()
+    for index in separate_layers:
+        optimized.layers[index].attention = SeparateQKVSDPAAttention(
+            config.d_model, config.num_heads
+        )
     copy_model_weights(baseline, optimized)
     baseline = baseline.to(device=device, dtype=dtype).eval()
     optimized = optimized.to(device=device, dtype=dtype).eval()
@@ -183,7 +235,8 @@ def main() -> int:
     print(
         f"logical_shape=({args.logical_batch}, {args.seq_len}, {args.d_model}) "
         f"block_shape={tuple(x.shape)} query_block={args.query_block} "
-        f"dtype={dtype} gpu={torch.cuda.get_device_name(device)}"
+        f"attention_plan={args.attention_plan} dtype={dtype} "
+        f"gpu={torch.cuda.get_device_name(device)}"
     )
     print(
         f"accuracy={'PASS' if accuracy.passed else 'FAIL'} | "
