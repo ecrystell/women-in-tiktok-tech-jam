@@ -489,8 +489,8 @@ def _require_modern_tensorrt_api(trt: Any) -> None:
         )
 
 
-def _host_half(tensor: torch.Tensor) -> Any:
-    """Copy a setup-time FP16 parameter into TensorRT's host constant format."""
+def _host_array(tensor: torch.Tensor) -> Any:
+    """Copy a setup-time parameter into TensorRT's host constant format."""
 
     try:
         import numpy as np
@@ -521,7 +521,9 @@ def _set_layer_precision(layer: Any, dtype: Any, label: str) -> None:
 
 def _add_constant(network: Any, tensor: torch.Tensor, label: str) -> Any:
     layer = _require_layer(
-        network.add_constant(tuple(int(value) for value in tensor.shape), _host_half(tensor)),
+        network.add_constant(
+            tuple(int(value) for value in tensor.shape), _host_array(tensor)
+        ),
         f"{label} constant",
     )
     return layer.get_output(0)
@@ -578,25 +580,52 @@ def _build_serialized_engine(
         if residual is None:
             raise TensorRTBuildError("TensorRT failed to add the residual input")
 
-        scale = _add_constant(network, norm_weight.reshape(1, key.d_model), "norm scale")
-        bias = _add_constant(network, norm_bias.reshape(1, key.d_model), "norm bias")
+        if strongly_typed:
+            residual_for_norm = _require_layer(
+                network.add_cast(residual, trt.DataType.FLOAT),
+                "FP32 LayerNorm input cast",
+            ).get_output(0)
+            scale = _add_constant(
+                network,
+                norm_weight.float().reshape(1, key.d_model),
+                "FP32 norm scale",
+            )
+            bias = _add_constant(
+                network,
+                norm_bias.float().reshape(1, key.d_model),
+                "FP32 norm bias",
+            )
+        else:
+            residual_for_norm = residual
+            scale = _add_constant(
+                network, norm_weight.reshape(1, key.d_model), "norm scale"
+            )
+            bias = _add_constant(
+                network, norm_bias.reshape(1, key.d_model), "norm bias"
+            )
         norm = _require_layer(
-            network.add_normalization(residual, scale, bias, 1 << 1),
+            network.add_normalization(residual_for_norm, scale, bias, 1 << 1),
             "identity LayerNorm",
         )
         norm.epsilon = float(key.eps)
-        if not hasattr(norm, "compute_precision"):
-            raise TensorRTUnsupportedError(
-                "installed TensorRT cannot request FP32 LayerNorm statistics"
-            )
-        norm.compute_precision = trt.DataType.FLOAT
-        if not strongly_typed:
+        if strongly_typed:
+            norm_output = _require_layer(
+                network.add_cast(norm.get_output(0), trt.DataType.HALF),
+                "FP16 LayerNorm output cast",
+            ).get_output(0)
+        else:
+            if not hasattr(norm, "compute_precision"):
+                raise TensorRTUnsupportedError(
+                    "installed TensorRT cannot request FP32 LayerNorm statistics"
+                )
+            norm.compute_precision = trt.DataType.FLOAT
             _set_layer_precision(norm, trt.DataType.HALF, "LayerNorm output")
+            norm_output = norm.get_output(0)
 
         up_matrix = _add_constant(network, up_weight, "up-projection weight")
         up = _require_layer(
             network.add_matrix_multiply(
-                norm.get_output(0),
+                norm_output,
                 trt.MatrixOperation.NONE,
                 up_matrix,
                 trt.MatrixOperation.TRANSPOSE,
