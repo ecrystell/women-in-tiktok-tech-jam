@@ -474,6 +474,9 @@ speedup  : 2.000x based on median latency
         )
         self.assertEqual(command[command.index("--atol") + 1], "0.001")
         self.assertEqual(command[command.index("--rtol") + 1], "0.01")
+        self.assertEqual(
+            command[command.index("--accuracy-trials") + 1], "20"
+        )
         self.assertIn("--causal", command)
 
 

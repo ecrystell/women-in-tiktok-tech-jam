@@ -177,6 +177,7 @@ def build_command(
     packed_sdpa_suffix_layers: int,
     atol: float = 0.001,
     rtol: float = 0.01,
+    accuracy_trials: int = 20,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -205,6 +206,8 @@ def build_command(
         str(repeats),
         "--benchmark-rounds",
         str(rounds),
+        "--accuracy-trials",
+        str(accuracy_trials),
         "--fast-ffn-suffix-layers",
         str(fast_ffn_suffix_layers),
         "--packed-sdpa-suffix-layers",
@@ -461,7 +464,7 @@ def main() -> int:
         print(
             f"suite=official mode=calibrate device={device} dtype={dtype} "
             f"processes={processes} warmup={warmup} repeats={repeats} "
-            f"rounds={rounds} atol=0.001 rtol=0.01"
+            f"rounds={rounds} accuracy_trials=20 atol=0.001 rtol=0.01"
         )
         winner = calibrate_case(
             case,
