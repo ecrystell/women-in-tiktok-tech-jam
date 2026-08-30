@@ -164,6 +164,21 @@ and full-block evidence is reported with that variance caveat.
 
 Current integration branch: `person3/integrate-person1`.
 
+Current assembly candidate branch: `person3/optimize-transformer-dispatch`.
+The candidate now constructs every `UserOptimizedTransformer` layer from
+Person 1's packed-QKV PyTorch SDPA attention and Person 2's guarded optimized
+FFN block. Weight transfer packs Q/K/V in reference row order, refreshes
+nonpersistent FFN state, and preserves the public forward signature. The
+benchmark prepares extension-backed FFN paths and exact-mask caches before
+compilation and timing, while unsupported paths retain native fallbacks.
+
+Local CPU validation of the assembly passed all 34 tests with eight expected
+CUDA/Triton skips. Strict non-causal/unpadded and causal/25%-padded harness
+smokes each passed with zero failed elements. These CPU timings are not GPU
+speedup evidence. End-to-end T4 validation and dispatch decisions remain
+pending; do not merge the candidate into the shared integration branch until
+those measurements pass.
+
 Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
 `f50ef57` are both contained by integration merge `99c1830` (Person 2 entered
 at merge `f6d897a`). The T4-validated source-code tree is `d57502e`; the final

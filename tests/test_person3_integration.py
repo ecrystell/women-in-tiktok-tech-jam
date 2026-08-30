@@ -1,0 +1,200 @@
+"""End-to-end tests for Person 3's optimized Transformer assembly."""
+
+from __future__ import annotations
+
+import inspect
+import unittest
+from unittest import mock
+
+import torch
+
+from person1_triton_attention import PackedQKVSDPAAttention
+from run_sweep import parse_result
+from torch_transformer_benchmark import (
+    BaselineTransformer,
+    TransformerConfig,
+    UserOptimizedTransformer,
+    UserOptimizedTransformerBlock,
+    copy_model_weights,
+)
+
+
+def assert_or_close(
+    testcase: unittest.TestCase,
+    reference: torch.Tensor,
+    candidate: torch.Tensor,
+    atol: float = 0.001,
+    rtol: float = 0.01,
+) -> None:
+    testcase.assertEqual(reference.shape, candidate.shape)
+    testcase.assertEqual(reference.dtype, candidate.dtype)
+    ref = reference.detach().float()
+    opt = candidate.detach().float()
+    error = (opt - ref).abs()
+    passed = torch.isfinite(ref) & torch.isfinite(opt)
+    passed &= (error <= atol) | (error <= rtol * ref.abs())
+    if not bool(passed.all().item()):
+        testcase.fail(
+            f"output mismatch: max_abs={error.max().item():.6g}, "
+            f"failed={int((~passed).sum().item())}/{passed.numel()}"
+        )
+
+
+class Person3IntegrationTests(unittest.TestCase):
+    @staticmethod
+    def make_models(
+        causal: bool = False,
+    ) -> tuple[BaselineTransformer, UserOptimizedTransformer]:
+        config = TransformerConfig(2, 7, 32, 4, 64, 2, causal)
+        torch.manual_seed(101)
+        baseline = BaselineTransformer(config).eval()
+        optimized = UserOptimizedTransformer(config).eval()
+        copy_model_weights(baseline, optimized)
+        return baseline, optimized
+
+    def test_public_forward_signature_and_integrated_layers(self) -> None:
+        baseline, optimized = self.make_models()
+        self.assertEqual(
+            inspect.signature(baseline.forward),
+            inspect.signature(optimized.forward),
+        )
+        self.assertTrue(
+            all(
+                type(layer) is UserOptimizedTransformerBlock
+                for layer in optimized.layers
+            )
+        )
+        self.assertTrue(
+            all(
+                isinstance(layer.attention, PackedQKVSDPAAttention)
+                for layer in optimized.layers
+            )
+        )
+        self.assertTrue(
+            all(layer.attention.backend == "sdpa" for layer in optimized.layers)
+        )
+
+    def test_weight_transfer_packs_qkv_and_refreshes_ffn_state(self) -> None:
+        baseline, optimized = self.make_models()
+
+        for source, target in zip(baseline.layers, optimized.layers):
+            expected_weight = torch.cat(
+                [
+                    source.attention.q_proj.weight,
+                    source.attention.k_proj.weight,
+                    source.attention.v_proj.weight,
+                ],
+                dim=0,
+            )
+            expected_bias = torch.cat(
+                [
+                    source.attention.q_proj.bias,
+                    source.attention.k_proj.bias,
+                    source.attention.v_proj.bias,
+                ],
+                dim=0,
+            )
+            self.assertTrue(
+                torch.equal(target.attention.qkv_proj.weight, expected_weight)
+            )
+            self.assertTrue(torch.equal(target.attention.qkv_proj.bias, expected_bias))
+            self.assertTrue(
+                torch.equal(
+                    target.attention.out_proj.weight,
+                    source.attention.out_proj.weight,
+                )
+            )
+            self.assertTrue(torch.equal(target.norm1.weight, source.norm1.weight))
+            self.assertTrue(torch.equal(target.norm2.bias, source.norm2.bias))
+            self.assertTrue(torch.equal(target.ffn_in.weight, source.ffn_in.weight))
+            self.assertTrue(torch.equal(target.ffn_out.bias, source.ffn_out.bias))
+            self.assertTrue(
+                torch.equal(
+                    target._ffn_out_weight_nt,
+                    target.ffn_out.weight.detach().t().contiguous(),
+                )
+            )
+
+        self.assertTrue(
+            torch.equal(optimized.final_norm.weight, baseline.final_norm.weight)
+        )
+        optimized_keys = set(optimized.state_dict())
+        self.assertIn("layers.0.attention.qkv_proj.weight", optimized_keys)
+        self.assertNotIn("layers.0.attention.q_proj.weight", optimized_keys)
+
+    def test_weight_transfer_rejects_mismatched_configuration(self) -> None:
+        baseline, _optimized = self.make_models()
+        mismatched = UserOptimizedTransformer(
+            TransformerConfig(1, 8, 32, 4, 64, 2, False)
+        )
+        with self.assertRaisesRegex(ValueError, "configurations must match"):
+            copy_model_weights(baseline, mismatched)
+
+    def test_cpu_end_to_end_masks_and_causality(self) -> None:
+        masks = (
+            None,
+            torch.ones(2, 7, dtype=torch.bool),
+            torch.tensor(
+                [
+                    [True, True, True, True, True, True, True],
+                    [True, True, True, True, False, False, False],
+                ]
+            ),
+        )
+        torch.manual_seed(103)
+        x = torch.randn(2, 7, 32)
+
+        for causal in (False, True):
+            baseline, optimized = self.make_models(causal)
+            for mask in masks:
+                with torch.inference_mode():
+                    reference = baseline(x, mask)
+                    candidate = optimized(x, mask)
+                    repeated = optimized(x, mask)
+                assert_or_close(self, reference, candidate)
+                self.assertTrue(torch.equal(candidate, repeated))
+                self.assertNotEqual(candidate.data_ptr(), repeated.data_ptr())
+                if mask is not None:
+                    self.assertTrue(bool((candidate[~mask] == 0).all().item()))
+
+    def test_model_preparation_counts_layers_and_cpu_falls_back(self) -> None:
+        _baseline, optimized = self.make_models()
+        x = torch.randn(2, 7, 32)
+        mask = torch.ones(2, 7, dtype=torch.bool)
+
+        self.assertEqual(optimized.prepare_for_inference(x, mask), 0)
+        self.assertTrue(
+            all(
+                "unsupported" in (layer.fast_ffn_error or "")
+                for layer in optimized.layers
+            )
+        )
+
+        with mock.patch.object(
+            UserOptimizedTransformerBlock,
+            "prepare_fast_ffn",
+            return_value=True,
+        ):
+            self.assertEqual(
+                optimized.prepare_for_inference(x, mask),
+                len(optimized.layers),
+            )
+
+    def test_sweep_parser_reads_strict_result_and_timings(self) -> None:
+        output = """
+summary: PASS | max_abs=0.0001 | max_rel=0.02 | failed=0/1024
+baseline : median=4.2000 ms | mean=4.2500 ms | p90=4.5000 ms | min=4.0000 ms
+optimized: median=2.1000 ms | mean=2.1500 ms | p90=2.3000 ms | min=2.0000 ms
+speedup  : 2.000x based on median latency
+"""
+        result = parse_result(output)
+        self.assertTrue(result.correct)
+        self.assertEqual(result.baseline_median_ms, 4.2)
+        self.assertEqual(result.baseline_p90_ms, 4.5)
+        self.assertEqual(result.optimized_median_ms, 2.1)
+        self.assertEqual(result.optimized_p90_ms, 2.3)
+        self.assertEqual(result.speedup, 2.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

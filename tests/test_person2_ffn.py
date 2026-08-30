@@ -18,6 +18,7 @@ from torch_transformer_benchmark import (
     OptimizedTransformerBlock,
     TransformerConfig,
     UserOptimizedTransformer,
+    UserOptimizedTransformerBlock,
 )
 
 
@@ -239,11 +240,14 @@ class Person2BlockTests(unittest.TestCase):
             (4, 8),
         )
 
-    def test_user_model_remains_owned_by_integration(self) -> None:
+    def test_user_model_uses_integration_owned_blocks(self) -> None:
         config = TransformerConfig(1, 4, 32, 4, 64, 2, False)
         model = UserOptimizedTransformer(config)
         self.assertTrue(
-            all(type(layer) is BaselineTransformerBlock for layer in model.layers)
+            all(
+                type(layer) is UserOptimizedTransformerBlock
+                for layer in model.layers
+            )
         )
 
     def test_cpu_full_block_masks_and_causality(self) -> None:
