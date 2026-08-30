@@ -282,6 +282,24 @@ method. Report the complete 1.098x-1.480x range alongside this aggregate;
 there is no competition-provided rule that defines one official cross-shape
 score.
 
+The organizer Appendix later supplied 14 all-causal configurations. They use
+`qkv_dim` as `d_model`, mostly D=FFN=128 and L=4, and vary batch, width, heads,
+and sequence length. `run_sweep.py --suite official --skip-long` now runs IDs
+1-13 directly; `--case-id N` isolates one case. These shapes replace the
+earlier five-case integration matrix as the actual optimization target. Dtype
+was not specified by the Appendix and must be reported explicitly.
+
+Official ID 14 is B32/S100000/D1024/H16/FFN1024/L2. In FP16, a full input is
+6.10 GiB and input plus output is 12.21 GiB, while explicit scores require
+9536.74 GiB before the baseline's FP32 softmax probabilities. The ordinary
+harness blocks this case by default on safety grounds. The separate
+`bench_shape14_blockwise.py` harness splits the mathematically independent
+batch dimension and uses a query-tiled reference whose score working set is
+`[batch_block, heads, query_block, seq_len]`; every query still evaluates and
+masks all S keys, preserving the reference softmax domain. Its timing is a
+sequential blockwise projection and must not be reported as full-batch GPU
+utilization. T4 correctness and performance remain unmeasured.
+
 Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
 `f50ef57` are both contained by integration merge `99c1830` (Person 2 entered
 at merge `f6d897a`). The T4-validated source-code tree is `d57502e`; the final

@@ -15,6 +15,7 @@ import torch
 
 @dataclass(frozen=True)
 class Case:
+    case_id: int
     batch: int
     seq_len: int
     d_model: int
@@ -27,7 +28,11 @@ class Case:
     @property
     def label(self) -> str:
         mode = "causal" if self.causal else "noncausal"
-        return f"B{self.batch} S{self.seq_len} D{self.d_model} {mode} P{self.padding:g}"
+        prefix = f"ID{self.case_id} " if self.case_id else ""
+        return (
+            f"{prefix}B{self.batch} S{self.seq_len} D{self.d_model} "
+            f"H{self.heads} L{self.layers} {mode} P{self.padding:g}"
+        )
 
 
 @dataclass(frozen=True)
@@ -40,13 +45,49 @@ class RunResult:
     speedup: float
 
 
-CASES = (
-    Case(1, 128, 512, 8, 2048, 6, False, 0.0),
-    Case(8, 512, 512, 8, 2048, 6, False, 0.0),
-    Case(8, 512, 512, 8, 2048, 6, True, 0.2),
-    Case(2, 2048, 512, 8, 2048, 6, False, 0.0),
-    Case(1, 4096, 512, 8, 2048, 6, True, 0.25),
+INTEGRATION_CASES = (
+    Case(0, 1, 128, 512, 8, 2048, 6, False, 0.0),
+    Case(0, 8, 512, 512, 8, 2048, 6, False, 0.0),
+    Case(0, 8, 512, 512, 8, 2048, 6, True, 0.2),
+    Case(0, 2, 2048, 512, 8, 2048, 6, False, 0.0),
+    Case(0, 1, 4096, 512, 8, 2048, 6, True, 0.25),
 )
+
+# Organizer Appendix configurations. qkv_dim maps to d_model and no padding
+# was specified, so these cases use an all-valid mask.
+OFFICIAL_CASES = (
+    Case(1, 64, 128, 128, 4, 128, 4, True, 0.0),
+    Case(2, 1, 128, 128, 4, 128, 4, True, 0.0),
+    Case(3, 4, 128, 128, 4, 128, 4, True, 0.0),
+    Case(4, 16, 128, 128, 4, 128, 4, True, 0.0),
+    Case(5, 128, 128, 128, 4, 128, 4, True, 0.0),
+    Case(6, 10000, 128, 128, 4, 128, 4, True, 0.0),
+    Case(7, 64, 128, 32, 4, 32, 4, True, 0.0),
+    Case(8, 64, 128, 1024, 4, 1024, 4, True, 0.0),
+    Case(9, 64, 128, 128, 1, 128, 4, True, 0.0),
+    Case(10, 64, 128, 128, 2, 128, 4, True, 0.0),
+    Case(11, 64, 128, 128, 16, 128, 4, True, 0.0),
+    Case(12, 64, 32, 128, 4, 128, 4, True, 0.0),
+    Case(13, 64, 1024, 128, 4, 128, 4, True, 0.0),
+    Case(14, 32, 100000, 1024, 16, 1024, 2, True, 0.0),
+)
+
+
+def shape14_memory_summary(case: Case, dtype: str) -> str:
+    """Estimate unavoidable full tensors in the original ID 14 harness."""
+    element_bytes = 2 if dtype == "float16" else 4
+    gib = 1024**3
+    activation_elements = case.batch * case.seq_len * case.d_model
+    score_elements = case.batch * case.heads * case.seq_len * case.seq_len
+    input_gib = activation_elements * element_bytes / gib
+    input_output_gib = 2 * input_gib
+    scores_gib = score_elements * element_bytes / gib
+    fp32_probabilities_gib = score_elements * 4 / gib
+    return (
+        f"input={input_gib:.2f} GiB, input+output={input_output_gib:.2f} GiB, "
+        f"explicit scores={scores_gib:.2f} GiB, "
+        f"FP32 softmax probabilities={fp32_probabilities_gib:.2f} GiB"
+    )
 
 
 def parse_timing(output: str, label: str) -> tuple[float, float]:
@@ -129,6 +170,19 @@ def build_command(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--suite", choices=("integration", "official"), default="integration"
+    )
+    parser.add_argument(
+        "--case-id",
+        type=int,
+        help="run one official case ID instead of the complete selected suite",
+    )
+    parser.add_argument(
+        "--allow-unsafe-shape14",
+        action="store_true",
+        help="allow the original full-allocation harness to attempt official ID 14",
+    )
     parser.add_argument("--mode", choices=("smoke", "final"), default="smoke")
     parser.add_argument("--device", default="auto")
     parser.add_argument(
@@ -151,6 +205,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--fast-ffn-suffix-layers must be nonnegative")
     if args.packed_sdpa_suffix_layers < 0:
         parser.error("--packed-sdpa-suffix-layers must be nonnegative")
+    if args.case_id is not None and args.suite != "official":
+        parser.error("--case-id requires --suite official")
+    if args.case_id is not None and not 1 <= args.case_id <= len(OFFICIAL_CASES):
+        parser.error("--case-id must be between 1 and 14")
     return args
 
 
@@ -168,10 +226,26 @@ def main() -> int:
     final_mode = args.mode == "final"
     processes = args.processes or (3 if final_mode else 1)
     warmup, repeats, rounds = (20, 100, 3) if final_mode else (5, 20, 1)
-    cases = CASES[:-1] if args.skip_long else CASES
+    cases = OFFICIAL_CASES if args.suite == "official" else INTEGRATION_CASES
+    if args.case_id is not None:
+        cases = tuple(case for case in cases if case.case_id == args.case_id)
+    elif args.skip_long:
+        cases = cases[:-1]
+
+    if any(case.case_id == 14 for case in cases) and not args.allow_unsafe_shape14:
+        shape14 = OFFICIAL_CASES[-1]
+        print(
+            "official ID 14 is blocked in the original harness: its full input, "
+            "reference, and explicit attention scores cannot fit on a T4. "
+            "Run IDs 1-13 with --skip-long; use --allow-unsafe-shape14 only "
+            "on a judge environment designed for that allocation."
+        )
+        print(f"ID 14 {dtype} memory floor: {shape14_memory_summary(shape14, dtype)}")
+        return 2
 
     print(
-        f"mode={args.mode} device={device} dtype={dtype} processes={processes} "
+        f"suite={args.suite} mode={args.mode} device={device} dtype={dtype} "
+        f"processes={processes} "
         f"warmup={warmup} repeats={repeats} rounds={rounds} "
         f"fast_ffn_suffix_layers={args.fast_ffn_suffix_layers} "
         f"packed_sdpa_suffix_layers={args.packed_sdpa_suffix_layers}"
@@ -228,7 +302,10 @@ def main() -> int:
                     for result in results
                 )
             )
-            verdict = "REPEATABLE" if repeatable else "SHAPE-DEPENDENT"
+            if not final_mode:
+                verdict = "SMOKE-PASS" if repeatable else "SMOKE-REVIEW"
+            else:
+                verdict = "REPEATABLE" if repeatable else "SHAPE-DEPENDENT"
             print(f"verdict={verdict} median_process_speedup={median_speedup:.3f}x")
 
     if execution_failed:

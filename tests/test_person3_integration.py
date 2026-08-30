@@ -8,8 +8,9 @@ from unittest import mock
 
 import torch
 
+from bench_shape14_blockwise import QueryTiledSelfAttention
 from person1_triton_attention import PackedQKVSDPAAttention
-from run_sweep import parse_result
+from run_sweep import OFFICIAL_CASES, parse_result, shape14_memory_summary
 from torch_transformer_benchmark import (
     BaselineSelfAttention,
     BaselineTransformer,
@@ -42,6 +43,62 @@ def assert_or_close(
 
 
 class Person3IntegrationTests(unittest.TestCase):
+    def test_query_tiled_reference_matches_baseline_attention(self) -> None:
+        torch.manual_seed(99)
+        baseline = BaselineSelfAttention(32, 4).eval()
+        tiled = QueryTiledSelfAttention(32, 4, query_block=3).eval()
+        tiled.load_state_dict(baseline.state_dict())
+        x = torch.randn(2, 7, 32)
+        masks = (
+            None,
+            torch.tensor(
+                [
+                    [True, True, True, True, True, True, True],
+                    [True, True, True, True, False, False, False],
+                ]
+            ),
+        )
+
+        for causal in (False, True):
+            for mask in masks:
+                with torch.inference_mode():
+                    expected = baseline(x, mask, causal)
+                    actual = tiled(x, mask, causal)
+                self.assertTrue(torch.equal(expected, actual))
+
+    def test_official_shape_table_matches_appendix(self) -> None:
+        self.assertEqual(len(OFFICIAL_CASES), 14)
+        self.assertEqual(
+            (
+                OFFICIAL_CASES[0].case_id,
+                OFFICIAL_CASES[0].batch,
+                OFFICIAL_CASES[0].d_model,
+                OFFICIAL_CASES[0].heads,
+                OFFICIAL_CASES[0].seq_len,
+                OFFICIAL_CASES[0].layers,
+                OFFICIAL_CASES[0].ffn_dim,
+                OFFICIAL_CASES[0].causal,
+            ),
+            (1, 64, 128, 4, 128, 4, 128, True),
+        )
+        self.assertEqual(
+            (
+                OFFICIAL_CASES[-1].case_id,
+                OFFICIAL_CASES[-1].batch,
+                OFFICIAL_CASES[-1].d_model,
+                OFFICIAL_CASES[-1].heads,
+                OFFICIAL_CASES[-1].seq_len,
+                OFFICIAL_CASES[-1].layers,
+                OFFICIAL_CASES[-1].ffn_dim,
+                OFFICIAL_CASES[-1].causal,
+            ),
+            (14, 32, 1024, 16, 100000, 2, 1024, True),
+        )
+        memory = shape14_memory_summary(OFFICIAL_CASES[-1], "float16")
+        self.assertIn("input=6.10 GiB", memory)
+        self.assertIn("input+output=12.21 GiB", memory)
+        self.assertIn("explicit scores=9536.74 GiB", memory)
+
     @staticmethod
     def make_models(
         causal: bool = False,
