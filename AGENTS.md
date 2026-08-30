@@ -215,7 +215,18 @@ block-output, and final-output masking. Cloned, changed, padded, unprepared,
 and compiled masks retain the original path. Accuracy validation now includes
 the exact prepared benchmark input so the path being timed must pass strict
 comparison. Local unpadded and padded harness checks were exact; T4 correctness
-and performance remain unmeasured.
+and performance were subsequently validated at candidate commit `7d87e79`.
+
+The transformer-level all-valid-mask bypass passed three independent eager
+FP16 processes on a Tesla T4 for B8/S512/D512/H8/FFN2048/L6, non-causal and
+unpadded, using 20 warmups, 100 repeats, and three alternating rounds per
+process. All 37,748,736 checked output elements were bit-exact. Median speedups
+were 1.220x, 1.218x, and 1.213x (median-of-processes 1.218x). Optimized p90
+latencies were 22.7702 ms, 23.1190 ms, and 23.5960 ms versus baseline p90
+latencies of 27.6974 ms, 28.0642 ms, and 28.6723 ms, so every process cleared
+the correctness, median-speedup, and p90 gates. This validates dispatch for
+that exact all-valid shape family; padded, causal, short, long, and other batch
+or model shapes still require separate measurements before broader claims.
 
 Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
 `f50ef57` are both contained by integration merge `99c1830` (Person 2 entered
