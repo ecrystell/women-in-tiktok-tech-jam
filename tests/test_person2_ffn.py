@@ -9,7 +9,14 @@ from unittest import mock
 
 import torch
 
-from bench_person2_ffn import accuracy_output, compile_model, mark_inference_step
+from bench_person2_ffn import (
+    StaticCudaGraphFFN,
+    accuracy_output,
+    compile_model,
+    mark_inference_step,
+    official_cases,
+    official_isolated_cases,
+)
 from profile_person2_gemms import gemm_shapes
 from profile_person2_ffn import event_device_time_us
 
@@ -355,10 +362,60 @@ class Person2BlockTests(unittest.TestCase):
         self.assertEqual((down.m, down.n, down.k), (4096, 512, 2048))
         self.assertEqual(up.flops, down.flops)
 
+    def test_official_ffn_shapes_are_complete_and_deduplicated(self) -> None:
+        full_cases = official_cases()
+        isolated_cases = official_isolated_cases()
+        self.assertEqual(len(full_cases), 13)
+        self.assertEqual(
+            {case_id for case in full_cases for case_id in case.official_ids},
+            set(range(1, 14)),
+        )
+        self.assertEqual(len(isolated_cases), 9)
+        self.assertEqual(
+            {(case.tokens, case.d_model, case.ffn_dim) for case in isolated_cases},
+            {
+                (128, 128, 128),
+                (512, 128, 128),
+                (2048, 128, 128),
+                (8192, 128, 128),
+                (16384, 128, 128),
+                (65536, 128, 128),
+                (1_280_000, 128, 128),
+                (8192, 32, 32),
+                (8192, 1024, 1024),
+            },
+        )
+        shared = next(
+            case
+            for case in isolated_cases
+            if case.tokens == 8192 and case.d_model == 128
+        )
+        self.assertEqual(shared.official_ids, (1, 9, 10, 11))
+
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
 class Person2CudaTests(unittest.TestCase):
+    def test_cuda_graph_diagnostic_rejects_aliased_outputs(self) -> None:
+        class Doubler(torch.nn.Module):
+            def forward(
+                self, value: torch.Tensor, _mask: torch.Tensor
+            ) -> torch.Tensor:
+                return value * 2
+
+        device = torch.device("cuda")
+        x = torch.randn(2, 8, 32, device=device, dtype=torch.float16)
+        mask = torch.ones(2, 8, device=device, dtype=torch.bool)
+        graphed = StaticCudaGraphFFN(Doubler(), x, mask, capture_warmups=3)
+        owns_outputs, reason = graphed.output_ownership()
+        self.assertFalse(owns_outputs)
+        self.assertIn("overwrit", reason)
+        with torch.inference_mode():
+            first = graphed(x, mask)
+            second = graphed(x, mask)
+        self.assertEqual(first.data_ptr(), second.data_ptr())
+        assert_or_close(self, x * 2, second)
+
     def test_cuda_full_op_masked_and_unmasked(self) -> None:
         from torch.utils.cpp_extension import CUDA_HOME
 
