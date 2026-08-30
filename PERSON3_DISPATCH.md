@@ -19,13 +19,21 @@ Automatic selection requires an exact key and all of these gates:
 - median process speedup is at least 1.02x;
 - every optimized p90 is no more than 1.02 times the baseline p90.
 
-If no measured candidate matches, the backend is native. A packed suffix can
-be requested only as an explicit experiment. Triton is not auto-selected.
+If no measured candidate matches, the backend is native. A packed suffix is
+automatically selected only for the exact measured key; manual suffixes remain
+available for experiments. Triton is not auto-selected.
 
-The only historical automatic candidate is the exact Tesla T4 B8/S512/D512/H8
-FP16 non-causal unpadded workload on PyTorch 2.11.0, where a one-layer packed
-SDPA suffix passed the gate at 1.327x median process speedup. It is intentionally
-not generalized to the official appendix shapes.
+The validated automatic T4 entries are:
+
+- B8/S512/D512/H8, FP16, non-causal, unpadded: one-layer packed SDPA,
+  1.327x median process speedup.
+- Official Shape 3 (B4/S128/D128/H4), FP16, causal, unpadded: one-layer
+  packed SDPA, 1.481x median process speedup.
+- Official Shape 4 (B16/S128/D128/H4), FP16, causal, unpadded: one-layer
+  packed SDPA, 1.448x median process speedup.
+
+These results are not generalized to nearby shapes, padding modes, devices,
+or PyTorch versions.
 
 ## Shape #14 safety path
 
@@ -40,19 +48,19 @@ score tensor. `bench_shape14_streaming.py` instead:
 - never runs or times the explicit baseline at S=100000.
 
 The reported value is sequential blockwise capability latency, not full-batch
-throughput. A reduced local smoke (`B1/S100000/D64/H1/L1`, FP16) passed on an
-RTX 4050 with 0.09 GiB peak GPU allocation. A full official T4 claim still
-requires execution on the acceptance environment.
+throughput. On the T4, the full-width B1 smoke passed in 4.17 s at 1.57 GiB
+peak allocation. The logical official B32 workload also passed with batch
+block 1 in 152.72 s at 1.57 GiB peak allocation; no `[B,H,S,S]` matrix was
+allocated.
 
 ## Validation status
 
-The isolated integration suite passes the CPU and available CUDA tests,
-including reduced Shape #14 exact correctness and the streaming smoke. The
-official CUDA sweep passed IDs 1–5 and 7–13 with native fallback. ID 6 was
-stopped by the new full-batch reference memory guard on the local RTX 4050;
-this is a safety result, not a correctness or speedup result. Run the sweep on
-the T4, or add a separately validated batch-blocked evaluator, before claiming
-ID 6 performance.
+The updated T4 checkout passes 52 tests with one expected opt-in skip. The
+official CUDA smoke sweep passed IDs 1–13; automatic dispatch selected packed
+SDPA only for IDs 3 and 4, with native fallback for every other official
+shape. Dedicated three-process final runs for IDs 3 and 4 passed correctness,
+repeatability, and p90 gates. The original full-batch ID 14 harness remains
+blocked; use the batch-blocked evaluator for its memory-safe result.
 
 No benchmark timing is emitted after strict accuracy failure. Generated timing
 results are not written to tracked files.
