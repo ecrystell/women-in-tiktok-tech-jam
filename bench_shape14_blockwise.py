@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from person1_triton_attention import triton_scaled_dot_product_attention
 from torch_transformer_benchmark import (
     BaselineSelfAttention,
     BaselineTransformer,
@@ -113,6 +114,35 @@ class SeparateQKVSDPAAttention(BaselineSelfAttention):
         return output
 
 
+class SeparateQKVTritonAttention(BaselineSelfAttention):
+    """Baseline projections with the FP32-statistics online-softmax core."""
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: torch.Tensor | None = None,
+        causal: bool = False,
+    ) -> torch.Tensor:
+        batch, seq_len, _ = x.shape
+        q = self._split_heads(self.q_proj(x))
+        k = self._split_heads(self.k_proj(x))
+        v = self._split_heads(self.v_proj(x))
+        context = triton_scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            valid_token_mask=valid_token_mask,
+            causal=causal,
+        )
+        merged = context.transpose(1, 2).contiguous().view(
+            batch, seq_len, self.d_model
+        )
+        output = self.out_proj(merged)
+        if valid_token_mask is not None:
+            output = output.masked_fill(~valid_token_mask[..., None], 0)
+        return output
+
+
 class QueryTiledReferenceTransformer(BaselineTransformer):
     """Baseline-equivalent transformer using query-tiled reference attention."""
 
@@ -156,11 +186,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-block", type=int, default=16)
     parser.add_argument(
         "--attention-plan",
-        choices=("packed-all", "separate-all", "separate-then-packed"),
+        choices=(
+            "packed-all",
+            "separate-all",
+            "separate-then-packed",
+            "separate-triton-all",
+        ),
         default="packed-all",
         help="choose projection rounding while retaining an SDPA attention core",
     )
-    parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--atol", type=float, default=0.001)
@@ -198,7 +233,13 @@ def main() -> int:
     optimized = UserOptimizedTransformer(
         config, packed_sdpa_suffix_layers=config.num_layers
     )
-    if args.attention_plan == "separate-all":
+    if args.attention_plan == "separate-triton-all":
+        for index in range(config.num_layers):
+            optimized.layers[index].attention = SeparateQKVTritonAttention(
+                config.d_model, config.num_heads
+            )
+        separate_layers = ()
+    elif args.attention_plan == "separate-all":
         separate_layers = range(config.num_layers)
     elif args.attention_plan == "separate-then-packed":
         separate_layers = range(max(0, config.num_layers - 1))

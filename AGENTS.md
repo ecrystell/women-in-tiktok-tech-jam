@@ -307,6 +307,15 @@ Q/K/V projection rounding in layer 1 while retaining an SDPA core in both
 layers and packed QKV in the final layer. Full ID 14 correctness and
 performance remain unmeasured.
 
+The B2/S4096/D1024/H16 `separate-all` follow-up failed the same single element
+with the same 0.0078125 maximum absolute error as `packed-all`. This isolates
+the remaining drift to the fused SDPA core rather than packed projection
+rounding. The next diagnostic is `--attention-plan separate-triton-all`, which
+keeps baseline projection arithmetic and uses Person 1's online-softmax Triton
+core with FP32 normalization statistics. The organizer requires 20 warmups;
+the shape-14 harness now defaults to 20, and reduced warmup counts are
+diagnostic-only rather than reportable performance evidence.
+
 Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
 `f50ef57` are both contained by integration merge `99c1830` (Person 2 entered
 at merge `f6d897a`). The T4-validated source-code tree is `d57502e`; the final
