@@ -77,6 +77,45 @@ Correctness takes precedence over speed for every subsystem and backend.
   devices, dtypes, layouts, masks, training mode, compilation, build failures,
   and numerical preflight failures must use a correct native fallback.
 
+### 1.1 Official appendix test shapes
+
+The organizer appendix defines the required workload matrix below. `QKV Dim`
+maps to the benchmark's `d_model` argument. The appendix specifies `causal =
+TRUE` for every case but does not specify a dtype or padding ratio; run and
+report the matrix explicitly for each supported dtype, using an all-valid mask
+when no padding ratio is otherwise supplied.
+
+| # | Batch | QKV Dim | Heads | Seq Len | Layers | Causal | FFN Dim |
+|--:|------:|--------:|------:|--------:|-------:|:------:|--------:|
+| 1 | 64 | 128 | 4 | 128 | 4 | TRUE | 128 |
+| 2 | 1 | 128 | 4 | 128 | 4 | TRUE | 128 |
+| 3 | 4 | 128 | 4 | 128 | 4 | TRUE | 128 |
+| 4 | 16 | 128 | 4 | 128 | 4 | TRUE | 128 |
+| 5 | 128 | 128 | 4 | 128 | 4 | TRUE | 128 |
+| 6 | 10000 | 128 | 4 | 128 | 4 | TRUE | 128 |
+| 7 | 64 | 32 | 4 | 128 | 4 | TRUE | 32 |
+| 8 | 64 | 1024 | 4 | 128 | 4 | TRUE | 1024 |
+| 9 | 64 | 128 | 1 | 128 | 4 | TRUE | 128 |
+| 10 | 64 | 128 | 2 | 128 | 4 | TRUE | 128 |
+| 11 | 64 | 128 | 16 | 128 | 4 | TRUE | 128 |
+| 12 | 64 | 128 | 4 | 32 | 4 | TRUE | 128 |
+| 13 | 64 | 128 | 4 | 1024 | 4 | TRUE | 128 |
+| 14 | 32 | 1024 | 16 | 100000 | 2 | TRUE | 1024 |
+
+Official IDs 1–13 are direct full-model cases. ID 14 is not an ordinary
+baseline timing case: its explicit score tensor has
+`32 * 16 * 100000^2 = 5.12e12` elements, requiring about 9.31 TiB in FP16 or
+18.63 TiB in FP32 before softmax and other tensors. Guard it in the ordinary
+harness and validate it only through a mathematically equivalent tiled,
+batch-blocked harness. Such timing must be labeled sequential blockwise
+projection rather than full-batch GPU utilization.
+
+The official matrix is dominated by narrow, launch-sensitive configurations:
+most cases have `d_model = ffn_dim = 128`, while head dimensions range across
+8, 32, 64, 128, and 256. Triton head-dimension eligibility must not restrict
+PyTorch SDPA eligibility. Benchmark packed QKV depth per shape because
+rounding drift can accumulate across the four causal layers.
+
 ## 2. Target-hardware policy
 
 The acceptance GPU is the Tesla T4 (`sm_75`). Optimize for what that GPU and the
@@ -142,6 +181,10 @@ Apply the NVIDIA GEMM article's shape-first method to inference.
 - Use PyTorch scaled-dot-product attention as the guaranteed path. It can avoid
   materializing the full score/probability matrices and can select an efficient
   backend for the installed GPU/runtime.
+- Keep SDPA eligibility separate from custom Triton eligibility. The official
+  matrix exercises head dimensions 8, 32, 64, 128, and 256; a Triton kernel
+  restricted to one proven head dimension must not force the other cases onto
+  explicit quadratic attention.
 - Support causal and padding masks together. Invalid key positions must not be
   attended to, and invalid query outputs must be exactly zero.
 - Avoid constructing an attention mask for a proven no-padding case only when
@@ -154,6 +197,9 @@ Apply the NVIDIA GEMM article's shape-first method to inference.
 - Benchmark short and long sequences separately because attention changes from
   launch/overhead-sensitive to quadratic compute/memory pressure as sequence
   length grows.
+- For official ID 14, use streaming/tiled attention with online FP32 softmax
+  statistics and batch blocking. The dense baseline must be memory-guarded;
+  do not claim full-batch timing from sequential blockwise validation.
 
 ## 6. Person 2: FFN, LayerNorm, and residual directives
 
