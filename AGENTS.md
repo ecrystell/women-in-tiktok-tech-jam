@@ -243,8 +243,17 @@ random trials plus the exact prepared case with zero failed elements across
 44,040,192 comparisons; its one-round smoke measured 1.336x end-to-end. N=2
 is rejected: 16 of 20 random trials and the prepared case failed, totaling 45
 failed elements across the same comparison count with maximum absolute error
-0.0078125. Performance was correctly skipped. Keep N=1 experimental pending
-three-process timing, and do not dispatch N=2 for this shape.
+0.0078125. Performance was correctly skipped. N=1 proceeded to three-process
+timing; do not dispatch N=2 for this shape.
+
+The subsequent three-process primary-sampling run validated N=1 for that exact
+shape. All 132,120,576 comparisons passed, and median speedups were 1.333x,
+1.325x, and 1.327x (median-of-processes 1.327x). Optimized p90 latencies were
+21.0168 ms, 21.4778 ms, and 21.9393 ms versus baseline p90 latencies of
+27.8528 ms, 28.3276 ms, and 29.0056 ms. Every process therefore cleared the
+correctness, speedup, and p90 gates. The next isolated experiment may combine
+this one-layer attention suffix with one final fast FFN layer; broader FFN or
+attention suffixes remain disabled.
 
 Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
 `f50ef57` are both contained by integration merge `99c1830` (Person 2 entered
