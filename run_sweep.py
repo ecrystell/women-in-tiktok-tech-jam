@@ -89,6 +89,34 @@ class CandidateEvaluation:
     def median_speedup(self) -> float:
         return statistics.median(result.speedup for result in self.results)
 
+    def relative_speedups(
+        self, control: "CandidateEvaluation"
+    ) -> tuple[float, ...]:
+        if len(self.results) != len(control.results) or not self.results:
+            return ()
+        return tuple(
+            candidate.speedup / baseline.speedup
+            for candidate, baseline in zip(self.results, control.results)
+        )
+
+    def improves_on(self, control: "CandidateEvaluation") -> bool:
+        """Require a candidate to beat its native control in every process."""
+        if not self.accepted or not control.accepted:
+            return False
+        relative_speedups = self.relative_speedups(control)
+        if not relative_speedups:
+            return False
+        relative_p90 = tuple(
+            (candidate.optimized_p90_ms / candidate.baseline_p90_ms)
+            / (baseline.optimized_p90_ms / baseline.baseline_p90_ms)
+            for candidate, baseline in zip(self.results, control.results)
+        )
+        return (
+            all(speedup > 1.0 for speedup in relative_speedups)
+            and statistics.median(relative_speedups) >= 1.02
+            and all(ratio <= 1.02 for ratio in relative_p90)
+        )
+
 
 INTEGRATION_CASES = (
     Case(0, 1, 128, 512, 8, 2048, 6, False, 0.0),
@@ -417,13 +445,23 @@ def calibrate_case(
         ffn_evaluations.append(evaluation)
         print_evaluation(evaluation)
 
-    accepted_ffn = [
-        evaluation for evaluation in ffn_evaluations if evaluation.accepted
-    ]
-    if not accepted_ffn:
-        print("no combined candidate cleared all gates")
+    native_ffn = ffn_evaluations[0]
+    if not native_ffn.accepted:
+        print("native-FFN control did not clear the baseline gates")
         return None
-    winner = max(accepted_ffn, key=lambda evaluation: evaluation.median_speedup)
+    improved_ffn = [
+        evaluation
+        for evaluation in ffn_evaluations[1:]
+        if evaluation.improves_on(native_ffn)
+    ]
+    winner = max(
+        (native_ffn, *improved_ffn),
+        key=lambda evaluation: statistics.median(
+            evaluation.relative_speedups(native_ffn)
+        )
+        if evaluation is not native_ffn
+        else 1.0,
+    )
     print(f"\nselected {winner.candidate.label}")
     return winner
 

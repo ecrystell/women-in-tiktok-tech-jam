@@ -454,6 +454,16 @@ speedup  : 2.000x based on median latency
         )
         self.assertFalse(rejected.accepted)
 
+        faster = RunResult(True, 4.0, 4.5, 2.8, 3.2, 4.0 / 2.8)
+        improved = CandidateEvaluation(Candidate(1, 1), (faster,) * 3)
+        self.assertTrue(improved.improves_on(accepted))
+        self.assertFalse(accepted.improves_on(improved))
+
+        mixed = CandidateEvaluation(
+            Candidate(1, 1), (faster, passing, faster)
+        )
+        self.assertFalse(mixed.improves_on(accepted))
+
     def test_calibration_parses_failure_and_builds_strict_command(self) -> None:
         output = (
             "summary: FAIL | max_abs=0.003 | max_rel=2 | "

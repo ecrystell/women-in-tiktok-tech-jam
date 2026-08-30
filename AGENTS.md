@@ -310,6 +310,17 @@ before FFN; and applies the 1.02x median-speedup and paired-p90 gates. Optional
 reports are evidence artifacts and must not be committed as production
 dispatch until the corresponding T4 run has been reviewed.
 
+The isolated `person3/experiment-narrow-ffn` integration tested Person 2's
+official narrow-FFN source through `99fc19e` against ID 2's winning one-layer
+packed-attention suffix. All six strict comparisons passed with zero failed
+elements. Fast FFN depth 1 did not pass the performance gate: versus native
+FFN it won only the first paired median, lost the next two, and its
+median-of-process optimized latency was 2.4019 ms versus 2.3764 ms. Process 3
+p90 regressed from 2.5807 ms to 4.0306 ms. Retain native FFN for ID 2. The
+narrow branch's 1D masked-residual grid remains relevant to ID 6 and other
+workloads above 65,535 token rows, but ID 2's all-valid-mask bypass does not
+exercise that fix.
+
 Official ID 14 is B32/S100000/D1024/H16/FFN1024/L2. In FP16, a full input is
 6.10 GiB and input plus output is 12.21 GiB, while explicit scores require
 9536.74 GiB before the baseline's FP32 softmax probabilities. The ordinary
