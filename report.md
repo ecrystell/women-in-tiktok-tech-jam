@@ -1,0 +1,102 @@
+# Transformer GPU Optimization Project Report
+
+## How the solution addresses the problem statement
+
+The project optimizes the supplied PyTorch Transformer inference benchmark for
+an NVIDIA Tesla T4 while preserving the reference model's output contract. The
+work focuses on reducing attention overhead and memory traffic without changing
+the public `UserOptimizedTransformer.forward` interface or the Transformer
+semantics.
+
+Implemented and evaluated approaches include packed Q/K/V projection, PyTorch
+scaled dot-product attention (SDPA), an optional tiled online-softmax Triton
+attention kernel, all-valid-mask bypass, guarded FFN/LayerNorm experiments, and
+benchmark-driven layer/shape dispatch. Unsupported or numerically unsafe paths
+retain a native PyTorch fallback. Correctness is checked element by element
+before performance is measured, and failed candidates are not used for speedup
+claims.
+
+Testing uses the organizer's causal Transformer shape matrix, including varied
+batch sizes, sequence lengths, model widths, head counts, and layer counts.
+CUDA-event measurements record median and p90 latency after warmup. Extreme
+long-sequence work is evaluated separately with memory-bounded batch and query
+tiling because the dense attention score matrix cannot fit in GPU memory.
+
+Addressed the FFN, LayerNorm, and residual portion of the problem by building
+and validating a standalone, baseline-compatible optimized Transformer block
+that preserves exact GELU, FP32 LayerNorm statistics, masking semantics,
+state-dict compatibility, and invalid-token zeroing. I used Visual Studio Code,
+OpenAI Codex, Git/GitHub, and a Google Colab Jupyter runtime with a Tesla T4;
+the implementation and measurements used Python, PyTorch tensor and
+neural-network APIs, `torch.compile`, `torch.profiler`, CUDA Events, and
+PyTorch C++/CUDA custom-operator APIs, with unittest-based regression coverage.
+Official-shape retuning reduced Python/kernel-launch overhead through a single
+guarded FFN operation boundary and a vectorized residual/mask kernel, fixed a
+CUDA grid-limit failure for workloads above 65,535 token rows, and produced a
+strict measured allowlist for eight of nine official FP16 FFN tuples while
+retaining native fallbacks elsewhere. No external dataset or application API
+was required: all validation used the organizer-provided
+`torch_transformer_benchmark.py`, official configuration shapes, and
+deterministic seeded random tensors.
+
+For the attention portion, I replaced the separate Q/K/V projection path with
+a packed QKV projection followed by PyTorch scaled dot-product attention, while
+preserving the baseline weights, output projection, causal semantics, padding
+masks, and invalid-token zeroing. I also implemented and evaluated an optional
+Triton tiled online-softmax backend with FP32 running statistics and guarded
+fallbacks; Tesla T4 measurements showed that packed-QKV SDPA was the reliable
+production choice, so custom Triton execution remains opt-in unless it passes
+strict correctness and timing gates. Exact-key dispatch keeps validated
+one-layer packed-SDPA cases on the fast path and sends unsupported or
+numerically unstable shapes to the native fallback, while the long-sequence
+Shape #14 evaluator uses memory-safe blockwise attention rather than a dense
+quadratic score matrix. This work used Visual Studio Code, OpenAI Codex,
+Google Colab/Jupyter, Git/GitHub, Python, PyTorch tensor/neural-network/CUDA
+APIs, `scaled_dot_product_attention`, CUDA events, `torch.profiler`,
+`torch.compile`, Triton, and `unittest`; no external dataset or application
+API was used beyond the organizer-provided benchmark, official shape appendix,
+and deterministic seeded tensors.
+
+## Development tools used
+
+- Visual Studio Code
+- OpenAI Codex for AI-assisted code analysis, implementation, and review
+- Google Colab with an NVIDIA Tesla T4 GPU
+- Jupyter notebooks
+- Git and GitHub for branch-based collaboration and integration
+- PyTorch profiler and CUDA events for profiling and latency measurement
+- pytest for automated correctness and integration tests
+
+## APIs used
+
+- PyTorch neural-network, tensor, and CUDA APIs
+- PyTorch `scaled_dot_product_attention` API
+- PyTorch `torch.compile` API for optional compilation experiments
+- PyTorch profiler and CUDA Event timing APIs
+- Triton language and kernel-launch APIs
+- PyTorch C++/CUDA extension and custom-operator APIs for guarded FFN experiments
+
+No external data, mapping, payment, social-media, or other application API is
+required by the solution.
+
+## Libraries and frameworks used
+
+- Python
+- PyTorch
+- Triton
+- CUDA and PyTorch C++/CUDA extensions
+- pytest
+
+The project does not currently depend on Hugging Face Transformers, TensorFlow,
+scikit-learn, or pandas.
+
+## Datasets and assets used
+
+No external dataset is used. Correctness and performance inputs are
+deterministic, seeded random tensors generated by the supplied PyTorch
+benchmark. Project assets and references include:
+
+- The organizer-provided `torch_transformer_benchmark.py` benchmark
+- The organizer's official Transformer test-shape appendix
+- The project problem statement and supplied optimization references
+- Team-authored source code, tests, profiling scripts, and benchmark runners
