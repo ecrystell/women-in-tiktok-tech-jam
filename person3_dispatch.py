@@ -120,8 +120,11 @@ def make_dispatch_key(
     capability: Optional[Tuple[int, int]] = None
     if device.type == "cuda":
         capability = tuple(torch.cuda.get_device_capability(device))
-
-    index = -1 if device.index is None else device.index
+        # ``torch.device("cuda")`` has no explicit index, but the dispatch
+        # key must still identify the concrete device used by the benchmark.
+        index = torch.cuda.current_device() if device.index is None else device.index
+    else:
+        index = -1 if device.index is None else device.index
     torch_version = torch.__version__.split("+")[0]
     return AttentionDispatchKey(
         batch_size=batch_size,
