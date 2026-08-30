@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import statistics
 import subprocess
@@ -43,6 +44,50 @@ class RunResult:
     optimized_median_ms: float
     optimized_p90_ms: float
     speedup: float
+
+
+@dataclass(frozen=True)
+class Candidate:
+    packed_sdpa_suffix_layers: int
+    fast_ffn_suffix_layers: int
+
+    @property
+    def label(self) -> str:
+        return (
+            f"packed={self.packed_sdpa_suffix_layers},"
+            f"fast_ffn={self.fast_ffn_suffix_layers}"
+        )
+
+
+@dataclass(frozen=True)
+class CandidateEvaluation:
+    candidate: Candidate
+    results: tuple[RunResult, ...]
+    rejected_reason: str | None = None
+
+    @property
+    def accepted(self) -> bool:
+        if self.rejected_reason is not None or not self.results:
+            return False
+        median_speedup = statistics.median(result.speedup for result in self.results)
+        return (
+            all(result.correct and result.speedup > 1.0 for result in self.results)
+            and median_speedup >= 1.02
+            and all(
+                result.optimized_p90_ms <= 1.02 * result.baseline_p90_ms
+                for result in self.results
+            )
+        )
+
+    @property
+    def median_latency_ms(self) -> float:
+        return statistics.median(
+            result.optimized_median_ms for result in self.results
+        )
+
+    @property
+    def median_speedup(self) -> float:
+        return statistics.median(result.speedup for result in self.results)
 
 
 INTEGRATION_CASES = (
@@ -130,6 +175,8 @@ def build_command(
     rounds: int,
     fast_ffn_suffix_layers: int,
     packed_sdpa_suffix_layers: int,
+    atol: float = 0.001,
+    rtol: float = 0.01,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -162,6 +209,10 @@ def build_command(
         str(fast_ffn_suffix_layers),
         "--packed-sdpa-suffix-layers",
         str(packed_sdpa_suffix_layers),
+        "--atol",
+        str(atol),
+        "--rtol",
+        str(rtol),
     ]
     if case.causal:
         command.append("--causal")
@@ -194,6 +245,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fast-ffn-suffix-layers", type=int, default=0)
     parser.add_argument("--packed-sdpa-suffix-layers", type=int, default=0)
     parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help=(
+            "sweep packed-attention depth, then FFN depth for one official case"
+        ),
+    )
+    parser.add_argument(
+        "--policy-json",
+        help="optionally write the accepted calibration result as JSON",
+    )
+    parser.add_argument(
         "--skip-long",
         action="store_true",
         help="skip the B1 S4096 memory-pressure case",
@@ -209,7 +271,158 @@ def parse_args() -> argparse.Namespace:
         parser.error("--case-id requires --suite official")
     if args.case_id is not None and not 1 <= args.case_id <= len(OFFICIAL_CASES):
         parser.error("--case-id must be between 1 and 14")
+    if args.calibrate and (args.suite != "official" or args.case_id is None):
+        parser.error("--calibrate requires --suite official and --case-id")
+    if args.calibrate and args.case_id == 14:
+        parser.error("ID 14 uses bench_shape14_blockwise.py, not --calibrate")
+    if args.calibrate and (
+        args.fast_ffn_suffix_layers or args.packed_sdpa_suffix_layers
+    ):
+        parser.error("--calibrate chooses suffix depths; do not provide depth flags")
+    if args.calibrate and args.processes is not None and args.processes != 3:
+        parser.error("--calibrate requires exactly three independent processes")
+    if args.policy_json and not args.calibrate:
+        parser.error("--policy-json requires --calibrate")
     return args
+
+
+def failed_summary(output: str) -> str | None:
+    match = re.search(
+        r"^summary: FAIL .*? failed=([0-9]+/[0-9]+)$",
+        output,
+        flags=re.MULTILINE,
+    )
+    return match.group(1) if match is not None else None
+
+
+def evaluate_candidate(
+    case: Case,
+    candidate: Candidate,
+    *,
+    device: str,
+    dtype: str,
+    processes: int,
+    warmup: int,
+    repeats: int,
+    rounds: int,
+) -> CandidateEvaluation:
+    """Run one candidate in isolated processes and retain strict failures."""
+    results: list[RunResult] = []
+    command = build_command(
+        case,
+        device,
+        dtype,
+        warmup,
+        repeats,
+        rounds,
+        candidate.fast_ffn_suffix_layers,
+        candidate.packed_sdpa_suffix_layers,
+    )
+    for process_index in range(processes):
+        completed = subprocess.run(command, capture_output=True, text=True)
+        failures = failed_summary(completed.stdout)
+        if failures is not None:
+            return CandidateEvaluation(
+                candidate,
+                tuple(results),
+                f"strict correctness failed ({failures})",
+            )
+        if completed.returncode != 0:
+            return CandidateEvaluation(
+                candidate,
+                tuple(results),
+                f"process {process_index + 1} exited {completed.returncode}",
+            )
+        try:
+            results.append(parse_result(completed.stdout))
+        except ValueError as error:
+            return CandidateEvaluation(candidate, tuple(results), str(error))
+    return CandidateEvaluation(candidate, tuple(results))
+
+
+def print_evaluation(evaluation: CandidateEvaluation) -> None:
+    if evaluation.rejected_reason is not None:
+        print(f"{evaluation.candidate.label}: REJECT | {evaluation.rejected_reason}")
+        return
+    p90_gate = all(
+        result.optimized_p90_ms <= 1.02 * result.baseline_p90_ms
+        for result in evaluation.results
+    )
+    verdict = "ACCEPT" if evaluation.accepted else "REVIEW"
+    print(
+        f"{evaluation.candidate.label}: {verdict} | "
+        f"median={evaluation.median_latency_ms:.4f} ms | "
+        f"speedup={evaluation.median_speedup:.3f}x | "
+        f"p90_gate={'PASS' if p90_gate else 'FAIL'}"
+    )
+
+
+def calibrate_case(
+    case: Case,
+    *,
+    device: str,
+    dtype: str,
+    processes: int,
+    warmup: int,
+    repeats: int,
+    rounds: int,
+) -> CandidateEvaluation | None:
+    """Calibrate attention first, then FFN against the best safe attention."""
+    print(f"\n[{case.label}] attention calibration")
+    attention_evaluations = []
+    for depth in range(case.layers + 1):
+        evaluation = evaluate_candidate(
+            case,
+            Candidate(depth, 0),
+            device=device,
+            dtype=dtype,
+            processes=processes,
+            warmup=warmup,
+            repeats=repeats,
+            rounds=rounds,
+        )
+        attention_evaluations.append(evaluation)
+        print_evaluation(evaluation)
+
+    accepted_attention = [
+        evaluation for evaluation in attention_evaluations if evaluation.accepted
+    ]
+    if not accepted_attention:
+        print("no attention candidate cleared all gates")
+        return None
+    # Each benchmark invocation measures its own paired baseline. Selecting by
+    # speedup is therefore less sensitive to thermal drift between candidates
+    # than comparing absolute candidate latency from separate processes.
+    attention_winner = max(
+        accepted_attention, key=lambda evaluation: evaluation.median_speedup
+    )
+
+    packed_depth = attention_winner.candidate.packed_sdpa_suffix_layers
+    print(f"\n[{case.label}] FFN calibration with packed={packed_depth}")
+    ffn_evaluations = []
+    for depth in range(case.layers + 1):
+        evaluation = evaluate_candidate(
+            case,
+            Candidate(packed_depth, depth),
+            device=device,
+            dtype=dtype,
+            processes=processes,
+            warmup=warmup,
+            repeats=repeats,
+            rounds=rounds,
+        )
+        ffn_evaluations.append(evaluation)
+        print_evaluation(evaluation)
+
+    accepted_ffn = [
+        evaluation for evaluation in ffn_evaluations if evaluation.accepted
+    ]
+    if not accepted_ffn:
+        print("no combined candidate cleared all gates")
+        return None
+    winner = max(accepted_ffn, key=lambda evaluation: evaluation.median_speedup)
+    print(f"\nselected {winner.candidate.label}")
+    return winner
 
 
 def main() -> int:
@@ -223,7 +436,7 @@ def main() -> int:
     if dtype == "auto":
         dtype = "float16" if device.startswith("cuda") else "float32"
 
-    final_mode = args.mode == "final"
+    final_mode = args.mode == "final" or args.calibrate
     processes = args.processes or (3 if final_mode else 1)
     warmup, repeats, rounds = (20, 100, 3) if final_mode else (5, 20, 1)
     cases = OFFICIAL_CASES if args.suite == "official" else INTEGRATION_CASES
@@ -242,6 +455,51 @@ def main() -> int:
         )
         print(f"ID 14 {dtype} memory floor: {shape14_memory_summary(shape14, dtype)}")
         return 2
+
+    if args.calibrate:
+        case = cases[0]
+        print(
+            f"suite=official mode=calibrate device={device} dtype={dtype} "
+            f"processes={processes} warmup={warmup} repeats={repeats} "
+            f"rounds={rounds} atol=0.001 rtol=0.01"
+        )
+        winner = calibrate_case(
+            case,
+            device=device,
+            dtype=dtype,
+            processes=processes,
+            warmup=warmup,
+            repeats=repeats,
+            rounds=rounds,
+        )
+        if winner is None:
+            return 1
+        if args.policy_json:
+            policy = {
+                "case_id": case.case_id,
+                "shape": {
+                    "batch_size": case.batch,
+                    "seq_len": case.seq_len,
+                    "d_model": case.d_model,
+                    "num_heads": case.heads,
+                    "ffn_dim": case.ffn_dim,
+                    "num_layers": case.layers,
+                    "causal": case.causal,
+                    "padding": case.padding,
+                    "dtype": dtype,
+                },
+                "packed_sdpa_suffix_layers": (
+                    winner.candidate.packed_sdpa_suffix_layers
+                ),
+                "fast_ffn_suffix_layers": winner.candidate.fast_ffn_suffix_layers,
+                "median_speedup": winner.median_speedup,
+                "median_latency_ms": winner.median_latency_ms,
+            }
+            with open(args.policy_json, "w", encoding="utf-8") as policy_file:
+                json.dump(policy, policy_file, indent=2)
+                policy_file.write("\n")
+            print(f"wrote policy candidate to {args.policy_json}")
+        return 0
 
     print(
         f"suite={args.suite} mode={args.mode} device={device} dtype={dtype} "

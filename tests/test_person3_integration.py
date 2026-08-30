@@ -14,7 +14,16 @@ from bench_shape14_blockwise import (
     SeparateQKVTritonAttention,
 )
 from person1_triton_attention import PackedQKVSDPAAttention
-from run_sweep import OFFICIAL_CASES, parse_result, shape14_memory_summary
+from run_sweep import (
+    OFFICIAL_CASES,
+    Candidate,
+    CandidateEvaluation,
+    RunResult,
+    build_command,
+    failed_summary,
+    parse_result,
+    shape14_memory_summary,
+)
 from torch_transformer_benchmark import (
     BaselineSelfAttention,
     BaselineTransformer,
@@ -425,6 +434,47 @@ speedup  : 2.000x based on median latency
         self.assertEqual(result.optimized_median_ms, 2.1)
         self.assertEqual(result.optimized_p90_ms, 2.3)
         self.assertEqual(result.speedup, 2.0)
+
+    def test_calibration_gate_requires_correct_repeatable_results(self) -> None:
+        passing = RunResult(True, 4.0, 4.5, 3.0, 3.4, 4.0 / 3.0)
+        accepted = CandidateEvaluation(Candidate(1, 0), (passing,) * 3)
+        self.assertTrue(accepted.accepted)
+        self.assertAlmostEqual(accepted.median_speedup, 4.0 / 3.0)
+
+        slow = RunResult(True, 4.0, 4.5, 3.95, 4.4, 4.0 / 3.95)
+        self.assertFalse(
+            CandidateEvaluation(Candidate(0, 0), (slow,) * 3).accepted
+        )
+        bad_p90 = RunResult(True, 4.0, 4.5, 3.0, 4.6, 4.0 / 3.0)
+        self.assertFalse(
+            CandidateEvaluation(Candidate(1, 1), (bad_p90,) * 3).accepted
+        )
+        rejected = CandidateEvaluation(
+            Candidate(2, 0), (), "strict correctness failed (1/1024)"
+        )
+        self.assertFalse(rejected.accepted)
+
+    def test_calibration_parses_failure_and_builds_strict_command(self) -> None:
+        output = (
+            "summary: FAIL | max_abs=0.003 | max_rel=2 | "
+            "failed=3/344064\n"
+        )
+        self.assertEqual(failed_summary(output), "3/344064")
+        self.assertIsNone(failed_summary("summary: PASS | failed=0/344064\n"))
+
+        command = build_command(
+            OFFICIAL_CASES[1],
+            "cuda",
+            "float16",
+            20,
+            100,
+            3,
+            0,
+            1,
+        )
+        self.assertEqual(command[command.index("--atol") + 1], "0.001")
+        self.assertEqual(command[command.index("--rtol") + 1], "0.01")
+        self.assertIn("--causal", command)
 
 
 if __name__ == "__main__":

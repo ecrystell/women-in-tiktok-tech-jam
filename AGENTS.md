@@ -290,6 +290,26 @@ and sequence length. `run_sweep.py --suite official --skip-long` now runs IDs
 earlier five-case integration matrix as the actual optimization target. Dtype
 was not specified by the Appendix and must be reported explicitly.
 
+Official ID 2 (`B1/S128/D128/H4/FFN128/L4`, causal, FP16) established a strict
+attention-depth boundary on the T4. Packed suffix depth 1 passed 20 randomized
+trials and the prepared benchmark input with zero failed elements. Depths 2,
+3, and 4 failed 1, 5, and 25 of 344,064 comparisons respectively at
+`atol=0.001`, `rtol=0.01`, so they are rejected. In three independent paired
+runs, depth 1 measured end-to-end speedups of 1.383x, 1.363x, and 1.335x; its
+optimized median beat depth 0 by 1.122x, 1.052x, and 1.038x. One p90 comparison
+against depth 0 regressed, but every optimized p90 remained faster than its
+paired original baseline. FFN depth remains uncalibrated for this shape, so no
+automatic production policy is enabled yet.
+
+`run_sweep.py --suite official --case-id N --calibrate` now performs the
+strict evidence workflow for IDs 1-13. It runs exactly three isolated
+processes with 20 warmups, 100 repeats, and three rounds; rejects numerical
+failures without aborting the remaining sweep; calibrates packed attention
+before FFN; and applies the 1.02x median-speedup and paired-p90 gates. Optional
+`--policy-json PATH` writes the winning candidate for review. Generated policy
+reports are evidence artifacts and must not be committed as production
+dispatch until the corresponding T4 run has been reviewed.
+
 Official ID 14 is B32/S100000/D1024/H16/FFN1024/L2. In FP16, a full input is
 6.10 GiB and input plus output is 12.21 GiB, while explicit scores require
 9536.74 GiB before the baseline's FP32 softmax probabilities. The ordinary
