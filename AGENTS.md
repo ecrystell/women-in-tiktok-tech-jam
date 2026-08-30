@@ -263,6 +263,25 @@ packed-only median and is therefore rejected as a performance dispatch for
 this shape. Keep the native FFN with the validated mask bypass plus final-layer
 packed SDPA; the fast FFN remains available only as an explicit experiment.
 
+The final eager full-integration matrix then validated the selected native-FFN
+candidate across all five target configurations. Each shape ran in three
+independent processes with 20 warmups, 100 repeats, and three alternating
+rounds; all 15 processes passed strict correctness and the median/p90 gate.
+
+| Full-model configuration | Process speedups | Median-of-processes |
+| --- | --- | ---: |
+| B1/S128, non-causal, unpadded | 1.480x, 1.492x, 1.462x | 1.480x |
+| B8/S512, non-causal, unpadded | 1.334x, 1.325x, 1.324x | 1.325x |
+| B8/S512, causal, 20% padding | 1.098x, 1.093x, 1.098x | 1.098x |
+| B2/S2048, non-causal, unpadded | 1.452x, 1.448x, 1.450x | 1.450x |
+| B1/S4096, causal, 25% padding | 1.137x, 1.145x, 1.141x | 1.141x |
+
+The unweighted geometric mean of the five median-of-process speedups is
+1.289x, equivalent to a 22.4% aggregate latency reduction under that summary
+method. Report the complete 1.098x-1.480x range alongside this aggregate;
+there is no competition-provided rule that defines one official cross-shape
+score.
+
 Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
 `f50ef57` are both contained by integration merge `99c1830` (Person 2 entered
 at merge `f6d897a`). The T4-validated source-code tree is `d57502e`; the final
