@@ -27,8 +27,9 @@ The main benchmark is `torch_transformer_benchmark.py`.
 - `valid_token_mask` masks invalid key positions and invalid query outputs.
 - The benchmark compares every output element using an OR condition:
   `abs_error <= atol` or `abs_error <= rtol * abs(reference)`.
-- The script defaults to `atol=0.001` and `rtol=0.01`; use these stricter
-  values for local validation even if external instructions allow looser ones.
+- The organizer-updated script currently defaults to `atol=0.002` and
+  `rtol=0.02`; the Person 1 standalone tests continue to use the stricter
+  `atol=0.001` and `rtol=0.01` contract for local validation.
 - Timing uses CUDA events after warmup. Do not include random-data generation
   in performance measurements.
 - Keep dtype, matmul precision, and TF32 settings identical for reference and
@@ -57,6 +58,11 @@ overhead but does not establish GPU latency, DRAM bandwidth, or FlashAttention
 backend selection. Use CUDA events or a profiler trace with CUDA activity for
 the final performance claim. Watch tensor copies and layout conversions because
 they can erase the benefit of packed QKV.
+
+The organizer-updated `torch_transformer_benchmark.py` is a baseline harness:
+the duplicate in-file `FastSelfAttention` implementation has been removed.
+Person 1's optimized attention remains in the standalone package, and Person 3
+owns wiring it into `UserOptimizedTransformer`.
 
 ## Team ownership
 
