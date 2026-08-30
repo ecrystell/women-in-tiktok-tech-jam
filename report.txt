@@ -39,6 +39,24 @@ external dataset or application API was required: all validation used the
 organizer-provided torch_transformer_benchmark.py, official configuration
 shapes, and deterministic seeded random tensors.
 
+For the attention portion, I replaced the separate Q/K/V projection path with
+a packed QKV projection followed by PyTorch scaled dot-product attention, while
+preserving the baseline weights, output projection, causal semantics, padding
+masks, and invalid-token zeroing. I also implemented and evaluated an optional
+Triton tiled online-softmax backend with FP32 running statistics and guarded
+fallbacks; Tesla T4 measurements showed that packed-QKV SDPA was the reliable
+production choice, so custom Triton execution remains opt-in unless it passes
+strict correctness and timing gates. Exact-key dispatch keeps validated
+one-layer packed-SDPA cases on the fast path and sends unsupported or
+numerically unstable shapes to the native fallback, while the long-sequence
+Shape #14 evaluator uses memory-safe blockwise attention rather than a dense
+quadratic score matrix. This work used Visual Studio Code, OpenAI Codex,
+Google Colab/Jupyter, Git/GitHub, Python, PyTorch tensor/neural-network/CUDA
+APIs, `scaled_dot_product_attention`, CUDA events, `torch.profiler`,
+`torch.compile`, Triton, and `unittest`; no external dataset or application
+API was used beyond the organizer-provided benchmark, official shape appendix,
+and deterministic seeded tensors.
+
 Development tools used
 
 - Visual Studio Code
