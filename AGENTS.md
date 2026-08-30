@@ -501,12 +501,19 @@ Local validation on the RTX 4050 Laptop GPU with PyTorch 2.13.0+cu126:
   memory guard; rerun on the T4 or use a blockwise evaluator before making an
   official ID 6 performance claim.
 
-The only prevalidated automatic table entry is the exact T4 key B8/S512/D512,
-H8, FP16, non-causal, unpadded, PyTorch 2.11.0, compute capability 7.5. Its
-one-layer packed-SDPA suffix passed strict correctness and three-process timing
-gates with a 1.327x median speedup. This result is not generalized to the
-organizer appendix shapes; those remain native until independently measured on
-the acceptance GPU.
+The prevalidated automatic table entries are exact T4 keys on PyTorch 2.11.0,
+compute capability 7.5: B8/S512/D512/H8 FP16 non-causal unpadded with a 1.327x
+median speedup, official Shape 3 (B4/S128/D128/H4) FP16 causal unpadded with a
+1.481x median speedup, and official Shape 4 (B16/S128/D128/H4) FP16 causal
+unpadded with a 1.448x median speedup. Each uses a one-layer packed-SDPA
+suffix, passed strict correctness and three-process timing gates, and is not
+generalized to nearby shapes, padding modes, devices, or versions.
+
+The updated T4 checkout passed the full official 1–13 smoke sweep. Automatic
+dispatch selected packed SDPA only for IDs 3 and 4; all other official IDs
+used native fallback. The dedicated final-mode three-process runs for IDs 3
+and 4 also passed. The full-batch ID 14 harness remains blocked; its validated
+path is the batch-blocked streaming evaluator.
 
 Recommended commands:
 

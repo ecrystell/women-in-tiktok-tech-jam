@@ -18,6 +18,7 @@ from person1_triton_attention import PackedQKVSDPAAttention
 from person3_dispatch import (
     AttentionDispatchKey,
     DispatchMeasurement,
+    historical_t4_measurements,
     make_dispatch_key,
     select_attention_plan,
 )
@@ -143,6 +144,25 @@ class Person3IntegrationTests(unittest.TestCase):
         )
         self.assertEqual(plan.label, "packed-sdpa-suffix:1")
         self.assertIn("manual experiment", plan.reason)
+
+    def test_historical_t4_measurements_are_exact_passing_entries(self) -> None:
+        measurements = historical_t4_measurements()
+        self.assertEqual(len(measurements), 3)
+        self.assertEqual(
+            {
+                (measurement.key.batch_size, measurement.key.d_model)
+                for measurement in measurements
+            },
+            {(8, 512), (4, 128), (16, 128)},
+        )
+        for measurement in measurements:
+            self.assertTrue(measurement.passes_gate)
+            plan = select_attention_plan(
+                measurement.key,
+                num_layers=4,
+                measurements=measurements,
+            )
+            self.assertEqual(plan.label, "packed-sdpa-suffix:1")
 
     def test_shape14_memory_guard_rejects_unsafe_block(self) -> None:
         unsafe = Shape14MemoryEstimate(
