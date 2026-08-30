@@ -273,3 +273,111 @@ reformulation was also screened: it had zero strict failures on short and
 medium shapes, but was not promoted because it changes floating-point
 evaluation and would require a new fused statistics/correction kernel. It
 remains a separately gated future experiment rather than part of this result.
+
+## Official narrow-shape retuning
+
+Branch `person2/official-narrow-ffn-t4` retuned the validated full-op control
+for the nine unique FFN workloads represented by official configurations
+1–13. Configuration 14 was excluded from the T4 performance gate because its
+activation alone is impractical on the target GPU and its dominant
+long-sequence attention cost is outside Person 2 ownership. No attention,
+causal-mask, `UserOptimizedTransformer`, or dispatch code was changed.
+
+The benchmark now supports `--suite official`, original official case IDs,
+explicit backend selection, process identifiers, and JSON metrics. Duplicate
+attention configurations share an isolated FFN result, while full-block checks
+retain their original batch, sequence, head, causal, and mask settings. The
+profiler separately reports LayerNorm, both GEMMs, exact GELU, residual/mask,
+approximate launch count, and CPU enqueue gaps.
+
+### CUDA launch-limit correction
+
+The first T4 screen exposed an implementation defect at the two largest token
+counts: the masked half2/half8 post kernels placed one token row in `grid.y`,
+which exceeds CUDA's 65,535 `grid.y` limit. Source commit `99fc19e` replaces
+that launch with a 1D vector grid and derives the row from the linear vector
+index. This preserves FP16 residual-add order and mask semantics while making
+the 65,536- and 1,280,000-row workloads legal. A real-CUDA regression test now
+covers more than 65,535 rows.
+
+The corrected source passed all 23 tests in 105.922 seconds on Tesla T4
+(`sm_75`, 15,360 MiB), driver 580.82.07, PyTorch 2.11.0+cu128, and CUDA 12.8.
+Coverage includes strict state loading, unchanged signatures, all-valid and
+padded masks, exact invalid zeroing, non-contiguous fallback, parameter
+invalidation, repeat ownership, FP16, FP32/BF16 fallback, static compilation,
+CUDA-graph lifecycle, and actual CUDA extension execution.
+
+### Isolated eager results
+
+Each process used FP16, seed 1234, `atol=0.001`, `rtol=0.01`, 20 warmups,
+100 CUDA-event repetitions, and five alternating rounds. All 27 accuracy
+comparisons had zero failed elements.
+
+| Official IDs | `(M,D,FFN)` | Process speedups | p90 gate | Recommendation |
+| --- | --- | --- | --- | --- |
+| 2 | `(128,128,128)` | 1.215x / 1.210x / 1.261x | PASS | eager full-op |
+| 3 | `(512,128,128)` | 1.228x / 1.230x / 1.235x | PASS | eager full-op |
+| 4, 12 | `(2048,128,128)` | 1.222x / 1.286x / 1.210x | FAIL in processes 1 and 3 | native |
+| 1, 9, 10, 11 | `(8192,128,128)` | 1.129x / 1.128x / 1.235x | PASS | eager full-op |
+| 5 | `(16384,128,128)` | 1.270x / 1.278x / 1.260x | PASS | eager full-op |
+| 13 | `(65536,128,128)` | 1.249x / 1.245x / 1.248x | PASS | eager full-op |
+| 6 | `(1280000,128,128)` | 1.271x / 1.267x / 1.261x | PASS | eager full-op |
+| 7 | `(8192,32,32)` | 1.219x / 1.250x / 1.164x | PASS | eager full-op |
+| 8 | `(8192,1024,1024)` | 1.141x / 1.135x / 1.141x | PASS | eager full-op |
+
+For the rejected 2,048-row tuple, process 1 p90 increased from 0.221936 to
+0.292051 ms and process 3 p90 increased from 0.236006 to 0.290906 ms. Its
+medians clear 1.005x, but the acceptance contract requires every process to
+clear both median and p90 gates.
+
+### Profiles and backend screens
+
+The full-op reduced the profiled CUDA launch count from approximately eight to
+five. Across the official suite, baseline GEMM share ranged from 13.46% to
+63.77%, LayerNorm from 9.53% to 68.60%, GELU from 3.40% to 8.85%, and
+residual/mask from 6.44% to 21.66%. Representative baseline-to-full-op CPU
+enqueue gaps were 0.2233 to 0.1814 ms at `(128,128,128)`, 0.2312 to 0.1585 ms
+at `(512,128,128)`, and 0.2393 to 0.1509 ms at `(8192,32,32)`. Larger cases
+were increasingly GEMM-bound but still benefited from the reduced residual
+stage and launch count.
+
+Symmetric `default` and `reduce-overhead` compilation failed the isolated
+screen on both the smallest and unstable tuples. `max-autotune-no-cudagraphs`
+also failed the smallest tuple, but the 2,048-row tuple measured 1.060x,
+1.054x, and 1.113x with passing p90. That rescue was rejected because compiled
+full-block checks for official IDs 4 and 12 measured only 0.909x and 0.896x.
+
+Fixed-shape CUDA-graph core replay measured 1.136x for the 8,192-row tuple and
+10.423x for the 128-row tuple, with zero numerical failures. It was not
+eligible: replay reused and overwrote the same output storage, so preserving
+previous outputs would require a timed clone or copy. Whole-model graph capture
+and ownership management remain Person 3 responsibilities.
+
+### Causal full-block safety and final allowlist
+
+Strict eager full-block speedups for official configurations 1–13 were:
+1.011x, 1.003x, 0.992x, 0.911x, 1.033x, 1.037x, 1.009x, 1.025x,
+0.994x, 1.017x, 1.010x, 1.005x, and 1.007x. Every output had zero failed
+elements. Configuration 4 failed the 0.99x median gate and increased p90 by
+about 9.6%; the other configurations passed both full-block safety limits.
+Because configurations 4 and 12 share the Person 2 dispatch key
+`(2048,128,128,FP16,all-valid,eager)`, the tuple is conservatively excluded.
+
+The measured eager FP16 all-valid allowlist is therefore:
+
+- `(128,128,128)`
+- `(512,128,128)`
+- `(8192,32,32)`
+- `(8192,128,128)`
+- `(8192,1024,1024)`
+- `(16384,128,128)`
+- `(65536,128,128)`
+- `(1280000,128,128)`
+
+Use native execution for `(2048,128,128)`, padded or unsupported masks,
+FP32, BF16, non-contiguous inputs, nonidentity LayerNorm parameters, compile
+fallbacks, or failed extension/preflight cases. FP32 and runtime-supported
+BF16 smoke checks passed through the native fallback with zero error. The
+official harness signature/accuracy smoke passed two of two trials with zero
+failed elements. No runtime dispatch was added; Person 3 must revalidate this
+allowlist in the integrated official harness before consuming it.
