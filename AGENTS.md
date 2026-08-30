@@ -164,6 +164,149 @@ and full-block evidence is reported with that variance caveat.
 
 Current integration branch: `person3/integrate-person1`.
 
+Current assembly candidate branch: `person3/optimize-transformer-dispatch`.
+The current strict-safe candidate uses baseline attention with Person 2's
+guarded optimized FFN block. It refreshes nonpersistent FFN state, preserves
+the public forward signature, and prepares extension-backed FFN paths and
+exact-mask caches before compilation and timing. Unsupported paths retain
+native fallbacks. Person 1's packed SDPA and Triton implementations remain
+available as standalone experiments, but are not selected by the production
+full-model path because of the T4 failure documented below.
+
+Local CPU validation of the assembly passed all 36 tests with eight expected
+CUDA/Triton skips. Strict non-causal/unpadded and causal/25%-padded harness
+smokes each passed with zero failed elements. These CPU timings are not GPU
+speedup evidence.
+
+The first end-to-end T4 smoke rejected the candidate before timing. All four
+tested shapes prepared the fast FFN in 6/6 layers, but strict five-trial
+accuracy failed after six combined layers. Failed elements ranged from 1,190
+of 327,680 for B1/S128 to 10,712 of 10,485,760 for causal padded B8/S512;
+maximum absolute error ranged from 0.0078125 to 0.00976562. Standalone component
+correctness therefore does not establish full-model correctness. Use
+`diagnose_integration.py` to separate attention drift, FFN drift, and their
+interaction before adding dispatch. Do not benchmark on failure or merge the
+candidate into the shared integration branch until strict T4 accuracy passes.
+
+The first fallback smoke then selected baseline attention plus fast FFN in all
+six layers. B1/S128 passed five strict trials with exact output, but performance
+was not repeatable: the direct run measured 0.987x with worse p90 while the
+sweep process measured 1.015x. B8/S512 unpadded, B8/S512 causal with 20%
+padding, and B2/S2048 unpadded all failed strict accuracy before timing, with
+maximum absolute errors from 0.0078125 and thousands of failed elements across
+five trials. The next diagnostic must test partial FFN layer selection; the
+six-layer FFN fallback is not a valid universal production dispatch.
+
+The B8/S512 layer-selection diagnostic found that the first four individual
+fast FFN layers failed strict full-model accuracy. Layers 5 and 6 passed
+individually, and the final two-layer suffix passed together with zero failed
+elements for seed 1234; a final three-layer suffix failed 23 elements. This is
+candidate evidence, not dispatch evidence, until the two-layer suffix passes
+all benchmark accuracy trials and repeated timing. The main benchmark now
+defaults to zero fast FFN layers and exposes `--fast-ffn-suffix-layers` only
+for controlled validation. Do not change the safe default until a shape has
+repeatable strict-correct speedup evidence.
+
+The next exact-safe candidate implements the requested all-valid-mask bypass.
+Preparation checks the fixed mask outside timing and caches only its exact
+object identity and tensor version when every token is valid. Eager forward
+then treats only that unchanged mask as `None`, removing no-op attention,
+block-output, and final-output masking. Cloned, changed, padded, unprepared,
+and compiled masks retain the original path. Accuracy validation now includes
+the exact prepared benchmark input so the path being timed must pass strict
+comparison. Local unpadded and padded harness checks were exact; T4 correctness
+and performance were subsequently validated at candidate commit `7d87e79`.
+
+The transformer-level all-valid-mask bypass passed three independent eager
+FP16 processes on a Tesla T4 for B8/S512/D512/H8/FFN2048/L6, non-causal and
+unpadded, using 20 warmups, 100 repeats, and three alternating rounds per
+process. All 37,748,736 checked output elements were bit-exact. Median speedups
+were 1.220x, 1.218x, and 1.213x (median-of-processes 1.218x). Optimized p90
+latencies were 22.7702 ms, 23.1190 ms, and 23.5960 ms versus baseline p90
+latencies of 27.6974 ms, 28.0642 ms, and 28.6723 ms, so every process cleared
+the correctness, median-speedup, and p90 gates. This validates dispatch for
+that exact all-valid shape family; padded, causal, short, long, and other batch
+or model shapes still require separate measurements before broader claims.
+
+The next accuracy-recovery experiment adds
+`--packed-sdpa-suffix-layers N`, defaulting to zero. It constructs Person 1's
+canonical `PackedQKVSDPAAttention` only in the final N transformer layers so
+its FP16 differences have fewer later residual blocks in which to accumulate.
+Weight transfer still packs rows in exact `[Q; K; V]` order, the FFN experiment
+remains disabled independently, and invalid suffix counts are rejected. Start
+T4 validation with N=1 and increase only after five-trial strict correctness;
+this is an experimental control, not a production dispatch or speedup claim.
+
+Initial T4 suffix validation used B8/S512/D512/H8/FFN2048/L6, non-causal,
+unpadded FP16 with the all-valid-mask bypass and native FFN. N=1 passed 20
+random trials plus the exact prepared case with zero failed elements across
+44,040,192 comparisons; its one-round smoke measured 1.336x end-to-end. N=2
+is rejected: 16 of 20 random trials and the prepared case failed, totaling 45
+failed elements across the same comparison count with maximum absolute error
+0.0078125. Performance was correctly skipped. N=1 proceeded to three-process
+timing; do not dispatch N=2 for this shape.
+
+The subsequent three-process primary-sampling run validated N=1 for that exact
+shape. All 132,120,576 comparisons passed, and median speedups were 1.333x,
+1.325x, and 1.327x (median-of-processes 1.327x). Optimized p90 latencies were
+21.0168 ms, 21.4778 ms, and 21.9393 ms versus baseline p90 latencies of
+27.8528 ms, 28.3276 ms, and 29.0056 ms. Every process therefore cleared the
+correctness, speedup, and p90 gates. The next isolated experiment may combine
+this one-layer attention suffix with one final fast FFN layer; broader FFN or
+attention suffixes remain disabled.
+
+That combined one-layer attention plus one-layer fast-FFN experiment also
+passed all 132,120,576 comparisons in three primary-sampling processes.
+Speedups were 1.329x, 1.326x, and 1.324x (median-of-processes 1.326x), and all
+p90 latencies improved against baseline. This does not improve on the 1.327x
+packed-only median and is therefore rejected as a performance dispatch for
+this shape. Keep the native FFN with the validated mask bypass plus final-layer
+packed SDPA; the fast FFN remains available only as an explicit experiment.
+
+The final eager full-integration matrix then validated the selected native-FFN
+candidate across all five target configurations. Each shape ran in three
+independent processes with 20 warmups, 100 repeats, and three alternating
+rounds; all 15 processes passed strict correctness and the median/p90 gate.
+
+| Full-model configuration | Process speedups | Median-of-processes |
+| --- | --- | ---: |
+| B1/S128, non-causal, unpadded | 1.480x, 1.492x, 1.462x | 1.480x |
+| B8/S512, non-causal, unpadded | 1.334x, 1.325x, 1.324x | 1.325x |
+| B8/S512, causal, 20% padding | 1.098x, 1.093x, 1.098x | 1.098x |
+| B2/S2048, non-causal, unpadded | 1.452x, 1.448x, 1.450x | 1.450x |
+| B1/S4096, causal, 25% padding | 1.137x, 1.145x, 1.141x | 1.141x |
+
+The unweighted geometric mean of the five median-of-process speedups is
+1.289x, equivalent to a 22.4% aggregate latency reduction under that summary
+method. Report the complete 1.098x-1.480x range alongside this aggregate;
+there is no competition-provided rule that defines one official cross-shape
+score.
+
+The organizer Appendix later supplied 14 all-causal configurations. They use
+`qkv_dim` as `d_model`, mostly D=FFN=128 and L=4, and vary batch, width, heads,
+and sequence length. `run_sweep.py --suite official --skip-long` now runs IDs
+1-13 directly; `--case-id N` isolates one case. These shapes replace the
+earlier five-case integration matrix as the actual optimization target. Dtype
+was not specified by the Appendix and must be reported explicitly.
+
+Official ID 14 is B32/S100000/D1024/H16/FFN1024/L2. In FP16, a full input is
+6.10 GiB and input plus output is 12.21 GiB, while explicit scores require
+9536.74 GiB before the baseline's FP32 softmax probabilities. The ordinary
+harness blocks this case by default on safety grounds. The separate
+`bench_shape14_blockwise.py` harness splits the mathematically independent
+batch dimension and uses a query-tiled reference whose score working set is
+`[batch_block, heads, query_block, seq_len]`; every query still evaluates and
+masks all S keys, preserving the reference softmax domain. Its timing is a
+sequential blockwise projection and must not be reported as full-batch GPU
+utilization. A reduced B2/S1024/D128/H4/L2 T4 validation passed strict
+correctness and measured a 17.408x blockwise speedup. At B2/S4096/D1024/H16,
+packing QKV in both layers failed one of 4,194,304 output elements with maximum
+absolute error 0.0078125, so that plan is rejected before timing. The harness
+now exposes `--attention-plan separate-then-packed` to preserve baseline
+Q/K/V projection rounding in layer 1 while retaining an SDPA core in both
+layers and packed QKV in the final layer. Full ID 14 correctness and
+performance remain unmeasured.
+
 Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
 `f50ef57` are both contained by integration merge `99c1830` (Person 2 entered
 at merge `f6d897a`). The T4-validated source-code tree is `d57502e`; the final
