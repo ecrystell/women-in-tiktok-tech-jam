@@ -89,6 +89,22 @@ Own FFN and normalization optimization. Start with `torch.compile`, exact
 fusion. Do not assume that a hand-written single kernel for both large Linear
 GEMMs is faster than optimized PyTorch/cuBLAS. Custom Triton is a stretch path.
 
+The best currently validated Person 2 branch is `person2/ffn-fullop-t4` at
+handoff commit `f50ef57`. Its full-op implementation was introduced at
+`16cf403` and validated at Task 2 commit `c319ab4`. On the Colab Tesla T4, three
+independent five-shape isolated FP16 sweeps had a lowest speedup of `1.023x`;
+all 15 p90 comparisons improved and every comparison had zero failed elements.
+Full-block validation included a reduced-sampling `0.858x` medium outlier that
+did not reproduce in three primary-sampling reruns (`1.016x`, `1.011x`, and
+`1.013x`), so the full-block result retains a sampling-variance caveat.
+
+Those measurements used the earlier wide tuning shapes and do not establish a
+speedup on the official narrow configurations. The newer experimental branch
+`person2/tensorrt-ffn-t4` retains the full-op implementation as its default:
+pre-norm fusion failed its performance gate, and TensorRT failed strict
+correctness. Retune against the official shapes before Person 3 selects this
+path for integrated dispatch.
+
 ### Person 3 — integration, profiling, and dispatch
 
 Own `UserOptimizedTransformer`, weight-copy integration, benchmark-driven
