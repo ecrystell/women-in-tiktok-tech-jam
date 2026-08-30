@@ -199,10 +199,11 @@ def select_attention_plan(
 
 
 def historical_t4_measurements() -> Tuple[DispatchMeasurement, ...]:
-    """Return the one exact integrated T4 measurement already validated.
+    """Return exact integrated T4 measurements that cleared every gate.
 
-    This is intentionally narrow.  It does not generalize the result to the
-    organizer appendix; those keys remain native until measured independently.
+    These entries are deliberately narrow: the dispatch key includes the
+    complete workload, device capability, and PyTorch version, so a result is
+    never generalized to a nearby official shape without independent data.
     """
 
     key = AttentionDispatchKey(
@@ -218,6 +219,32 @@ def historical_t4_measurements() -> Tuple[DispatchMeasurement, ...]:
         compute_capability=(7, 5),
         torch_version="2.11.0",
     )
+    shape3_key = AttentionDispatchKey(
+        batch_size=4,
+        seq_len=128,
+        d_model=128,
+        num_heads=4,
+        dtype="torch.float16",
+        causal=True,
+        padding="none",
+        device_type="cuda",
+        device_index=0,
+        compute_capability=(7, 5),
+        torch_version="2.11.0",
+    )
+    shape4_key = AttentionDispatchKey(
+        batch_size=16,
+        seq_len=128,
+        d_model=128,
+        num_heads=4,
+        dtype="torch.float16",
+        causal=True,
+        padding="none",
+        device_type="cuda",
+        device_index=0,
+        compute_capability=(7, 5),
+        torch_version="2.11.0",
+    )
     return (
         DispatchMeasurement(
             key=key,
@@ -226,6 +253,22 @@ def historical_t4_measurements() -> Tuple[DispatchMeasurement, ...]:
             process_speedups=(1.333, 1.325, 1.327),
             baseline_p90_ms=(27.8528, 28.3276, 29.0056),
             optimized_p90_ms=(21.0168, 21.4778, 21.9393),
+        ),
+        DispatchMeasurement(
+            key=shape3_key,
+            suffix_layers=1,
+            correctness_passed=True,
+            process_speedups=(1.497, 1.435, 1.481),
+            baseline_p90_ms=(3.4001, 4.5934, 3.4165),
+            optimized_p90_ms=(2.1672, 3.6061, 2.3229),
+        ),
+        DispatchMeasurement(
+            key=shape4_key,
+            suffix_layers=1,
+            correctness_passed=True,
+            process_speedups=(1.448, 1.460, 1.447),
+            baseline_p90_ms=(5.9553, 3.3555, 4.4701),
+            optimized_p90_ms=(4.1014, 2.4126, 3.7307),
         ),
     )
 
