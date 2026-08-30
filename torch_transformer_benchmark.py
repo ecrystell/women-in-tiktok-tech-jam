@@ -640,6 +640,7 @@ class UserOptimizedTransformer(BaselineTransformer):
         self,
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
+        fast_ffn_suffix_layers: Optional[int] = None,
     ) -> int:
         """Prepare and validate guarded FFN paths for a representative call.
 
@@ -647,13 +648,24 @@ class UserOptimizedTransformer(BaselineTransformer):
         model gives each layer a representative activation while preserving
         the exact mask object needed by the optional padded-row fast path.
         """
+        if fast_ffn_suffix_layers is None:
+            fast_ffn_suffix_layers = len(self.layers)
+        if not 0 <= fast_ffn_suffix_layers <= len(self.layers):
+            raise ValueError("fast_ffn_suffix_layers must be between 0 and num_layers")
+
+        first_fast_layer = len(self.layers) - fast_ffn_suffix_layers
+        for layer in self.layers:
+            layer._fast_ffn_enabled = False
+
         prepared_layers = 0
         with torch.inference_mode():
-            for layer in self.layers:
+            for index, layer in enumerate(self.layers):
                 x = x + layer.attention(
                     layer.norm1(x), valid_token_mask, self.config.causal
                 )
-                if layer.prepare_fast_ffn(x, valid_token_mask):
+                if index >= first_fast_layer and layer.prepare_fast_ffn(
+                    x, valid_token_mask
+                ):
                     prepared_layers += 1
                 x = layer._ffn_residual(x, valid_token_mask)
         return prepared_layers
@@ -1113,6 +1125,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--non-strict-weight-copy", action="store_true")
     parser.add_argument(
+        "--fast-ffn-suffix-layers",
+        type=int,
+        default=0,
+        help="experimentally enable the guarded FFN in only the final N layers",
+    )
+    parser.add_argument(
         "--matmul-precision",
         choices=("highest", "high", "medium"),
         default="high",
@@ -1139,6 +1157,8 @@ def validate_args(args: argparse.Namespace, device: torch.device, dtype: torch.d
         raise ValueError("warmup must be non-negative")
     if args.repeats <= 0 or args.benchmark_rounds <= 0:
         raise ValueError("repeats and benchmark_rounds must be positive")
+    if not 0 <= args.fast_ffn_suffix_layers <= args.layers:
+        raise ValueError("fast_ffn_suffix_layers must be between 0 and --layers")
     if device.type == "cpu" and dtype == torch.float16:
         print("[warning] float16 CPU kernels may be unsupported or slow")
 
@@ -1189,7 +1209,10 @@ def main() -> int:
         padding_ratio=args.padding_ratio,
         input_scale=args.input_scale,
     )
-    prepared_ffn_layers = optimized.prepare_for_inference(*benchmark_case)
+    prepared_ffn_layers = optimized.prepare_for_inference(
+        *benchmark_case,
+        fast_ffn_suffix_layers=args.fast_ffn_suffix_layers,
+    )
     attention_backend = optimized.attention_backend
 
     # Compile only after model construction, weight copy, device transfer, and eval().
@@ -1202,6 +1225,7 @@ def main() -> int:
     if device.type == "cuda":
         print(f"gpu={torch.cuda.get_device_name(device)}")
     print(f"attention_backend={attention_backend}")
+    print(f"requested_fast_ffn_suffix_layers={args.fast_ffn_suffix_layers}")
     print(
         f"fast_ffn_layers={prepared_ffn_layers}/{config.num_layers} "
         "(unsupported layers use the native fallback)"

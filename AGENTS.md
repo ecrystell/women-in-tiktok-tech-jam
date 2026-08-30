@@ -197,6 +197,16 @@ maximum absolute errors from 0.0078125 and thousands of failed elements across
 five trials. The next diagnostic must test partial FFN layer selection; the
 six-layer FFN fallback is not a valid universal production dispatch.
 
+The B8/S512 layer-selection diagnostic found that the first four individual
+fast FFN layers failed strict full-model accuracy. Layers 5 and 6 passed
+individually, and the final two-layer suffix passed together with zero failed
+elements for seed 1234; a final three-layer suffix failed 23 elements. This is
+candidate evidence, not dispatch evidence, until the two-layer suffix passes
+all benchmark accuracy trials and repeated timing. The main benchmark now
+defaults to zero fast FFN layers and exposes `--fast-ffn-suffix-layers` only
+for controlled validation. Do not change the safe default until a shape has
+repeatable strict-correct speedup evidence.
+
 Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
 `f50ef57` are both contained by integration merge `99c1830` (Person 2 entered
 at merge `f6d897a`). The T4-validated source-code tree is `d57502e`; the final

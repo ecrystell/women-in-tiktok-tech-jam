@@ -164,6 +164,36 @@ class Person3IntegrationTests(unittest.TestCase):
                 len(optimized.layers),
             )
 
+        def enable_fast_ffn(layer, _x, _mask):
+            layer._fast_ffn_enabled = True
+            return True
+
+        with mock.patch.object(
+            UserOptimizedTransformerBlock,
+            "prepare_fast_ffn",
+            autospec=True,
+            side_effect=enable_fast_ffn,
+        ) as prepare:
+            self.assertEqual(
+                optimized.prepare_for_inference(
+                    x, mask, fast_ffn_suffix_layers=1
+                ),
+                1,
+            )
+            self.assertEqual(prepare.call_count, 1)
+        self.assertFalse(optimized.layers[0]._fast_ffn_enabled)
+        self.assertTrue(optimized.layers[-1]._fast_ffn_enabled)
+
+        self.assertEqual(
+            optimized.prepare_for_inference(x, mask, fast_ffn_suffix_layers=0),
+            0,
+        )
+        self.assertTrue(
+            all(not layer._fast_ffn_enabled for layer in optimized.layers)
+        )
+        with self.assertRaisesRegex(ValueError, "between 0 and num_layers"):
+            optimized.prepare_for_inference(x, mask, fast_ffn_suffix_layers=3)
+
     def test_sweep_parser_reads_strict_result_and_timings(self) -> None:
         output = """
 summary: PASS | max_abs=0.0001 | max_rel=0.02 | failed=0/1024

@@ -87,6 +87,7 @@ def build_command(
     warmup: int,
     repeats: int,
     rounds: int,
+    fast_ffn_suffix_layers: int,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -115,6 +116,8 @@ def build_command(
         str(repeats),
         "--benchmark-rounds",
         str(rounds),
+        "--fast-ffn-suffix-layers",
+        str(fast_ffn_suffix_layers),
     ]
     if case.causal:
         command.append("--causal")
@@ -131,6 +134,7 @@ def parse_args() -> argparse.Namespace:
         default="auto",
     )
     parser.add_argument("--processes", type=int)
+    parser.add_argument("--fast-ffn-suffix-layers", type=int, default=0)
     parser.add_argument(
         "--skip-long",
         action="store_true",
@@ -139,6 +143,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.processes is not None and args.processes <= 0:
         parser.error("--processes must be positive")
+    if args.fast_ffn_suffix_layers < 0:
+        parser.error("--fast-ffn-suffix-layers must be nonnegative")
     return args
 
 
@@ -160,7 +166,8 @@ def main() -> int:
 
     print(
         f"mode={args.mode} device={device} dtype={dtype} processes={processes} "
-        f"warmup={warmup} repeats={repeats} rounds={rounds}"
+        f"warmup={warmup} repeats={repeats} rounds={rounds} "
+        f"fast_ffn_suffix_layers={args.fast_ffn_suffix_layers}"
     )
     correctness_failed = False
     execution_failed = False
@@ -168,7 +175,15 @@ def main() -> int:
     for case in cases:
         results: list[RunResult] = []
         print(f"\n[{case.label}]")
-        command = build_command(case, device, dtype, warmup, repeats, rounds)
+        command = build_command(
+            case,
+            device,
+            dtype,
+            warmup,
+            repeats,
+            rounds,
+            args.fast_ffn_suffix_layers,
+        )
         for process_index in range(processes):
             completed = subprocess.run(command, capture_output=True, text=True)
             if completed.returncode != 0:
