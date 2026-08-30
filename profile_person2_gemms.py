@@ -14,7 +14,13 @@ import torch
 import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile
 
-from bench_person2_ffn import Case, SWEEP_SHAPES, make_input, percentile
+from bench_person2_ffn import (
+    Case,
+    SWEEP_SHAPES,
+    make_input,
+    official_isolated_cases,
+    percentile,
+)
 from torch_transformer_benchmark import BaselineTransformerBlock
 
 
@@ -131,7 +137,15 @@ def print_result(result: GemmResult) -> None:
 
 
 def cases_from_args(args: argparse.Namespace) -> Iterable[Case]:
-    if args.sweep:
+    if args.suite == "official":
+        cases = official_isolated_cases()
+        if args.official_case:
+            requested = set(args.official_case)
+            cases = tuple(
+                case for case in cases if requested.intersection(case.official_ids)
+            )
+        return cases
+    if args.suite == "legacy" or args.sweep:
         return (Case(*shape) for shape in SWEEP_SHAPES)
     return (
         Case(
@@ -148,6 +162,10 @@ def cases_from_args(args: argparse.Namespace) -> Iterable[Case]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--suite", choices=("custom", "legacy", "official"), default="custom"
+    )
+    parser.add_argument("--official-case", action="append", type=int)
     parser.add_argument("--sweep", action="store_true")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=512)
@@ -166,6 +184,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.sweep and args.suite != "custom":
+        raise ValueError("--sweep is a legacy-suite alias and cannot be combined")
+    if args.official_case and args.suite != "official":
+        raise ValueError("--official-case requires --suite official")
     if not torch.cuda.is_available():
         raise RuntimeError("the per-GEMM profile requires CUDA")
     device = torch.device("cuda")

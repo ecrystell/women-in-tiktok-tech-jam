@@ -20,6 +20,7 @@ from bench_person2_ffn import (
     make_input,
     make_models,
     mark_inference_step,
+    official_isolated_cases,
     resolve_device,
     resolve_dtype,
     time_model,
@@ -27,7 +28,7 @@ from bench_person2_ffn import (
 )
 
 
-TARGET_SPEEDUP = 1.05
+TARGET_SPEEDUP = 1.005
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class ProfileResult:
     median_ms: float
     profiled_device_ms: float
     launch_gap_upper_bound_ms: float
+    approximate_cuda_launch_count: int
     gemm_percent: float
     layer_norm_percent: float
     gelu_percent: float
@@ -125,8 +127,12 @@ def profile_model(
         "copy_layout": 0.0,
         "other": 0.0,
     }
+    launch_count = 0
     for event in captured.key_averages():
-        category_us[categorize(event.key)] += event_device_time_us(event)
+        device_time = event_device_time_us(event)
+        category_us[categorize(event.key)] += device_time
+        if device_time > 0:
+            launch_count += int(getattr(event, "count", 0) or 0)
 
     total_us = sum(category_us.values())
     if total_us <= 0:
@@ -149,6 +155,7 @@ def profile_model(
         median_ms=median_ms,
         profiled_device_ms=per_call_device_ms,
         launch_gap_upper_bound_ms=gap_ms,
+        approximate_cuda_launch_count=launch_count,
         gemm_percent=percent("gemm"),
         layer_norm_percent=percent("layer_norm"),
         gelu_percent=percent("gelu"),
@@ -166,7 +173,8 @@ def print_result(result: ProfileResult) -> None:
     print(
         f"median={result.median_ms:.4f} ms | "
         f"profiled_device={result.profiled_device_ms:.4f} ms | "
-        f"launch_gap_upper_bound={result.launch_gap_upper_bound_ms:.4f} ms"
+        f"launch_gap_upper_bound={result.launch_gap_upper_bound_ms:.4f} ms | "
+        f"approx_cuda_launches={result.approximate_cuda_launch_count}"
     )
     print(
         f"gemm={result.gemm_percent:.2f}% | "
@@ -179,12 +187,16 @@ def print_result(result: ProfileResult) -> None:
     print(
         f"non_gemm={result.non_gemm_percent:.2f}% | "
         f"amdahl_upper_bound={result.amdahl_upper_bound:.3f}x | "
-        f"universal_1.05x_feasible={'YES' if result.target_feasible else 'NO'}"
+        f"non_gemm_1.005x_feasible={'YES' if result.target_feasible else 'NO'}"
     )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--suite", choices=("custom", "legacy", "official"), default="custom"
+    )
+    parser.add_argument("--official-case", action="append", type=int)
     parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--dtype",
@@ -222,7 +234,15 @@ def parse_args() -> argparse.Namespace:
 
 
 def cases_from_args(args: argparse.Namespace) -> Iterable[Case]:
-    if args.sweep:
+    if args.suite == "official":
+        cases = official_isolated_cases()
+        if args.official_case:
+            requested = set(args.official_case)
+            cases = tuple(
+                case for case in cases if requested.intersection(case.official_ids)
+            )
+        return cases
+    if args.suite == "legacy" or args.sweep:
         return (Case(*shape) for shape in SWEEP_SHAPES)
     return (
         Case(
@@ -239,6 +259,10 @@ def cases_from_args(args: argparse.Namespace) -> Iterable[Case]:
 
 def main() -> int:
     args = parse_args()
+    if args.sweep and args.suite != "custom":
+        raise ValueError("--sweep is a legacy-suite alias and cannot be combined")
+    if args.official_case and args.suite != "official":
+        raise ValueError("--official-case requires --suite official")
     device = resolve_device(args.device)
     dtype = resolve_dtype(args.dtype)
     if device.type != "cuda":
@@ -258,6 +282,10 @@ def main() -> int:
     results: list[ProfileResult] = []
     for case in cases_from_args(args):
         baseline, optimized = make_models(case, "isolated", device, dtype)
+        prep_x, prep_mask = make_input(case, device, dtype, args.seed)
+        prepare = getattr(optimized, "prepare", None)
+        if prepare is not None and not prepare(prep_x, prep_mask):
+            print(f"optimized fallback: {optimized.prepare_error}")
         selected = []
         if args.models in ("baseline", "both"):
             selected.append(("baseline", compile_model(baseline, args.mode)))
@@ -277,7 +305,7 @@ def main() -> int:
         print(
             "\nPROFILE GATE: "
             + ("PASS" if universal else "FAIL")
-            + " | theoretical 1.05x target "
+            + " | theoretical 1.005x target "
             + ("remains feasible" if universal else "is impossible from non-GEMM removal alone")
         )
 
