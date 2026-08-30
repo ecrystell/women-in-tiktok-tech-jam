@@ -55,12 +55,14 @@ allocated.
 
 ## Validation status
 
-The updated T4 checkout passes 52 tests with one expected opt-in skip. The
-official CUDA smoke sweep passed IDs 1–13; automatic dispatch selected packed
-SDPA only for IDs 3 and 4, with native fallback for every other official
-shape. Dedicated three-process final runs for IDs 3 and 4 passed correctness,
-repeatability, and p90 gates. The original full-batch ID 14 harness remains
-blocked; use the batch-blocked evaluator for its memory-safe result.
+The updated T4 checkout passes 53 tests with one expected opt-in skip. The
+official CUDA smoke sweep passed strict correctness for IDs 1–13; automatic
+dispatch selected packed SDPA only for IDs 3 and 4, with native fallback for
+every other official shape. ID 9 was correctness-safe but received
+`SMOKE-REVIEW` because of p90 timing variability. Dedicated three-process final
+runs for IDs 3 and 4 passed correctness, repeatability, and p90 gates. The
+original full-batch ID 14 harness remains blocked; use the batch-blocked
+evaluator for its memory-safe result.
 
 No benchmark timing is emitted after strict accuracy failure. Generated timing
 results are not written to tracked files.
