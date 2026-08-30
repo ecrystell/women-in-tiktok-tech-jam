@@ -420,6 +420,30 @@ class Person2CudaTests(unittest.TestCase):
         self.assertEqual(first.data_ptr(), second.data_ptr())
         assert_or_close(self, x * 2, second)
 
+    def test_cuda_masked_post_supports_more_than_65535_rows(self) -> None:
+        from torch.utils.cpp_extension import CUDA_HOME
+
+        if CUDA_HOME is None:
+            self.skipTest("a CUDA toolkit is unavailable for extension build")
+        device = torch.device("cuda")
+        baseline, optimized = Person2BlockTests.make_blocks(
+            device, torch.float16
+        )
+        x = torch.randn(512, 128, 32, device=device, dtype=torch.float16)
+        mask = torch.ones(512, 128, device=device, dtype=torch.bool)
+        self.assertEqual(mask.numel(), 65536)
+        self.assertTrue(
+            optimized.prepare_fast_ffn(x, mask), optimized.fast_ffn_error
+        )
+        with torch.inference_mode():
+            reference = x + baseline.ffn_out(
+                torch.nn.functional.gelu(
+                    baseline.ffn_in(baseline.norm2(x)), approximate="none"
+                )
+            )
+            candidate = optimized._ffn_residual(x, mask)
+        assert_or_close(self, reference, candidate)
+
     def test_cuda_full_op_masked_and_unmasked(self) -> None:
         from torch.utils.cpp_extension import CUDA_HOME
 
