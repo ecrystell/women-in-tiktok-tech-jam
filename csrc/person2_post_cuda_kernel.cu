@@ -39,13 +39,12 @@ __global__ void residual_masked_half2(
     const half2* residual,
     const bool* valid_token_mask,
     half2* output,
-    int64_t rows,
+    int64_t pairs,
     int64_t pairs_per_row) {
-  const int64_t row = blockIdx.y;
-  const int64_t column =
+  const int64_t index =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (row < rows && column < pairs_per_row) {
-    const int64_t index = row * pairs_per_row + column;
+  if (index < pairs) {
+    const int64_t row = index / pairs_per_row;
     output[index] = valid_token_mask[row]
         ? __hadd2(update[index], residual[index])
         : __float2half2_rn(0.0f);
@@ -74,13 +73,12 @@ __global__ void residual_masked_half8(
     const int4* residual,
     const bool* valid_token_mask,
     int4* output,
-    int64_t rows,
+    int64_t vectors,
     int64_t vectors_per_row) {
-  const int64_t row = blockIdx.y;
-  const int64_t column =
+  const int64_t index =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (row < rows && column < vectors_per_row) {
-    const int64_t index = row * vectors_per_row + column;
+  if (index < vectors) {
+    const int64_t row = index / vectors_per_row;
     Half8 result;
     if (valid_token_mask[row]) {
       Half8 left;
@@ -142,31 +140,29 @@ void residual_masked_cuda(
   const int64_t pairs_per_row = update.size(1) / 2;
   if (update.size(1) % 8 == 0) {
     const int64_t vectors_per_row = update.size(1) / 8;
-    constexpr int vector_threads = 128;
-    const dim3 vector_blocks(
-        static_cast<unsigned int>(
-            (vectors_per_row + vector_threads - 1) / vector_threads),
-        static_cast<unsigned int>(rows));
+    const int64_t vectors = rows * vectors_per_row;
+    constexpr int vector_threads = 256;
+    const int64_t vector_blocks =
+        (vectors + vector_threads - 1) / vector_threads;
     residual_masked_half8<<<vector_blocks, vector_threads, 0, stream>>>(
         reinterpret_cast<const int4*>(update.data_ptr<at::Half>()),
         reinterpret_cast<const int4*>(residual.data_ptr<at::Half>()),
         valid_token_mask.data_ptr<bool>(),
         reinterpret_cast<int4*>(output.data_ptr<at::Half>()),
-        rows,
+        vectors,
         vectors_per_row);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }
+  const int64_t pairs = rows * pairs_per_row;
   constexpr int threads = 256;
-  const dim3 blocks(
-      static_cast<unsigned int>((pairs_per_row + threads - 1) / threads),
-      static_cast<unsigned int>(rows));
+  const int64_t blocks = (pairs + threads - 1) / threads;
   residual_masked_half2<<<blocks, threads, 0, stream>>>(
       reinterpret_cast<const half2*>(update.data_ptr<at::Half>()),
       reinterpret_cast<const half2*>(residual.data_ptr<at::Half>()),
       valid_token_mask.data_ptr<bool>(),
       reinterpret_cast<half2*>(output.data_ptr<at::Half>()),
-      rows,
+      pairs,
       pairs_per_row);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
