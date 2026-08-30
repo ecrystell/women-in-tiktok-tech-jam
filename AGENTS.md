@@ -316,6 +316,16 @@ core with FP32 normalization statistics. The organizer requires 20 warmups;
 the shape-14 harness now defaults to 20, and reduced warmup counts are
 diagnostic-only rather than reportable performance evidence.
 
+`separate-triton-all` also failed at B2/S4096/D1024/H16: two of 4,194,304
+elements failed with maximum absolute error 0.0078125. The root cause is now
+isolated to attention-core arithmetic. The reference rounds FP16 scores before
+FP32 softmax and casts probabilities to FP16 before the value matmul; fused
+SDPA and the Triton online-softmax kernel use different intermediate precision
+and reduction order. `--attention-plan explicit-tiled-all` is the exact
+recovery candidate: it preserves the reference operator order while bounding
+score memory by query tiles. `--candidate-query-block` independently tunes the
+candidate tile size, defaulting to 64 versus the reference harness's 16.
+
 Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
 `f50ef57` are both contained by integration merge `99c1830` (Person 2 entered
 at merge `f6d897a`). The T4-validated source-code tree is `d57502e`; the final

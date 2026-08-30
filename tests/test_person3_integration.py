@@ -51,7 +51,9 @@ class Person3IntegrationTests(unittest.TestCase):
         torch.manual_seed(99)
         baseline = BaselineSelfAttention(32, 4).eval()
         tiled = QueryTiledSelfAttention(32, 4, query_block=3).eval()
+        wider_tiled = QueryTiledSelfAttention(32, 4, query_block=5).eval()
         tiled.load_state_dict(baseline.state_dict())
+        wider_tiled.load_state_dict(baseline.state_dict())
         x = torch.randn(2, 7, 32)
         masks = (
             None,
@@ -68,7 +70,9 @@ class Person3IntegrationTests(unittest.TestCase):
                 with torch.inference_mode():
                     expected = baseline(x, mask, causal)
                     actual = tiled(x, mask, causal)
+                    wider_actual = wider_tiled(x, mask, causal)
                 self.assertTrue(torch.equal(expected, actual))
+                self.assertTrue(torch.equal(expected, wider_actual))
 
     def test_separate_qkv_sdpa_preserves_baseline_parameters(self) -> None:
         torch.manual_seed(100)

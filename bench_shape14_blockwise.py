@@ -191,12 +191,19 @@ def parse_args() -> argparse.Namespace:
             "separate-all",
             "separate-then-packed",
             "separate-triton-all",
+            "explicit-tiled-all",
         ),
         default="packed-all",
         help="choose projection rounding while retaining an SDPA attention core",
     )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument(
+        "--candidate-query-block",
+        type=int,
+        default=64,
+        help="query tile used by the exact explicit-tiled candidate",
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--atol", type=float, default=0.001)
     parser.add_argument("--rtol", type=float, default=0.01)
@@ -211,6 +218,8 @@ def main() -> int:
         raise ValueError("logical-batch must be divisible by batch-block")
     if args.warmup < 0 or args.repeats <= 0:
         raise ValueError("warmup must be nonnegative and repeats must be positive")
+    if args.candidate_query_block <= 0:
+        raise ValueError("candidate-query-block must be positive")
 
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -233,7 +242,15 @@ def main() -> int:
     optimized = UserOptimizedTransformer(
         config, packed_sdpa_suffix_layers=config.num_layers
     )
-    if args.attention_plan == "separate-triton-all":
+    if args.attention_plan == "explicit-tiled-all":
+        for index in range(config.num_layers):
+            optimized.layers[index].attention = QueryTiledSelfAttention(
+                config.d_model,
+                config.num_heads,
+                args.candidate_query_block,
+            )
+        separate_layers = ()
+    elif args.attention_plan == "separate-triton-all":
         for index in range(config.num_layers):
             optimized.layers[index].attention = SeparateQKVTritonAttention(
                 config.d_model, config.num_heads
@@ -276,6 +293,7 @@ def main() -> int:
     print(
         f"logical_shape=({args.logical_batch}, {args.seq_len}, {args.d_model}) "
         f"block_shape={tuple(x.shape)} query_block={args.query_block} "
+        f"candidate_query_block={args.candidate_query_block} "
         f"attention_plan={args.attention_plan} dtype={dtype} "
         f"gpu={torch.cuda.get_device_name(device)}"
     )
