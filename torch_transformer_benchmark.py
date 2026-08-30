@@ -26,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import person2_ffn_post
+from person1_triton_attention import PackedQKVSDPAAttention
 
 
 @dataclass(frozen=True)
@@ -560,6 +561,17 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
 class UserOptimizedTransformerBlock(OptimizedTransformerBlock):
     """Production block using strict-safe attention and the guarded FFN."""
 
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        ffn_dim: int,
+        use_packed_sdpa: bool = False,
+    ) -> None:
+        super().__init__(d_model, num_heads, ffn_dim)
+        if use_packed_sdpa:
+            self.attention = PackedQKVSDPAAttention(d_model, num_heads)
+
 
 class BaselineTransformer(nn.Module):
     def __init__(self, config: TransformerConfig) -> None:
@@ -589,19 +601,32 @@ class BaselineTransformer(nn.Module):
 
 
 class UserOptimizedTransformer(BaselineTransformer):
-    """Transformer using baseline attention and the validated optimized FFN."""
+    """Transformer with explicitly guarded attention and FFN experiments."""
 
-    def __init__(self, config: TransformerConfig) -> None:
+    def __init__(
+        self,
+        config: TransformerConfig,
+        packed_sdpa_suffix_layers: int = 0,
+    ) -> None:
+        if not 0 <= packed_sdpa_suffix_layers <= config.num_layers:
+            raise ValueError(
+                "packed_sdpa_suffix_layers must be between 0 and num_layers"
+            )
         # Construct the optimized hierarchy directly while preserving the
         # baseline parameter names required by strict weight transfer.
         nn.Module.__init__(self)
         self.config = config
+        self.packed_sdpa_suffix_layers = packed_sdpa_suffix_layers
+        first_packed_layer = config.num_layers - packed_sdpa_suffix_layers
         self.layers = nn.ModuleList(
             [
                 UserOptimizedTransformerBlock(
-                    config.d_model, config.num_heads, config.ffn_dim
+                    config.d_model,
+                    config.num_heads,
+                    config.ffn_dim,
+                    use_packed_sdpa=index >= first_packed_layer,
                 )
-                for _ in range(config.num_layers)
+                for index in range(config.num_layers)
             ]
         )
         self.final_norm = nn.LayerNorm(config.d_model)
@@ -622,9 +647,16 @@ class UserOptimizedTransformer(BaselineTransformer):
             target_layer.norm1.load_state_dict(
                 source_layer.norm1.state_dict(), strict=strict
             )
-            target_layer.attention.load_state_dict(
-                source_layer.attention.state_dict(), strict=strict
-            )
+            if isinstance(target_layer.attention, PackedQKVSDPAAttention):
+                target_layer.attention.copy_from_baseline(source_layer.attention)
+            elif isinstance(target_layer.attention, BaselineSelfAttention):
+                target_layer.attention.load_state_dict(
+                    source_layer.attention.state_dict(), strict=strict
+                )
+            else:
+                raise TypeError(
+                    "optimized attention must be baseline or packed SDPA"
+                )
             target_layer.norm2.load_state_dict(
                 source_layer.norm2.state_dict(), strict=strict
             )
@@ -702,6 +734,8 @@ class UserOptimizedTransformer(BaselineTransformer):
 
     @property
     def attention_backend(self) -> str:
+        if self.packed_sdpa_suffix_layers:
+            return f"packed-sdpa-suffix:{self.packed_sdpa_suffix_layers}"
         return "baseline"
 
     @property
@@ -1198,6 +1232,12 @@ def parse_args() -> argparse.Namespace:
         help="experimentally enable the guarded FFN in only the final N layers",
     )
     parser.add_argument(
+        "--packed-sdpa-suffix-layers",
+        type=int,
+        default=0,
+        help="experimentally use packed SDPA in only the final N layers",
+    )
+    parser.add_argument(
         "--matmul-precision",
         choices=("highest", "high", "medium"),
         default="high",
@@ -1226,6 +1266,10 @@ def validate_args(args: argparse.Namespace, device: torch.device, dtype: torch.d
         raise ValueError("repeats and benchmark_rounds must be positive")
     if not 0 <= args.fast_ffn_suffix_layers <= args.layers:
         raise ValueError("fast_ffn_suffix_layers must be between 0 and --layers")
+    if not 0 <= args.packed_sdpa_suffix_layers <= args.layers:
+        raise ValueError(
+            "packed_sdpa_suffix_layers must be between 0 and --layers"
+        )
     if device.type == "cpu" and dtype == torch.float16:
         print("[warning] float16 CPU kernels may be unsupported or slow")
 
@@ -1255,7 +1299,10 @@ def main() -> int:
         torch.backends.cudnn.allow_tf32 = args.allow_tf32
 
     baseline = BaselineTransformer(config)
-    optimized = UserOptimizedTransformer(config)
+    optimized = UserOptimizedTransformer(
+        config,
+        packed_sdpa_suffix_layers=args.packed_sdpa_suffix_layers,
+    )
     copy_model_weights(
         baseline,
         optimized,
@@ -1296,6 +1343,10 @@ def main() -> int:
         print(f"gpu={torch.cuda.get_device_name(device)}")
     print(f"attention_backend={attention_backend}")
     print(f"mask_dispatch={mask_dispatch}")
+    print(
+        "requested_packed_sdpa_suffix_layers="
+        f"{args.packed_sdpa_suffix_layers}"
+    )
     print(f"requested_fast_ffn_suffix_layers={args.fast_ffn_suffix_layers}")
     print(
         f"fast_ffn_layers={prepared_ffn_layers}/{config.num_layers} "

@@ -8,6 +8,7 @@ from unittest import mock
 
 import torch
 
+from person1_triton_attention import PackedQKVSDPAAttention
 from run_sweep import parse_result
 from torch_transformer_benchmark import (
     BaselineSelfAttention,
@@ -71,6 +72,78 @@ class Person3IntegrationTests(unittest.TestCase):
             )
         )
         self.assertEqual(optimized.attention_backend, "baseline")
+
+    def test_packed_sdpa_suffix_uses_only_final_layers(self) -> None:
+        config = TransformerConfig(2, 7, 32, 4, 64, 3, False)
+        optimized = UserOptimizedTransformer(
+            config, packed_sdpa_suffix_layers=1
+        )
+
+        self.assertTrue(
+            all(
+                isinstance(layer.attention, BaselineSelfAttention)
+                for layer in optimized.layers[:-1]
+            )
+        )
+        self.assertIsInstance(
+            optimized.layers[-1].attention, PackedQKVSDPAAttention
+        )
+        self.assertEqual(optimized.attention_backend, "packed-sdpa-suffix:1")
+
+        with self.assertRaisesRegex(ValueError, "between 0 and num_layers"):
+            UserOptimizedTransformer(config, packed_sdpa_suffix_layers=4)
+
+    def test_packed_sdpa_suffix_weight_transfer_uses_qkv_row_order(self) -> None:
+        config = TransformerConfig(2, 7, 32, 4, 64, 2, False)
+        torch.manual_seed(102)
+        baseline = BaselineTransformer(config).eval()
+        optimized = UserOptimizedTransformer(
+            config, packed_sdpa_suffix_layers=1
+        ).eval()
+        copy_model_weights(baseline, optimized)
+
+        source = baseline.layers[-1].attention
+        packed = optimized.layers[-1].attention
+        expected_weight = torch.cat(
+            [source.q_proj.weight, source.k_proj.weight, source.v_proj.weight]
+        )
+        expected_bias = torch.cat(
+            [source.q_proj.bias, source.k_proj.bias, source.v_proj.bias]
+        )
+        self.assertTrue(torch.equal(packed.qkv_proj.weight, expected_weight))
+        self.assertTrue(torch.equal(packed.qkv_proj.bias, expected_bias))
+        self.assertTrue(
+            torch.equal(packed.out_proj.weight, source.out_proj.weight)
+        )
+
+    def test_packed_sdpa_suffix_cpu_end_to_end(self) -> None:
+        torch.manual_seed(104)
+        x = torch.randn(2, 7, 32)
+        masks = (
+            None,
+            torch.ones(2, 7, dtype=torch.bool),
+            torch.tensor(
+                [
+                    [True, True, True, True, True, True, True],
+                    [True, True, True, True, False, False, False],
+                ]
+            ),
+        )
+
+        for causal in (False, True):
+            config = TransformerConfig(2, 7, 32, 4, 64, 2, causal)
+            baseline = BaselineTransformer(config).eval()
+            optimized = UserOptimizedTransformer(
+                config, packed_sdpa_suffix_layers=1
+            ).eval()
+            copy_model_weights(baseline, optimized)
+            for mask in masks:
+                with torch.inference_mode():
+                    reference = baseline(x, mask)
+                    candidate = optimized(x, mask)
+                assert_or_close(self, reference, candidate)
+                if mask is not None:
+                    self.assertTrue(bool((candidate[~mask] == 0).all().item()))
 
     def test_weight_transfer_preserves_attention_and_refreshes_ffn_state(self) -> None:
         baseline, optimized = self.make_models()

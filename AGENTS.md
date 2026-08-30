@@ -228,6 +228,15 @@ the correctness, median-speedup, and p90 gates. This validates dispatch for
 that exact all-valid shape family; padded, causal, short, long, and other batch
 or model shapes still require separate measurements before broader claims.
 
+The next accuracy-recovery experiment adds
+`--packed-sdpa-suffix-layers N`, defaulting to zero. It constructs Person 1's
+canonical `PackedQKVSDPAAttention` only in the final N transformer layers so
+its FP16 differences have fewer later residual blocks in which to accumulate.
+Weight transfer still packs rows in exact `[Q; K; V]` order, the FFN experiment
+remains disabled independently, and invalid suffix counts are rejected. Start
+T4 validation with N=1 and increase only after five-trial strict correctness;
+this is an experimental control, not a production dispatch or speedup claim.
+
 Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
 `f50ef57` are both contained by integration merge `99c1830` (Person 2 entered
 at merge `f6d897a`). The T4-validated source-code tree is `d57502e`; the final

@@ -88,6 +88,7 @@ def build_command(
     repeats: int,
     rounds: int,
     fast_ffn_suffix_layers: int,
+    packed_sdpa_suffix_layers: int,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -118,6 +119,8 @@ def build_command(
         str(rounds),
         "--fast-ffn-suffix-layers",
         str(fast_ffn_suffix_layers),
+        "--packed-sdpa-suffix-layers",
+        str(packed_sdpa_suffix_layers),
     ]
     if case.causal:
         command.append("--causal")
@@ -135,6 +138,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--processes", type=int)
     parser.add_argument("--fast-ffn-suffix-layers", type=int, default=0)
+    parser.add_argument("--packed-sdpa-suffix-layers", type=int, default=0)
     parser.add_argument(
         "--skip-long",
         action="store_true",
@@ -145,6 +149,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--processes must be positive")
     if args.fast_ffn_suffix_layers < 0:
         parser.error("--fast-ffn-suffix-layers must be nonnegative")
+    if args.packed_sdpa_suffix_layers < 0:
+        parser.error("--packed-sdpa-suffix-layers must be nonnegative")
     return args
 
 
@@ -167,7 +173,8 @@ def main() -> int:
     print(
         f"mode={args.mode} device={device} dtype={dtype} processes={processes} "
         f"warmup={warmup} repeats={repeats} rounds={rounds} "
-        f"fast_ffn_suffix_layers={args.fast_ffn_suffix_layers}"
+        f"fast_ffn_suffix_layers={args.fast_ffn_suffix_layers} "
+        f"packed_sdpa_suffix_layers={args.packed_sdpa_suffix_layers}"
     )
     correctness_failed = False
     execution_failed = False
@@ -183,6 +190,7 @@ def main() -> int:
             repeats,
             rounds,
             args.fast_ffn_suffix_layers,
+            args.packed_sdpa_suffix_layers,
         )
         for process_index in range(processes):
             completed = subprocess.run(command, capture_output=True, text=True)
