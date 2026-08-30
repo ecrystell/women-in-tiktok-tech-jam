@@ -8,8 +8,8 @@ import argparse
 import torch
 import torch.nn as nn
 
+from person1_triton_attention import PackedQKVSDPAAttention
 from torch_transformer_benchmark import (
-    BaselineSelfAttention,
     BaselineTransformer,
     OptimizedTransformerBlock,
     TransformerConfig,
@@ -64,13 +64,13 @@ def make_sdpa_prefix_model(
     copy_model_weights(baseline, model)
     model = model.to(device=device, dtype=dtype).eval()
 
-    for index in range(packed_layers, baseline.config.num_layers):
+    for index in range(packed_layers):
         source_attention = baseline.layers[index].attention
-        fallback = BaselineSelfAttention(
+        packed_attention = PackedQKVSDPAAttention(
             baseline.config.d_model, baseline.config.num_heads
         ).to(device=device, dtype=dtype)
-        fallback.load_state_dict(source_attention.state_dict(), strict=True)
-        model.layers[index].attention = fallback.eval()
+        packed_attention.copy_from_baseline(source_attention)
+        model.layers[index].attention = packed_attention.eval()
     return model
 
 
@@ -135,17 +135,17 @@ def main() -> int:
         torch.backends.cudnn.allow_tf32 = True
 
     baseline = BaselineTransformer(config)
-    packed_native = UserOptimizedTransformer(config)
     ffn_only = FFNOnlyTransformer(config)
-    combined = UserOptimizedTransformer(config)
-    copy_model_weights(baseline, packed_native)
     copy_model_weights(baseline, ffn_only)
-    copy_model_weights(baseline, combined)
 
     baseline = baseline.to(device=device, dtype=dtype).eval()
-    packed_native = packed_native.to(device=device, dtype=dtype).eval()
     ffn_only = ffn_only.to(device=device, dtype=dtype).eval()
-    combined = combined.to(device=device, dtype=dtype).eval()
+    packed_native = make_sdpa_prefix_model(
+        baseline, config.num_layers, device, dtype
+    )
+    combined = make_sdpa_prefix_model(
+        baseline, config.num_layers, device, dtype
+    )
     x, valid_mask = generate_random_case(
         config,
         device,

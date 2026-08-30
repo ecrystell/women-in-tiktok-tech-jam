@@ -8,9 +8,9 @@ from unittest import mock
 
 import torch
 
-from person1_triton_attention import PackedQKVSDPAAttention
 from run_sweep import parse_result
 from torch_transformer_benchmark import (
+    BaselineSelfAttention,
     BaselineTransformer,
     TransformerConfig,
     UserOptimizedTransformer,
@@ -66,38 +66,22 @@ class Person3IntegrationTests(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                isinstance(layer.attention, PackedQKVSDPAAttention)
+                isinstance(layer.attention, BaselineSelfAttention)
                 for layer in optimized.layers
             )
         )
-        self.assertTrue(
-            all(layer.attention.backend == "sdpa" for layer in optimized.layers)
-        )
+        self.assertEqual(optimized.attention_backend, "baseline")
 
-    def test_weight_transfer_packs_qkv_and_refreshes_ffn_state(self) -> None:
+    def test_weight_transfer_preserves_attention_and_refreshes_ffn_state(self) -> None:
         baseline, optimized = self.make_models()
 
         for source, target in zip(baseline.layers, optimized.layers):
-            expected_weight = torch.cat(
-                [
-                    source.attention.q_proj.weight,
-                    source.attention.k_proj.weight,
-                    source.attention.v_proj.weight,
-                ],
-                dim=0,
-            )
-            expected_bias = torch.cat(
-                [
-                    source.attention.q_proj.bias,
-                    source.attention.k_proj.bias,
-                    source.attention.v_proj.bias,
-                ],
-                dim=0,
-            )
             self.assertTrue(
-                torch.equal(target.attention.qkv_proj.weight, expected_weight)
+                torch.equal(
+                    target.attention.q_proj.weight,
+                    source.attention.q_proj.weight,
+                )
             )
-            self.assertTrue(torch.equal(target.attention.qkv_proj.bias, expected_bias))
             self.assertTrue(
                 torch.equal(
                     target.attention.out_proj.weight,
@@ -119,8 +103,8 @@ class Person3IntegrationTests(unittest.TestCase):
             torch.equal(optimized.final_norm.weight, baseline.final_norm.weight)
         )
         optimized_keys = set(optimized.state_dict())
-        self.assertIn("layers.0.attention.qkv_proj.weight", optimized_keys)
-        self.assertNotIn("layers.0.attention.q_proj.weight", optimized_keys)
+        self.assertIn("layers.0.attention.q_proj.weight", optimized_keys)
+        self.assertNotIn("layers.0.attention.qkv_proj.weight", optimized_keys)
 
     def test_weight_transfer_rejects_mismatched_configuration(self) -> None:
         baseline, _optimized = self.make_models()

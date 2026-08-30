@@ -26,7 +26,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import person2_ffn_post
-from person1_triton_attention import PackedQKVSDPAAttention
 
 
 @dataclass(frozen=True)
@@ -559,11 +558,7 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
 
 
 class UserOptimizedTransformerBlock(OptimizedTransformerBlock):
-    """Production block combining packed SDPA attention and the guarded FFN."""
-
-    def __init__(self, d_model: int, num_heads: int, ffn_dim: int) -> None:
-        super().__init__(d_model, num_heads, ffn_dim)
-        self.attention = PackedQKVSDPAAttention(d_model, num_heads)
+    """Production block using strict-safe attention and the guarded FFN."""
 
 
 class BaselineTransformer(nn.Module):
@@ -594,11 +589,11 @@ class BaselineTransformer(nn.Module):
 
 
 class UserOptimizedTransformer(BaselineTransformer):
-    """Transformer assembled from the validated attention and FFN paths."""
+    """Transformer using baseline attention and the validated optimized FFN."""
 
     def __init__(self, config: TransformerConfig) -> None:
-        # Construct the optimized hierarchy directly so baseline attention
-        # parameters are never registered alongside the packed QKV weights.
+        # Construct the optimized hierarchy directly while preserving the
+        # baseline parameter names required by strict weight transfer.
         nn.Module.__init__(self)
         self.config = config
         self.layers = nn.ModuleList(
@@ -615,7 +610,7 @@ class UserOptimizedTransformer(BaselineTransformer):
     def copy_from_baseline(
         self, source: BaselineTransformer, strict: bool = True
     ) -> None:
-        """Transfer all baseline parameters, packing Q/K/V per layer."""
+        """Transfer baseline parameters and refresh optimized FFN state."""
         if self.config != source.config:
             raise ValueError("baseline and optimized configurations must match")
         if len(self.layers) != len(source.layers):
@@ -625,7 +620,9 @@ class UserOptimizedTransformer(BaselineTransformer):
             target_layer.norm1.load_state_dict(
                 source_layer.norm1.state_dict(), strict=strict
             )
-            target_layer.attention.copy_from_baseline(source_layer.attention)
+            target_layer.attention.load_state_dict(
+                source_layer.attention.state_dict(), strict=strict
+            )
             target_layer.norm2.load_state_dict(
                 source_layer.norm2.state_dict(), strict=strict
             )
@@ -663,7 +660,7 @@ class UserOptimizedTransformer(BaselineTransformer):
 
     @property
     def attention_backend(self) -> str:
-        return "sdpa"
+        return "baseline"
 
     def forward(
         self,

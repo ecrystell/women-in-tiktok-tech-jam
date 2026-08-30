@@ -165,12 +165,13 @@ and full-block evidence is reported with that variance caveat.
 Current integration branch: `person3/integrate-person1`.
 
 Current assembly candidate branch: `person3/optimize-transformer-dispatch`.
-The candidate now constructs every `UserOptimizedTransformer` layer from
-Person 1's packed-QKV PyTorch SDPA attention and Person 2's guarded optimized
-FFN block. Weight transfer packs Q/K/V in reference row order, refreshes
-nonpersistent FFN state, and preserves the public forward signature. The
-benchmark prepares extension-backed FFN paths and exact-mask caches before
-compilation and timing, while unsupported paths retain native fallbacks.
+The current strict-safe candidate uses baseline attention with Person 2's
+guarded optimized FFN block. It refreshes nonpersistent FFN state, preserves
+the public forward signature, and prepares extension-backed FFN paths and
+exact-mask caches before compilation and timing. Unsupported paths retain
+native fallbacks. Person 1's packed SDPA and Triton implementations remain
+available as standalone experiments, but are not selected by the production
+full-model path because of the T4 failure documented below.
 
 Local CPU validation of the assembly passed all 34 tests with eight expected
 CUDA/Triton skips. Strict non-causal/unpadded and causal/25%-padded harness
