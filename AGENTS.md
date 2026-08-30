@@ -173,7 +173,7 @@ native fallbacks. Person 1's packed SDPA and Triton implementations remain
 available as standalone experiments, but are not selected by the production
 full-model path because of the T4 failure documented below.
 
-Local CPU validation of the assembly passed all 34 tests with eight expected
+Local CPU validation of the assembly passed all 36 tests with eight expected
 CUDA/Triton skips. Strict non-causal/unpadded and causal/25%-padded harness
 smokes each passed with zero failed elements. These CPU timings are not GPU
 speedup evidence.
@@ -206,6 +206,16 @@ all benchmark accuracy trials and repeated timing. The main benchmark now
 defaults to zero fast FFN layers and exposes `--fast-ffn-suffix-layers` only
 for controlled validation. Do not change the safe default until a shape has
 repeatable strict-correct speedup evidence.
+
+The next exact-safe candidate implements the requested all-valid-mask bypass.
+Preparation checks the fixed mask outside timing and caches only its exact
+object identity and tensor version when every token is valid. Eager forward
+then treats only that unchanged mask as `None`, removing no-op attention,
+block-output, and final-output masking. Cloned, changed, padded, unprepared,
+and compiled masks retain the original path. Accuracy validation now includes
+the exact prepared benchmark input so the path being timed must pass strict
+comparison. Local unpadded and padded harness checks were exact; T4 correctness
+and performance remain unmeasured.
 
 Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
 `f50ef57` are both contained by integration merge `99c1830` (Person 2 entered

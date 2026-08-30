@@ -605,6 +605,8 @@ class UserOptimizedTransformer(BaselineTransformer):
             ]
         )
         self.final_norm = nn.LayerNorm(config.d_model)
+        self._all_valid_mask: Optional[torch.Tensor] = None
+        self._all_valid_mask_version = -1
 
     @torch.no_grad()
     def copy_from_baseline(
@@ -635,6 +637,22 @@ class UserOptimizedTransformer(BaselineTransformer):
             target_layer._refresh_fast_ffn_state()
 
         self.final_norm.load_state_dict(source.final_norm.state_dict(), strict=strict)
+        self._all_valid_mask = None
+        self._all_valid_mask_version = -1
+
+    def _effective_valid_token_mask(
+        self,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if torch.compiler.is_compiling():
+            return valid_token_mask
+        if (
+            valid_token_mask is not None
+            and valid_token_mask is self._all_valid_mask
+            and valid_token_mask._version == self._all_valid_mask_version
+        ):
+            return None
+        return valid_token_mask
 
     def prepare_for_inference(
         self,
@@ -653,6 +671,18 @@ class UserOptimizedTransformer(BaselineTransformer):
         if not 0 <= fast_ffn_suffix_layers <= len(self.layers):
             raise ValueError("fast_ffn_suffix_layers must be between 0 and num_layers")
 
+        self._all_valid_mask = None
+        self._all_valid_mask_version = -1
+        if (
+            valid_token_mask is not None
+            and valid_token_mask.shape == x.shape[:2]
+            and valid_token_mask.device == x.device
+            and bool(valid_token_mask.all().item())
+        ):
+            self._all_valid_mask = valid_token_mask
+            self._all_valid_mask_version = valid_token_mask._version
+        effective_mask = self._effective_valid_token_mask(valid_token_mask)
+
         first_fast_layer = len(self.layers) - fast_ffn_suffix_layers
         for layer in self.layers:
             layer._fast_ffn_enabled = False
@@ -661,25 +691,35 @@ class UserOptimizedTransformer(BaselineTransformer):
         with torch.inference_mode():
             for index, layer in enumerate(self.layers):
                 x = x + layer.attention(
-                    layer.norm1(x), valid_token_mask, self.config.causal
+                    layer.norm1(x), effective_mask, self.config.causal
                 )
                 if index >= first_fast_layer and layer.prepare_fast_ffn(
-                    x, valid_token_mask
+                    x, effective_mask
                 ):
                     prepared_layers += 1
-                x = layer._ffn_residual(x, valid_token_mask)
+                x = layer._ffn_residual(x, effective_mask)
         return prepared_layers
 
     @property
     def attention_backend(self) -> str:
         return "baseline"
 
+    @property
+    def mask_dispatch(self) -> str:
+        if (
+            self._all_valid_mask is not None
+            and self._all_valid_mask._version == self._all_valid_mask_version
+        ):
+            return "all-valid-bypass"
+        return "masked"
+
     def forward(
         self,
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return super().forward(x, valid_token_mask)
+        effective_mask = self._effective_valid_token_mask(valid_token_mask)
+        return super().forward(x, effective_mask)
 
 
 def copy_model_weights(
@@ -856,6 +896,7 @@ def run_accuracy_tests(
     input_scale: float,
     rtol: float,
     atol: float,
+    prepared_case: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> bool:
     print("\n=== Accuracy check ===")
     print(f"criterion: abs_error <= {atol:g} OR relative_error <= {rtol:.2%}")
@@ -903,6 +944,32 @@ def run_accuracy_tests(
                     f"optimized={result.optimized_at_worst:.8g}"
                 )
                 print(f"  failed output feature dims={preview}{suffix}")
+
+        if prepared_case is not None:
+            x, valid_mask = prepared_case
+            reference = baseline(x, valid_mask)
+            candidate = optimized(x, valid_mask)
+            result = compare_outputs(reference, candidate, rtol=rtol, atol=atol)
+
+            all_passed &= result.passed
+            global_max_abs = max(global_max_abs, result.max_abs_error)
+            global_max_rel = max(global_max_rel, result.max_relative_error)
+            total_failed += result.failed_elements
+            total_elements += result.total_elements
+
+            status = "PASS" if result.passed else "FAIL"
+            print(
+                f"prepared benchmark case: {status} | "
+                f"max_abs={result.max_abs_error:.6g} | "
+                f"max_rel={result.max_relative_error:.6g} | "
+                f"failed={result.failed_elements}/{result.total_elements}"
+            )
+            if not result.passed:
+                print(
+                    f"  worst_index={result.worst_index}, "
+                    f"baseline={result.reference_at_worst:.8g}, "
+                    f"optimized={result.optimized_at_worst:.8g}"
+                )
 
     print(
         f"summary: {'PASS' if all_passed else 'FAIL'} | "
@@ -1214,6 +1281,9 @@ def main() -> int:
         fast_ffn_suffix_layers=args.fast_ffn_suffix_layers,
     )
     attention_backend = optimized.attention_backend
+    mask_dispatch = (
+        "masked-compile-fallback" if args.compile_user else optimized.mask_dispatch
+    )
 
     # Compile only after model construction, weight copy, device transfer, and eval().
     baseline = maybe_compile(baseline, args.compile_baseline, args.compile_mode)
@@ -1225,6 +1295,7 @@ def main() -> int:
     if device.type == "cuda":
         print(f"gpu={torch.cuda.get_device_name(device)}")
     print(f"attention_backend={attention_backend}")
+    print(f"mask_dispatch={mask_dispatch}")
     print(f"requested_fast_ffn_suffix_layers={args.fast_ffn_suffix_layers}")
     print(
         f"fast_ffn_layers={prepared_ffn_layers}/{config.num_layers} "
@@ -1243,6 +1314,7 @@ def main() -> int:
         input_scale=args.input_scale,
         rtol=args.rtol,
         atol=args.atol,
+        prepared_case=benchmark_case,
     )
 
     if not accuracy_passed and not args.benchmark_on_failure:

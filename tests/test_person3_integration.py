@@ -194,6 +194,69 @@ class Person3IntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "between 0 and num_layers"):
             optimized.prepare_for_inference(x, mask, fast_ffn_suffix_layers=3)
 
+    def test_all_valid_mask_bypass_is_identity_and_version_guarded(self) -> None:
+        baseline, optimized = self.make_models()
+        torch.manual_seed(107)
+        x = torch.randn(2, 7, 32)
+        mask = torch.ones(2, 7, dtype=torch.bool)
+
+        self.assertEqual(
+            optimized.prepare_for_inference(
+                x, mask, fast_ffn_suffix_layers=0
+            ),
+            0,
+        )
+        self.assertEqual(optimized.mask_dispatch, "all-valid-bypass")
+        with mock.patch.object(
+            optimized.layers[0].attention,
+            "forward",
+            wraps=optimized.layers[0].attention.forward,
+        ) as attention:
+            with torch.inference_mode():
+                reference = baseline(x, mask)
+                candidate = optimized(x, mask)
+            self.assertIsNone(attention.call_args.args[1])
+        self.assertTrue(torch.equal(reference, candidate))
+
+        cloned_mask = mask.clone()
+        with mock.patch.object(
+            optimized.layers[0].attention,
+            "forward",
+            wraps=optimized.layers[0].attention.forward,
+        ) as attention:
+            with torch.inference_mode():
+                cloned_candidate = optimized(x, cloned_mask)
+            self.assertIs(attention.call_args.args[1], cloned_mask)
+        self.assertTrue(torch.equal(reference, cloned_candidate))
+
+        mask[1, -1] = False
+        self.assertEqual(optimized.mask_dispatch, "masked")
+        with torch.inference_mode():
+            mutated_reference = baseline(x, mask)
+            mutated_candidate = optimized(x, mask)
+        self.assertTrue(torch.equal(mutated_reference, mutated_candidate))
+        self.assertTrue(bool((mutated_candidate[~mask] == 0).all().item()))
+
+    def test_padded_mask_is_not_bypassed(self) -> None:
+        _baseline, optimized = self.make_models()
+        x = torch.randn(2, 7, 32)
+        mask = torch.tensor(
+            [
+                [True, True, True, True, True, True, True],
+                [True, True, True, True, False, False, False],
+            ]
+        )
+        optimized.prepare_for_inference(x, mask, fast_ffn_suffix_layers=0)
+        self.assertEqual(optimized.mask_dispatch, "masked")
+        with mock.patch.object(
+            optimized.layers[0].attention,
+            "forward",
+            wraps=optimized.layers[0].attention.forward,
+        ) as attention:
+            with torch.inference_mode():
+                optimized(x, mask)
+            self.assertIs(attention.call_args.args[1], mask)
+
     def test_sweep_parser_reads_strict_result_and_timings(self) -> None:
         output = """
 summary: PASS | max_abs=0.0001 | max_rel=0.02 | failed=0/1024
