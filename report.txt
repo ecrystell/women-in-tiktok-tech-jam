@@ -22,6 +22,23 @@ CUDA-event measurements record median and p90 latency after warmup. Extreme
 long-sequence work is evaluated separately with memory-bounded batch and query
 tiling because the dense attention score matrix cannot fit in GPU memory.
 
+Addressed the FFN, LayerNorm, and residual portion of 
+the problem by building and validating a standalone, baseline-compatible
+optimized Transformer block that preserves exact GELU, FP32 LayerNorm
+statistics, masking semantics, state-dict compatibility, and invalid-token
+zeroing. I used Visual Studio Code, OpenAI Codex, Git/GitHub, and a Google Colab
+Jupyter runtime with a Tesla T4; the implementation and measurements used
+Python, PyTorch tensor and neural-network APIs, torch.compile, torch.profiler,
+CUDA Events, and PyTorch C++/CUDA custom-operator APIs, with unittest-based
+regression coverage. Official-shape retuning reduced Python/kernel-launch
+overhead through a single guarded FFN operation boundary and a vectorized
+residual/mask kernel, fixed a CUDA grid-limit failure for workloads above
+65,535 token rows, and produced a strict measured allowlist for eight of nine
+official FP16 FFN tuples while retaining native fallbacks elsewhere. No
+external dataset or application API was required: all validation used the
+organizer-provided torch_transformer_benchmark.py, official configuration
+shapes, and deterministic seeded random tensors.
+
 Development tools used
 
 - Visual Studio Code
