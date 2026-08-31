@@ -1,4 +1,4 @@
-# GPU-Optimized PyTorch Transformer
+# KernelKraft
 
 This project optimizes the organizer-provided PyTorch Transformer inference
 benchmark for an NVIDIA Tesla T4 while preserving its public API, model
@@ -143,11 +143,11 @@ speedup against the infeasible dense reference.
 
 ## Team Contributions
 
-- Person 1: packed-QKV SDPA, optional Triton attention, masks, and attention
+- Zhao Jin (Person 1): packed-QKV SDPA, optional Triton attention, masks, and attention
   validation.
-- Person 2: FFN, LayerNorm, residual fusion experiments, CUDA post-processing,
+- Yeo Su Gar (Person 2): FFN, LayerNorm, residual fusion experiments, CUDA post-processing,
   and standalone validation.
-- Person 3: final model assembly, weight transfer, shape dispatch, integration,
+- Tiffany Heng (Person 3): final model assembly, weight transfer, shape dispatch, integration,
   Shape 14 evaluation, official sweeps, and reproducibility documentation.
 
 The team used OpenAI Codex for AI-assisted analysis, implementation, debugging,
