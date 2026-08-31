@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import statistics
 import subprocess
@@ -146,6 +147,28 @@ OFFICIAL_CASES = (
     Case(14, 32, 100000, 1024, 16, 1024, 2, True, 0.0),
 )
 
+CANONICAL_PACKED_CASE_IDS = frozenset({2, 3, 4, 12})
+
+
+def canonical_backend_label(case: Case, device: str, dtype: str) -> str:
+    """Describe the backend selected by the canonical runtime policy."""
+    if (
+        case.case_id not in CANONICAL_PACKED_CASE_IDS
+        or case.padding != 0.0
+        or dtype != "float16"
+        or not device.startswith("cuda")
+        or not torch.cuda.is_available()
+        or torch.__version__.split("+")[0] != "2.11.0"
+    ):
+        return "native"
+
+    device_index = torch.device(device).index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    if tuple(torch.cuda.get_device_capability(device_index)) != (7, 5):
+        return "native"
+    return "packed-sdpa-suffix:1"
+
 
 def shape14_memory_summary(case: Case, dtype: str) -> str:
     """Estimate unavoidable full tensors in the original ID 14 harness."""
@@ -175,7 +198,7 @@ def parse_timing(output: str, label: str) -> tuple[float, float]:
     return float(match.group(1)), float(match.group(2))
 
 
-def parse_result(output: str) -> RunResult:
+def parse_result(output: str, fallback_backend: str = "unknown") -> RunResult:
     backend_match = re.search(
         r"^attention_backend=(\S+)$", output, flags=re.MULTILINE
     )
@@ -195,8 +218,58 @@ def parse_result(output: str) -> RunResult:
         optimized_median_ms=optimized_median,
         optimized_p90_ms=optimized_p90,
         speedup=float(speedup_match.group(1)),
-        backend=backend_match.group(1) if backend_match else "unknown",
+        backend=backend_match.group(1) if backend_match else fallback_backend,
     )
+
+
+def suite_summary_lines(
+    case_results: list[tuple[Case, tuple[RunResult, ...]]],
+) -> list[str]:
+    """Build a compact aggregate report from completed official cases."""
+    if not case_results:
+        return []
+
+    medians = [
+        (case, statistics.median(result.speedup for result in results))
+        for case, results in case_results
+    ]
+    geometric_mean = math.exp(
+        statistics.fmean(math.log(speedup) for _, speedup in medians)
+    )
+    slowest_case, minimum_speedup = min(medians, key=lambda item: item[1])
+    fastest_case, maximum_speedup = max(medians, key=lambda item: item[1])
+    process_count = sum(len(results) for _, results in case_results)
+    all_correct = all(
+        result.correct for _, results in case_results for result in results
+    )
+    packed_ids = [
+        str(case.case_id)
+        for case, results in case_results
+        if results[0].backend == "packed-sdpa-suffix:1"
+    ]
+
+    return [
+        "=== Official suite summary ===",
+        (
+            f"correctness={'PASS' if all_correct else 'FAIL'} | "
+            f"cases={len(case_results)} | "
+            f"processes={process_count}"
+        ),
+        (
+            f"median-process speedup range={minimum_speedup:.3f}x-"
+            f"{maximum_speedup:.3f}x"
+        ),
+        f"unweighted geometric-mean speedup={geometric_mean:.3f}x",
+        (
+            f"best=ID{fastest_case.case_id} {maximum_speedup:.3f}x | "
+            f"lowest=ID{slowest_case.case_id} {minimum_speedup:.3f}x"
+        ),
+        (
+            "packed-sdpa-suffix:1 IDs="
+            f"{','.join(packed_ids) if packed_ids else 'none'} | "
+            "remaining IDs=native attention"
+        ),
+    ]
 
 
 def build_command(
@@ -573,6 +646,7 @@ def main() -> int:
     )
     correctness_failed = False
     execution_failed = False
+    completed_case_results: list[tuple[Case, tuple[RunResult, ...]]] = []
 
     for case in cases:
         results: list[RunResult] = []
@@ -597,7 +671,10 @@ def main() -> int:
                 print(completed.stderr)
                 continue
             try:
-                result = parse_result(completed.stdout)
+                result = parse_result(
+                    completed.stdout,
+                    fallback_backend=canonical_backend_label(case, device, dtype),
+                )
             except ValueError as error:
                 execution_failed = True
                 print(f"process {process_index + 1}: ERROR ({error})")
@@ -616,6 +693,7 @@ def main() -> int:
             )
 
         if len(results) == processes:
+            completed_case_results.append((case, tuple(results)))
             median_speedup = statistics.median(result.speedup for result in results)
             repeatable = (
                 all(result.correct and result.speedup > 1.0 for result in results)
@@ -630,6 +708,11 @@ def main() -> int:
             else:
                 verdict = "REPEATABLE" if repeatable else "SHAPE-DEPENDENT"
             print(f"verdict={verdict} median_process_speedup={median_speedup:.3f}x")
+
+    if completed_case_results:
+        print()
+        for line in suite_summary_lines(completed_case_results):
+            print(line)
 
     if execution_failed:
         return 2

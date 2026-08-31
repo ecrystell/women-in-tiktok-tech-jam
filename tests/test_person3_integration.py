@@ -30,10 +30,12 @@ from run_sweep import (
     CandidateEvaluation,
     RunResult,
     build_command,
+    canonical_backend_label,
     failed_summary,
     parse_result,
     select_relative_winner,
     shape14_memory_summary,
+    suite_summary_lines,
 )
 from torch_transformer_benchmark import (
     BaselineSelfAttention,
@@ -616,6 +618,45 @@ speedup  : 2.000x based on median latency
         self.assertNotIn("--dispatch-mode", command)
         self.assertNotIn("--packed-sdpa-suffix-layers", command)
         self.assertNotIn("--fast-ffn-suffix-layers", command)
+
+    def test_runner_reports_canonical_policy_and_suite_summary(self) -> None:
+        with (
+            mock.patch("run_sweep.torch.cuda.is_available", return_value=True),
+            mock.patch("run_sweep.torch.cuda.current_device", return_value=0),
+            mock.patch(
+                 "run_sweep.torch.cuda.get_device_capability", return_value=(7, 5)
+            ),
+            mock.patch("run_sweep.torch.__version__", "2.11.0+cu128"),
+        ):
+            self.assertEqual(
+                canonical_backend_label(
+                    OFFICIAL_CASES[1], "cuda", "float16"
+                ),
+                "packed-sdpa-suffix:1",
+            )
+            self.assertEqual(
+                canonical_backend_label(
+                    OFFICIAL_CASES[0], "cuda", "float16"
+                ),
+                "native",
+            )
+
+        native = RunResult(True, 4.0, 4.1, 3.2, 3.3, 1.25, "native")
+        packed = RunResult(
+            True, 4.0, 4.1, 2.0, 2.1, 2.0, "packed-sdpa-suffix:1"
+        )
+        report = "\n".join(
+            suite_summary_lines(
+                [
+                    (OFFICIAL_CASES[0], (native,) * 3),
+                    (OFFICIAL_CASES[1], (packed,) * 3),
+                ]
+            )
+        )
+        self.assertIn("cases=2 | processes=6", report)
+        self.assertIn("speedup range=1.250x-2.000x", report)
+        self.assertIn("best=ID2 2.000x", report)
+        self.assertIn("packed-sdpa-suffix:1 IDs=2", report)
 
 
 if __name__ == "__main__":
