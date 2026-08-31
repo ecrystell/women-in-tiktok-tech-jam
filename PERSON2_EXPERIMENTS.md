@@ -381,3 +381,52 @@ BF16 smoke checks passed through the native fallback with zero error. The
 official harness signature/accuracy smoke passed two of two trials with zero
 failed elements. No runtime dispatch was added; Person 3 must revalidate this
 allowlist in the integrated official harness before consuming it.
+
+## Algebraic LayerNorm/GEMM correction experiment
+
+Branch `person2/ln-gemm-correction-t4` tested a directives-derived algebraic
+reformulation for identity-affine LayerNorm. For an up-projection weight
+matrix `W`, it computes the native FP16 raw GEMM first and applies
+`(xW - mean(x) * row_sum(W)) * rstd(x)` in a CUDA epilogue before adding the
+bias and evaluating exact erf GELU. The linear result is explicitly rounded
+to FP16 before GELU, LayerNorm mean/variance remain FP32, both native cuBLAS
+GEMMs are retained, and the validated residual/mask post kernel remains the
+last stage. The experiment is inference-only and guarded by strict
+intermediate and final numerical preflights; it is disabled by default.
+
+Source commit `d4d247f` introduced the custom operation. A pure warp-per-row
+schedule at `9eccbba` reduced the correction grid by eight times and removed
+block-wide synchronization, but paired testing showed that one topology was
+not suitable for every dimension. Final experimental commit `7eaee3e` selects
+the CUDA reduction topology inside the kernel wrapper: block-per-row for
+moderate `D=128` workloads and warp-per-row for `D=32` or at least 65,536
+rows. This is kernel launch tuning, not `UserOptimizedTransformer` dispatch.
+
+Commit `7fa364c` added `--control-backend full-op` so the candidate and the
+validated full-op run are prepared, alternated, and timed in the same process.
+Earlier cross-process subtraction was discarded after it produced a spurious
+`0.644x` point from process-level Colab variance.
+
+On Tesla T4 (`sm_75`, 15,360 MiB), driver 580.82.07, PyTorch 2.11.0+cu128,
+and CUDA 12.8, the hybrid source passed all 27 Person 2 tests in 102.049
+seconds. Coverage included real extension execution, strict state loading,
+parameter invalidation, exact invalid-token zeroing, repeated output
+ownership, non-contiguous and nonidentity fallbacks, FP16, FP32, runtime BF16,
+static compile fallback, and the alternating full-op control.
+
+Paired FP16 timing used seed 1234, `atol=0.001`, `rtol=0.01`, 20 warmups,
+100 CUDA-event repetitions, five alternating rounds, and three independent
+processes. Across the 21 `D=128` comparisons, every candidate median improved:
+the range was `1.0166x` to `1.5263x`, with zero failed elements. Twenty of 21
+p90 comparisons improved; the exception was `(M,D,FFN)=(2048,128,128)` in
+process 1, where p90 increased from 0.207664 to 0.245328 ms despite a 1.0619x
+median speedup. The `D=32` tuple measured 1.0974x, 1.1492x, and 0.9379x and
+therefore was not repeatable. The `D=1024` screen measured 0.9455x with a p90
+regression and was also rejected.
+
+The experiment does not pass the project-wide strict gate, so no full-block
+speedup claim or production allowlist is made and `AGENTS.md` is unchanged.
+The validated full-op implementation remains the best Person 2 handoff. The
+algebraic path and its paired benchmark remain on the experimental branch as
+evidence that the launch topology is promising for `D=128`, but Person 3 must
+not dispatch to it without a fresh integrated gate.
