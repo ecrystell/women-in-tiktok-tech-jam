@@ -569,8 +569,19 @@ the measured token-major native FFN and exact GELU.
 Local CPU validation at test commit `23a7b0d` passed 58 tests with 11 expected
 CUDA/Triton skips. Organizer-style CPU strict checks passed with zero failed
 elements for native, exact packed-candidate, all-valid, padded, and causal
-paths. No T4 result has been measured for this canonical no-preparation-hook
-candidate yet; do not transfer earlier speedup claims until the official
-script passes strict and organizer-tolerance T4 sweeps. Shape 14 remains in
-the separate streaming/blockwise evaluators because the unchanged organizer
-`main()` cannot safely construct its dense reference.
+paths.
+
+Canonical T4 validation at `d2610a5` passed all 59 tests, including 11 expected
+hardware/toolkit skips, and completed the strict official ID 1-13 matrix in
+three independent processes per shape. All 39 processes passed at
+`atol=0.001`, `rtol=0.01`, with 20 warmups, 100 repeats, and three alternating
+rounds. Every shape cleared the median and paired-p90 gates. Median-of-process
+speedups ranged from 1.090x to 1.471x, with an unweighted geometric mean of
+1.272x. ID 12 was fastest at 1.471x; ID 8 was lowest at 1.090x. Automatic
+dispatch selected one packed-SDPA suffix layer for IDs 2, 3, 4, and 12 and
+native attention for the remaining official IDs. This strict run is stronger
+than the organizer's default numerical tolerance, but a separate invocation
+with the untouched organizer defaults should be retained as judge-equivalent
+evidence. Shape 14 remains in the separate streaming/blockwise evaluators
+because the unchanged organizer `main()` cannot safely construct its dense
+reference.
