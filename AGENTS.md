@@ -566,7 +566,7 @@ Person 2's rejected extension-backed FFN experiment moved to
 without becoming a submission dependency. The canonical production model uses
 the measured token-major native FFN and exact GELU.
 
-Local CPU validation at test commit `23a7b0d` passed 57 tests with 11 expected
+Local CPU validation at test commit `23a7b0d` passed 58 tests with 11 expected
 CUDA/Triton skips. Organizer-style CPU strict checks passed with zero failed
 elements for native, exact packed-candidate, all-valid, padded, and causal
 paths. No T4 result has been measured for this canonical no-preparation-hook
