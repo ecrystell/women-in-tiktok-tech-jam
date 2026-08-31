@@ -11,6 +11,58 @@ void residual_unmasked_cuda(
     const torch::Tensor& residual,
     torch::Tensor& output);
 
+void layer_norm_correct_exact_gelu_cuda(
+    torch::Tensor& raw_projection,
+    const torch::Tensor& residual,
+    const torch::Tensor& weight_row_sum,
+    const torch::Tensor& bias,
+    double eps);
+
+torch::Tensor algebraic_layer_norm_up_gelu(
+    const torch::Tensor& residual,
+    const torch::Tensor& up_weight,
+    const torch::Tensor& up_bias,
+    const torch::Tensor& up_weight_row_sum,
+    double eps) {
+  auto activated = at::linear(residual, up_weight, c10::nullopt);
+  layer_norm_correct_exact_gelu_cuda(
+      activated, residual, up_weight_row_sum, up_bias, eps);
+  return activated;
+}
+
+torch::Tensor algebraic_layer_norm_ffn_masked(
+    const torch::Tensor& residual,
+    const torch::Tensor& up_weight,
+    const torch::Tensor& up_bias,
+    const torch::Tensor& up_weight_row_sum,
+    const torch::Tensor& down_weight_nt,
+    const torch::Tensor& down_bias,
+    const torch::Tensor& valid_token_mask,
+    double eps) {
+  auto activated = algebraic_layer_norm_up_gelu(
+      residual, up_weight, up_bias, up_weight_row_sum, eps);
+  auto update = at::addmm(down_bias, activated, down_weight_nt);
+  auto output = torch::empty_like(residual);
+  residual_masked_cuda(update, residual, valid_token_mask, output);
+  return output;
+}
+
+torch::Tensor algebraic_layer_norm_ffn_unmasked(
+    const torch::Tensor& residual,
+    const torch::Tensor& up_weight,
+    const torch::Tensor& up_bias,
+    const torch::Tensor& up_weight_row_sum,
+    const torch::Tensor& down_weight_nt,
+    const torch::Tensor& down_bias,
+    double eps) {
+  auto activated = algebraic_layer_norm_up_gelu(
+      residual, up_weight, up_bias, up_weight_row_sum, eps);
+  auto update = at::addmm(down_bias, activated, down_weight_nt);
+  auto output = torch::empty_like(residual);
+  residual_unmasked_cuda(update, residual, output);
+  return output;
+}
+
 torch::Tensor exact_gelu_down_masked(
     torch::Tensor preactivation,
     const torch::Tensor& weight_nt,
@@ -104,4 +156,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       "identity_layer_norm_ffn_unmasked",
       &identity_layer_norm_ffn_unmasked,
       "Identity LayerNorm, exact FFN, and residual add");
+  module.def(
+      "algebraic_layer_norm_up_gelu",
+      &algebraic_layer_norm_up_gelu,
+      "Raw up GEMM with LayerNorm correction and exact GELU");
+  module.def(
+      "algebraic_layer_norm_ffn_masked",
+      &algebraic_layer_norm_ffn_masked,
+      "Algebraic LayerNorm FFN with masked residual postprocessing");
+  module.def(
+      "algebraic_layer_norm_ffn_unmasked",
+      &algebraic_layer_norm_ffn_unmasked,
+      "Algebraic LayerNorm FFN with unmasked residual postprocessing");
 }

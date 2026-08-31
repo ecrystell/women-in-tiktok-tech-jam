@@ -75,9 +75,12 @@ class BaselineFFNResidual(nn.Module):
 class OptimizedFFNResidual(nn.Module):
     """Expose the exact FFN path used by OptimizedTransformerBlock."""
 
-    def __init__(self, block: OptimizedTransformerBlock) -> None:
+    def __init__(
+        self, block: OptimizedTransformerBlock, backend: str = "full-op"
+    ) -> None:
         super().__init__()
         self.block = block
+        self.backend = backend
 
     def forward(
         self, x: torch.Tensor, valid_token_mask: Optional[torch.Tensor]
@@ -87,18 +90,25 @@ class OptimizedFFNResidual(nn.Module):
     def prepare(
         self, x: torch.Tensor, valid_token_mask: Optional[torch.Tensor]
     ) -> bool:
+        if self.backend == "ln-gemm-correction":
+            return self.block.prepare_ln_gemm_ffn(x, valid_token_mask)
         return self.block.prepare_fast_ffn(x, valid_token_mask)
 
     @property
     def prepare_error(self) -> Optional[str]:
+        if self.backend == "ln-gemm-correction":
+            return self.block.ln_gemm_ffn_error
         return self.block.fast_ffn_error
 
 
 class FullBlock(nn.Module):
-    def __init__(self, block: nn.Module, causal: bool) -> None:
+    def __init__(
+        self, block: nn.Module, causal: bool, backend: str = "full-op"
+    ) -> None:
         super().__init__()
         self.block = block
         self.causal = causal
+        self.backend = backend
 
     def forward(
         self, x: torch.Tensor, valid_token_mask: Optional[torch.Tensor]
@@ -114,10 +124,14 @@ class FullBlock(nn.Module):
             ffn_input = x + self.block.attention(
                 self.block.norm1(x), valid_token_mask, self.causal
             )
+        if self.backend == "ln-gemm-correction":
+            return self.block.prepare_ln_gemm_ffn(ffn_input, valid_token_mask)
         return self.block.prepare_fast_ffn(ffn_input, valid_token_mask)
 
     @property
     def prepare_error(self) -> Optional[str]:
+        if self.backend == "ln-gemm-correction":
+            return getattr(self.block, "ln_gemm_ffn_error", None)
         return getattr(self.block, "fast_ffn_error", None)
 
 
@@ -370,6 +384,7 @@ def make_models(
     scope: str,
     device: torch.device,
     dtype: torch.dtype,
+    backend: str = "full-op",
 ) -> tuple[nn.Module, nn.Module]:
     baseline_block = BaselineTransformerBlock(
         case.d_model, case.heads, case.ffn_dim
@@ -383,10 +398,10 @@ def make_models(
 
     if scope == "isolated":
         return BaselineFFNResidual(baseline_block), OptimizedFFNResidual(
-            optimized_block
+            optimized_block, backend
         )
-    return FullBlock(baseline_block, case.causal), FullBlock(
-        optimized_block, case.causal
+    return FullBlock(baseline_block, case.causal, backend), FullBlock(
+        optimized_block, case.causal, backend
     )
 
 
@@ -413,8 +428,14 @@ def run_case(
             raise RuntimeError("CUDA-graph diagnostics support isolated FFN only")
         if args.backend == "cuda-graph" and mode != "eager":
             raise RuntimeError("CUDA-graph diagnostics require eager mode")
+        if args.backend == "ln-gemm-correction" and mode != "eager":
+            raise RuntimeError(
+                "LayerNorm/GEMM correction is an eager-only experiment"
+            )
         x, mask = make_input(case, device, dtype, args.seed)
-        baseline, candidate = make_models(case, scope, device, dtype)
+        baseline, candidate = make_models(
+            case, scope, device, dtype, args.backend
+        )
         fast_enabled = False
         prepare = getattr(candidate, "prepare", None)
         if prepare is not None:
@@ -634,7 +655,9 @@ def parse_args() -> argparse.Namespace:
         "--scope", choices=("isolated", "full", "both"), default="isolated"
     )
     parser.add_argument(
-        "--backend", choices=("full-op", "cuda-graph"), default="full-op"
+        "--backend",
+        choices=("full-op", "ln-gemm-correction", "cuda-graph"),
+        default="full-op",
     )
     parser.add_argument(
         "--compile-mode",

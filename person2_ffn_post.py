@@ -237,3 +237,132 @@ def _identity_layer_norm_ffn_unmasked_fake(
 ) -> torch.Tensor:
     del up_weight, up_bias, down_weight_nt, down_bias, eps
     return torch.empty_like(residual)
+
+
+@torch.library.custom_op(
+    "person2_post::algebraic_layer_norm_up_gelu_v1",
+    mutates_args=(),
+)
+def algebraic_layer_norm_up_gelu(
+    residual: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    up_weight_row_sum: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Run raw up GEMM followed by LayerNorm correction and exact GELU."""
+    return load_extension().algebraic_layer_norm_up_gelu(
+        residual,
+        up_weight,
+        up_bias,
+        up_weight_row_sum,
+        eps,
+    )
+
+
+@algebraic_layer_norm_up_gelu.register_fake
+def _algebraic_layer_norm_up_gelu_fake(
+    residual: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    up_weight_row_sum: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    del up_bias, up_weight_row_sum, eps
+    return residual.new_empty((residual.shape[0], up_weight.shape[0]))
+
+
+@torch.library.custom_op(
+    "person2_post::algebraic_layer_norm_ffn_masked_v1",
+    mutates_args=(),
+)
+def algebraic_layer_norm_ffn_masked(
+    residual: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    up_weight_row_sum: torch.Tensor,
+    down_weight_nt: torch.Tensor,
+    down_bias: torch.Tensor,
+    valid_token_mask: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Run the algebraic identity-LayerNorm FFN and masked residual post."""
+    return load_extension().algebraic_layer_norm_ffn_masked(
+        residual,
+        up_weight,
+        up_bias,
+        up_weight_row_sum,
+        down_weight_nt,
+        down_bias,
+        valid_token_mask,
+        eps,
+    )
+
+
+@algebraic_layer_norm_ffn_masked.register_fake
+def _algebraic_layer_norm_ffn_masked_fake(
+    residual: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    up_weight_row_sum: torch.Tensor,
+    down_weight_nt: torch.Tensor,
+    down_bias: torch.Tensor,
+    valid_token_mask: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    del (
+        up_weight,
+        up_bias,
+        up_weight_row_sum,
+        down_weight_nt,
+        down_bias,
+        valid_token_mask,
+        eps,
+    )
+    return torch.empty_like(residual)
+
+
+@torch.library.custom_op(
+    "person2_post::algebraic_layer_norm_ffn_unmasked_v1",
+    mutates_args=(),
+)
+def algebraic_layer_norm_ffn_unmasked(
+    residual: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    up_weight_row_sum: torch.Tensor,
+    down_weight_nt: torch.Tensor,
+    down_bias: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Run the algebraic identity-LayerNorm FFN and unmasked residual post."""
+    return load_extension().algebraic_layer_norm_ffn_unmasked(
+        residual,
+        up_weight,
+        up_bias,
+        up_weight_row_sum,
+        down_weight_nt,
+        down_bias,
+        eps,
+    )
+
+
+@algebraic_layer_norm_ffn_unmasked.register_fake
+def _algebraic_layer_norm_ffn_unmasked_fake(
+    residual: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    up_weight_row_sum: torch.Tensor,
+    down_weight_nt: torch.Tensor,
+    down_bias: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    del (
+        up_weight,
+        up_bias,
+        up_weight_row_sum,
+        down_weight_nt,
+        down_bias,
+        eps,
+    )
+    return torch.empty_like(residual)

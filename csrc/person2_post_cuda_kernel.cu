@@ -5,9 +5,86 @@
 
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <cstdint>
 
 namespace {
+
+__inline__ __device__ float warp_sum(float value) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2) {
+    value += __shfl_down_sync(0xffffffff, value, offset);
+  }
+  return value;
+}
+
+__inline__ __device__ float block_sum(float value, float* warp_totals) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  value = warp_sum(value);
+  if (lane == 0) {
+    warp_totals[warp] = value;
+  }
+  __syncthreads();
+
+  const int warps = (blockDim.x + 31) / 32;
+  value = threadIdx.x < warps ? warp_totals[lane] : 0.0f;
+  if (warp == 0) {
+    value = warp_sum(value);
+  }
+  if (threadIdx.x == 0) {
+    warp_totals[0] = value;
+  }
+  __syncthreads();
+  return warp_totals[0];
+}
+
+__global__ void layer_norm_correct_exact_gelu(
+    half* raw_projection,
+    const half* residual,
+    const float* weight_row_sum,
+    const half* bias,
+    int64_t rows,
+    int64_t hidden,
+    int64_t ffn,
+    float eps) {
+  const int64_t row = static_cast<int64_t>(blockIdx.x);
+  if (row >= rows) {
+    return;
+  }
+
+  __shared__ float warp_totals[32];
+  float local_sum = 0.0f;
+  for (int64_t column = threadIdx.x; column < hidden; column += blockDim.x) {
+    local_sum += __half2float(residual[row * hidden + column]);
+  }
+  const float mean = block_sum(local_sum, warp_totals) / hidden;
+
+  float local_squared_difference = 0.0f;
+  for (int64_t column = threadIdx.x; column < hidden; column += blockDim.x) {
+    const float centered =
+        __half2float(residual[row * hidden + column]) - mean;
+    local_squared_difference += centered * centered;
+  }
+  const float variance =
+      block_sum(local_squared_difference, warp_totals) / hidden;
+  const float rstd = rsqrtf(variance + eps);
+
+  for (int64_t column = threadIdx.x; column < ffn; column += blockDim.x) {
+    const int64_t index = row * ffn + column;
+    const float raw = __half2float(raw_projection[index]);
+    const float corrected =
+        (raw - mean * weight_row_sum[column]) * rstd +
+        __half2float(bias[column]);
+    // Match the baseline Linear -> GELU boundary: the linear result is first
+    // rounded to FP16, then exact erf GELU is evaluated in FP32 opmath.
+    const half rounded = __float2half_rn(corrected);
+    const float value = __half2float(rounded);
+    const float activated =
+        0.5f * value * erfcf(-value * 0.70710678118654752440f);
+    raw_projection[index] = __float2half_rn(activated);
+  }
+}
 
 void validate_common(
     const torch::Tensor& update,
@@ -118,6 +195,65 @@ __global__ void residual_unmasked_half8(
 }
 
 }  // namespace
+
+void layer_norm_correct_exact_gelu_cuda(
+    torch::Tensor& raw_projection,
+    const torch::Tensor& residual,
+    const torch::Tensor& weight_row_sum,
+    const torch::Tensor& bias,
+    double eps) {
+  TORCH_CHECK(
+      raw_projection.is_cuda() && residual.is_cuda() &&
+          weight_row_sum.is_cuda() && bias.is_cuda(),
+      "projection, residual, weight sum, and bias must be CUDA tensors");
+  TORCH_CHECK(
+      raw_projection.scalar_type() == torch::kFloat16 &&
+          residual.scalar_type() == torch::kFloat16 &&
+          bias.scalar_type() == torch::kFloat16 &&
+          weight_row_sum.scalar_type() == torch::kFloat32,
+      "projection/residual/bias must be FP16 and weight sum must be FP32");
+  TORCH_CHECK(
+      raw_projection.is_contiguous() && residual.is_contiguous() &&
+          weight_row_sum.is_contiguous() && bias.is_contiguous(),
+      "all correction tensors must be contiguous");
+  TORCH_CHECK(
+      raw_projection.dim() == 2 && residual.dim() == 2 &&
+          weight_row_sum.dim() == 1 && bias.dim() == 1,
+      "correction expects two matrices and two vectors");
+  TORCH_CHECK(
+      raw_projection.size(0) == residual.size(0),
+      "projection and residual row counts must match");
+  TORCH_CHECK(
+      raw_projection.size(1) == weight_row_sum.numel() &&
+          raw_projection.size(1) == bias.numel(),
+      "projection width must match the weight-sum and bias vectors");
+  TORCH_CHECK(
+      raw_projection.size(0) > 0 && residual.size(1) > 0 &&
+          raw_projection.size(1) > 0,
+      "correction tensors must be non-empty");
+  TORCH_CHECK(eps > 0.0, "LayerNorm epsilon must be positive");
+
+  const c10::cuda::CUDAGuard guard(residual.device());
+  const int device = residual.get_device();
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream(device).stream();
+  const int64_t largest_dimension =
+      std::max(residual.size(1), raw_projection.size(1));
+  int threads = 32;
+  while (threads < largest_dimension && threads < 256) {
+    threads *= 2;
+  }
+  const int64_t rows = residual.size(0);
+  layer_norm_correct_exact_gelu<<<rows, threads, 0, stream>>>(
+      reinterpret_cast<half*>(raw_projection.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(residual.data_ptr<at::Half>()),
+      weight_row_sum.data_ptr<float>(),
+      reinterpret_cast<const half*>(bias.data_ptr<at::Half>()),
+      rows,
+      residual.size(1),
+      raw_projection.size(1),
+      static_cast<float>(eps));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 
 void residual_masked_cuda(
     const torch::Tensor& update,

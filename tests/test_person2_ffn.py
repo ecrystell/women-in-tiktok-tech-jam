@@ -82,6 +82,7 @@ class Person2BlockTests(unittest.TestCase):
     def test_fast_ffn_cache_is_nonpersistent_and_refreshes(self) -> None:
         baseline, optimized = self.make_blocks()
         self.assertNotIn("_ffn_out_weight_nt", optimized.state_dict())
+        self.assertNotIn("_ffn_in_weight_row_sum", optimized.state_dict())
         self.assertTrue(
             torch.equal(
                 optimized._ffn_out_weight_nt,
@@ -98,8 +99,101 @@ class Person2BlockTests(unittest.TestCase):
                 optimized.ffn_out.weight.detach().t().contiguous(),
             )
         )
+        self.assertTrue(
+            torch.equal(
+                optimized._ffn_in_weight_row_sum,
+                optimized.ffn_in.weight.detach().float().sum(dim=1),
+            )
+        )
         self.assertFalse(optimized._norm2_affine_is_identity)
+        self.assertFalse(optimized._ln_gemm_ffn_enabled)
         self.assertFalse(optimized._compact_ffn_enabled)
+
+    def test_ln_gemm_cpu_and_build_failure_fall_back(self) -> None:
+        _baseline, optimized = self.make_blocks()
+        x = torch.randn(2, 5, 32)
+        mask = torch.ones(2, 5, dtype=torch.bool)
+        self.assertFalse(optimized.prepare_ln_gemm_ffn(x, mask))
+        self.assertIn("unsupported", optimized.ln_gemm_ffn_error or "")
+
+        optimized = OptimizedTransformerBlock(32, 4, 32).eval()
+        with (
+            mock.patch.object(
+                optimized, "_supports_ln_gemm_ffn", return_value=True
+            ),
+            mock.patch(
+                "person2_ffn_post.load_extension",
+                side_effect=RuntimeError("simulated correction build failure"),
+            ),
+        ):
+            self.assertFalse(optimized.prepare_ln_gemm_ffn(x, mask))
+        self.assertIn(
+            "simulated correction build failure",
+            optimized.ln_gemm_ffn_error or "",
+        )
+        self.assertFalse(optimized._ln_gemm_ffn_enabled)
+
+    def test_ln_gemm_preflight_and_parameter_invalidation(self) -> None:
+        torch.manual_seed(19)
+        baseline = BaselineTransformerBlock(32, 4, 32).eval()
+        optimized = OptimizedTransformerBlock(32, 4, 32).eval()
+        optimized.load_state_dict(baseline.state_dict(), strict=True)
+        x = torch.randn(2, 5, 32)
+        mask = torch.tensor([[True] * 5, [True, True, True, False, False]])
+
+        def up_gelu(residual, weight, bias, _weight_sum, eps):
+            normalized = torch.nn.functional.layer_norm(
+                residual, (residual.shape[-1],), None, None, eps
+            )
+            return torch.nn.functional.gelu(
+                torch.nn.functional.linear(normalized, weight, bias),
+                approximate="none",
+            )
+
+        def full_masked(
+            residual,
+            up_weight,
+            up_bias,
+            weight_sum,
+            down_weight,
+            down_bias,
+            valid,
+            eps,
+        ):
+            hidden = up_gelu(
+                residual, up_weight, up_bias, weight_sum, eps
+            )
+            update = torch.addmm(down_bias, hidden, down_weight)
+            return (update + residual).masked_fill(~valid[:, None], 0)
+
+        with (
+            mock.patch.object(
+                optimized, "_supports_ln_gemm_ffn", return_value=True
+            ),
+            mock.patch("person2_ffn_post.load_extension"),
+            mock.patch(
+                "person2_ffn_post.algebraic_layer_norm_up_gelu",
+                side_effect=up_gelu,
+            ),
+            mock.patch(
+                "person2_ffn_post.algebraic_layer_norm_ffn_masked",
+                side_effect=full_masked,
+            ),
+        ):
+            self.assertTrue(optimized.prepare_ln_gemm_ffn(x, mask))
+        self.assertTrue(optimized._ln_gemm_ffn_enabled)
+
+        with torch.no_grad():
+            optimized.ffn_in.weight.add_(0.01)
+        with mock.patch.object(
+            optimized,
+            "_ffn_residual_native",
+            wraps=optimized._ffn_residual_native,
+        ) as native:
+            with torch.inference_mode():
+                optimized._ffn_residual(x, mask)
+            native.assert_called_once()
+        self.assertFalse(optimized._ln_gemm_ffn_enabled)
         self.assertIsNone(optimized._compact_mask)
         self.assertIsNone(optimized._compact_valid_rows)
 
@@ -239,6 +333,42 @@ class Person2BlockTests(unittest.TestCase):
                 residual,
                 up_weight,
                 up_bias,
+                weight,
+                bias,
+                1e-5,
+            ).shape,
+            (4, 8),
+        )
+        weight_sum = mode.from_tensor(torch.empty(16, dtype=torch.float32))
+        self.assertEqual(
+            person2_ffn_post.algebraic_layer_norm_up_gelu(
+                residual,
+                up_weight,
+                up_bias,
+                weight_sum,
+                1e-5,
+            ).shape,
+            (4, 16),
+        )
+        self.assertEqual(
+            person2_ffn_post.algebraic_layer_norm_ffn_masked(
+                residual,
+                up_weight,
+                up_bias,
+                weight_sum,
+                weight,
+                bias,
+                mask,
+                1e-5,
+            ).shape,
+            (4, 8),
+        )
+        self.assertEqual(
+            person2_ffn_post.algebraic_layer_norm_ffn_unmasked(
+                residual,
+                up_weight,
+                up_bias,
+                weight_sum,
                 weight,
                 bias,
                 1e-5,
@@ -396,6 +526,67 @@ class Person2BlockTests(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
 class Person2CudaTests(unittest.TestCase):
+    def test_cuda_ln_gemm_correction_and_fallbacks(self) -> None:
+        from torch.utils.cpp_extension import CUDA_HOME
+
+        if CUDA_HOME is None:
+            self.skipTest("a CUDA toolkit is unavailable for extension build")
+        device = torch.device("cuda")
+        torch.manual_seed(41)
+        baseline = BaselineTransformerBlock(32, 4, 32).to(
+            device=device, dtype=torch.float16
+        ).eval()
+        optimized = OptimizedTransformerBlock(32, 4, 32)
+        optimized.load_state_dict(baseline.state_dict(), strict=True)
+        optimized = optimized.to(device=device, dtype=torch.float16).eval()
+        mask = torch.tensor(
+            [[True] * 16, [True] * 12 + [False] * 4], device=device
+        )
+
+        for seed in (43, 47, 53):
+            torch.manual_seed(seed)
+            x = torch.randn(
+                2, 16, 32, device=device, dtype=torch.float16
+            )
+            self.assertTrue(
+                optimized.prepare_ln_gemm_ffn(x, mask),
+                optimized.ln_gemm_ffn_error,
+            )
+            with torch.inference_mode():
+                reference = x + baseline.ffn_out(
+                    torch.nn.functional.gelu(
+                        baseline.ffn_in(baseline.norm2(x)),
+                        approximate="none",
+                    )
+                )
+                reference = reference.masked_fill(~mask[..., None], 0)
+                first = optimized._ffn_residual(x, mask)
+                second = optimized._ffn_residual(x, mask)
+            assert_or_close(self, reference, first)
+            self.assertTrue(torch.equal(first, second))
+            self.assertNotEqual(first.data_ptr(), second.data_ptr())
+            self.assertTrue(bool((first[~mask] == 0).all().item()))
+
+        adversarial = torch.full(
+            (2, 16, 32), 32.0, device=device, dtype=torch.float16
+        )
+        adversarial[:, :, ::2] += 0.03125
+        prepared = optimized.prepare_ln_gemm_ffn(adversarial, mask)
+        with torch.inference_mode():
+            native = optimized._ffn_residual_native(adversarial, mask)
+            selected = optimized._ffn_residual(adversarial, mask)
+        assert_or_close(self, native, selected)
+        if not prepared:
+            self.assertIn(
+                "numerical preflight", optimized.ln_gemm_ffn_error or ""
+            )
+
+        noncontiguous = torch.randn(
+            2, 32, 16, device=device, dtype=torch.float16
+        ).transpose(1, 2)
+        self.assertFalse(noncontiguous.is_contiguous())
+        self.assertFalse(optimized.prepare_ln_gemm_ffn(noncontiguous, mask))
+
     def test_cuda_graph_diagnostic_rejects_aliased_outputs(self) -> None:
         class Doubler(torch.nn.Module):
             def forward(

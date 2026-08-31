@@ -217,6 +217,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--models", choices=("baseline", "optimized", "both"), default="both"
     )
+    parser.add_argument(
+        "--backend",
+        choices=("full-op", "ln-gemm-correction"),
+        default="full-op",
+    )
     parser.add_argument("--sweep", action="store_true")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=512)
@@ -281,7 +286,9 @@ def main() -> int:
 
     results: list[ProfileResult] = []
     for case in cases_from_args(args):
-        baseline, optimized = make_models(case, "isolated", device, dtype)
+        baseline, optimized = make_models(
+            case, "isolated", device, dtype, args.backend
+        )
         prep_x, prep_mask = make_input(case, device, dtype, args.seed)
         prepare = getattr(optimized, "prepare", None)
         if prepare is not None and not prepare(prep_x, prep_mask):

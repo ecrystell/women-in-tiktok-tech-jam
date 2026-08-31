@@ -163,16 +163,24 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
             self.ffn_out.weight.detach().t().contiguous(),
             persistent=False,
         )
+        self.register_buffer(
+            "_ffn_in_weight_row_sum",
+            self.ffn_in.weight.detach().float().sum(dim=1).contiguous(),
+            persistent=False,
+        )
         self._norm2_affine_is_identity = True
+        self._ffn_in_weight_version = self.ffn_in.weight._version
         self._ffn_out_weight_version = self.ffn_out.weight._version
         self._norm2_weight_version = self.norm2.weight._version
         self._norm2_bias_version = self.norm2.bias._version
         self._fast_ffn_enabled = False
+        self._ln_gemm_ffn_enabled = False
         self._compact_ffn_enabled = False
         self._compact_mask: Optional[torch.Tensor] = None
         self._compact_mask_version = -1
         self._compact_valid_rows: Optional[torch.Tensor] = None
         self.fast_ffn_error: Optional[str] = None
+        self.ln_gemm_ffn_error: Optional[str] = None
         self.compact_ffn_error: Optional[str] = None
         self.register_load_state_dict_post_hook(self._refresh_after_load)
 
@@ -183,14 +191,19 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
     @torch.no_grad()
     def _refresh_fast_ffn_state(self) -> None:
         self._ffn_out_weight_nt = self.ffn_out.weight.detach().t().contiguous()
+        self._ffn_in_weight_row_sum = (
+            self.ffn_in.weight.detach().float().sum(dim=1).contiguous()
+        )
         self._norm2_affine_is_identity = bool(
             torch.equal(self.norm2.weight, torch.ones_like(self.norm2.weight))
             and torch.count_nonzero(self.norm2.bias).item() == 0
         )
+        self._ffn_in_weight_version = self.ffn_in.weight._version
         self._ffn_out_weight_version = self.ffn_out.weight._version
         self._norm2_weight_version = self.norm2.weight._version
         self._norm2_bias_version = self.norm2.bias._version
         self._fast_ffn_enabled = False
+        self._ln_gemm_ffn_enabled = False
         self._compact_ffn_enabled = False
         self._compact_mask = None
         self._compact_mask_version = -1
@@ -200,13 +213,28 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         if torch.compiler.is_compiling():
             return True
         current = (
-            self._ffn_out_weight_version == self.ffn_out.weight._version
+            self._ffn_in_weight_version == self.ffn_in.weight._version
+            and self._ffn_out_weight_version == self.ffn_out.weight._version
             and self._norm2_weight_version == self.norm2.weight._version
             and self._norm2_bias_version == self.norm2.bias._version
         )
         if not current:
             self._refresh_fast_ffn_state()
         return current
+
+    def _supports_ln_gemm_ffn(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> bool:
+        return (
+            self._supports_fast_ffn(x, valid_token_mask)
+            and self._norm2_affine_is_identity
+            and self._ffn_in_weight_row_sum.dtype == torch.float32
+            and self._ffn_in_weight_row_sum.device == x.device
+            and self.ffn_in.weight.shape[0] == self.ffn_in.weight.shape[1]
+            and not torch.compiler.is_compiling()
+        )
 
     def _supports_fast_ffn(
         self,
@@ -285,6 +313,43 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
                 self.ffn_out.bias,
                 residual,
                 valid_token_mask.reshape(-1),
+            )
+        return output.reshape(batch, seq_len, d_model)
+
+    def _ffn_residual_ln_gemm(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Elide the materialized LayerNorm input to the square up GEMM.
+
+        For identity-affine LayerNorm and a square up projection,
+        `LN(x) @ W.T` is reconstructed from `x @ W.T`, row statistics, and the
+        cached row sums of W.  A CUDA epilogue applies the correction, rounds at
+        the Linear/GELU boundary, and evaluates exact erf GELU in-place.
+        """
+        batch, seq_len, d_model = x.shape
+        residual = x.reshape(batch * seq_len, d_model)
+        if valid_token_mask is None:
+            output = person2_ffn_post.algebraic_layer_norm_ffn_unmasked(
+                residual,
+                self.ffn_in.weight,
+                self.ffn_in.bias,
+                self._ffn_in_weight_row_sum,
+                self._ffn_out_weight_nt,
+                self.ffn_out.bias,
+                self.norm2.eps,
+            )
+        else:
+            output = person2_ffn_post.algebraic_layer_norm_ffn_masked(
+                residual,
+                self.ffn_in.weight,
+                self.ffn_in.bias,
+                self._ffn_in_weight_row_sum,
+                self._ffn_out_weight_nt,
+                self.ffn_out.bias,
+                valid_token_mask.reshape(-1),
+                self.norm2.eps,
             )
         return output.reshape(batch, seq_len, d_model)
 
@@ -401,15 +466,85 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
             self.fast_ffn_error = f"{type(error).__name__}: {error}"
             return False
 
+    def prepare_ln_gemm_ffn(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> bool:
+        """Prepare and validate the algebraic LayerNorm/GEMM experiment."""
+        self._refresh_fast_ffn_state()
+        self.ln_gemm_ffn_error = None
+        with torch.inference_mode():
+            supported = self._supports_ln_gemm_ffn(x, valid_token_mask)
+        if not supported:
+            self.ln_gemm_ffn_error = (
+                "unsupported device, dtype, layout, shape, parameters, or mode"
+            )
+            return False
+        try:
+            person2_ffn_post.load_extension()
+            batch, seq_len, d_model = x.shape
+            residual = x.reshape(batch * seq_len, d_model)
+            with torch.inference_mode():
+                normalized = F.layer_norm(
+                    residual,
+                    (d_model,),
+                    None,
+                    None,
+                    self.norm2.eps,
+                )
+                reference_up = F.gelu(
+                    F.linear(normalized, self.ffn_in.weight, self.ffn_in.bias),
+                    approximate="none",
+                )
+                candidate_up = person2_ffn_post.algebraic_layer_norm_up_gelu(
+                    residual,
+                    self.ffn_in.weight,
+                    self.ffn_in.bias,
+                    self._ffn_in_weight_row_sum,
+                    self.norm2.eps,
+                )
+                reference = self._ffn_residual_native(x, valid_token_mask)
+                candidate = self._ffn_residual_ln_gemm(x, valid_token_mask)
+
+            for stage, expected, actual in (
+                ("up-gelu", reference_up, candidate_up),
+                ("full-ffn", reference, candidate),
+            ):
+                ref = expected.float()
+                opt = actual.float()
+                error = (opt - ref).abs()
+                passed = torch.isfinite(ref) & torch.isfinite(opt)
+                passed &= (error <= 0.001) | (error <= 0.01 * ref.abs())
+                if not bool(passed.all().item()):
+                    self.ln_gemm_ffn_error = (
+                        f"strict {stage} numerical preflight failed: "
+                        f"max_abs={error.max().item():.6g}, "
+                        f"failed={int((~passed).sum().item())}"
+                    )
+                    return False
+            self._ln_gemm_ffn_enabled = True
+            return True
+        except (ImportError, OSError, RuntimeError) as error:
+            self.ln_gemm_ffn_error = f"{type(error).__name__}: {error}"
+            return False
+
     def _ffn_residual(
         self,
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Apply the pre-norm FFN residual sublayer with baseline semantics."""
+        parameters_are_current = self._fast_parameters_are_current()
+        if (
+            self._ln_gemm_ffn_enabled
+            and parameters_are_current
+            and self._supports_ln_gemm_ffn(x, valid_token_mask)
+        ):
+            return self._ffn_residual_ln_gemm(x, valid_token_mask)
         if (
             self._fast_ffn_enabled
-            and self._fast_parameters_are_current()
+            and parameters_are_current
             and self._supports_fast_ffn(x, valid_token_mask)
         ):
             if self._compact_ffn_enabled and self._compact_mask_is_current(
