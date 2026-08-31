@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import unittest
+import os
+from unittest import mock
 
 try:
     import torch
     import torch.nn.functional as F
+    import person1_triton_attention as attention_impl
 
     from person1_triton_attention import (
         TritonSelfAttention,
+        cuda_bfloat16_supported,
+        prepare_valid_token_mask,
+        sdpa_backend_diagnostics,
         triton_available,
         triton_op_available,
         triton_scaled_dot_product_attention,
@@ -20,13 +26,22 @@ try:
 except ModuleNotFoundError:
     torch = None  # type: ignore[assignment]
     F = None  # type: ignore[assignment]
+    attention_impl = None  # type: ignore[assignment]
     _TORCH_AVAILABLE = False
+    cuda_bfloat16_supported = lambda device=None: False  # type: ignore[assignment]
+    prepare_valid_token_mask = lambda mask: mask  # type: ignore[assignment]
+    sdpa_backend_diagnostics = lambda *args, **kwargs: {}  # type: ignore[assignment]
     triton_available = lambda: False  # type: ignore[assignment]
     triton_op_available = lambda: False  # type: ignore[assignment]
 
 
 _CUDA_TRITON_AVAILABLE = bool(
     _TORCH_AVAILABLE and torch.cuda.is_available() and triton_available()
+)
+_CUDA_BF16_AVAILABLE = bool(
+    _TORCH_AVAILABLE
+    and torch.cuda.is_available()
+    and cuda_bfloat16_supported(torch.device("cuda"))
 )
 
 
@@ -111,6 +126,168 @@ class Person1AttentionTests(unittest.TestCase):
                 )
                 assert_or_close(self, reference, candidate)
 
+    def test_cpu_sdpa_supports_all_official_head_dimensions(self):
+        """SDPA must not be gated by the custom Triton head-dim set."""
+
+        torch.manual_seed(8)
+        # (d_model, heads) covers official Dh values 8, 32, 64, 128, and 256.
+        for d_model, heads in ((32, 4), (128, 4), (128, 2), (128, 1), (1024, 4)):
+            head_dim = d_model // heads
+            q = torch.randn(1, heads, 13, head_dim)
+            k = torch.randn_like(q)
+            v = torch.randn_like(q)
+            candidate = triton_scaled_dot_product_attention(q, k, v, causal=True)
+            reference = reference_attention(q, k, v, causal=True)
+            assert_or_close(self, reference, candidate)
+
+    def test_auto_module_reports_sdpa_for_official_head_dimensions(self):
+        for d_model, heads in ((32, 4), (128, 4), (128, 2), (128, 1), (1024, 4)):
+            module = TritonSelfAttention(d_model, heads, backend="auto")
+            x = torch.randn(1, 5, d_model)
+            self.assertEqual(module.selected_backend(x), "sdpa")
+
+    def test_setup_mask_normalization_only_collapses_all_valid_masks(self):
+        all_valid = torch.ones(2, 7, dtype=torch.bool)
+        self.assertIsNone(prepare_valid_token_mask(all_valid))
+        padded = all_valid.clone()
+        padded[1, -1] = False
+        self.assertIs(prepare_valid_token_mask(padded), padded)
+
+    def test_backend_status_reports_actual_sdpa_or_fallback_reason(self):
+        module = TritonSelfAttention(32, 4, backend="sdpa").eval()
+        x = torch.randn(1, 5, 32)
+        module(x)
+        self.assertEqual(module.backend_status(), ("sdpa", None))
+
+        triton_module = TritonSelfAttention(64, 1, backend="triton").eval()
+        triton_module(torch.randn(1, 32, 64))
+        backend, reason = triton_module.backend_status()
+        self.assertEqual(backend, "sdpa-fallback")
+        self.assertTrue(reason)
+
+    def test_sdpa_diagnostic_reports_layout_mask_and_backend_candidates(self):
+        q = torch.randn(1, 2, 9, 16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        diagnostics = sdpa_backend_diagnostics(
+            q, k, v, valid_token_mask=self._make_mask(1, 9, q.device), causal=True
+        )
+        self.assertEqual(diagnostics["shape"], (1, 2, 9, 16))
+        self.assertEqual(diagnostics["mask"], "key-only-bool")
+        self.assertEqual(diagnostics["q_stride"], tuple(q.stride()))
+        self.assertIn("selected_kernel", diagnostics)
+        self.assertIn("math", diagnostics["backends"])
+
+    def test_non_contiguous_qkv_layout_matches_contiguous_reference(self):
+        torch.manual_seed(9)
+        storage = torch.randn(1, 2, 13, 32)
+        q = storage[..., ::2]
+        k = torch.randn_like(storage)[..., ::2]
+        v = torch.randn_like(storage)[..., ::2]
+        self.assertFalse(q.is_contiguous())
+        mask = self._make_mask(1, 13, q.device)
+        candidate = triton_scaled_dot_product_attention(
+            q, k, v, valid_token_mask=mask, causal=True
+        )
+        reference = reference_attention(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            valid_token_mask=mask,
+            causal=True,
+        )
+        assert_or_close(self, reference, candidate)
+
+    def test_repeated_calls_preserve_previous_output(self):
+        module = TritonSelfAttention(32, 4, backend="sdpa").eval()
+        x = torch.randn(2, 13, 32)
+        first = module(x).clone()
+        second = module(x)
+        self.assertTrue(torch.equal(first, second))
+        self.assertIsNot(first, second)
+        self.assertNotEqual(first.data_ptr(), x.data_ptr())
+        self.assertNotEqual(second.data_ptr(), x.data_ptr())
+
+    def test_masked_keys_cannot_change_valid_outputs_and_queries_are_zero(self):
+        torch.manual_seed(10)
+        q = torch.randn(1, 2, 13, 16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        mask = torch.zeros(1, 13, dtype=torch.bool)
+        mask[:, :7] = True
+        baseline = triton_scaled_dot_product_attention(
+            q, k, v, valid_token_mask=mask, causal=False
+        )
+        k_changed = k.clone()
+        v_changed = v.clone()
+        k_changed[:, :, 7:, :] = 1000.0
+        v_changed[:, :, 7:, :] = -1000.0
+        changed = triton_scaled_dot_product_attention(
+            q, k_changed, v_changed, valid_token_mask=mask, causal=False
+        )
+        self.assertTrue(torch.equal(baseline[:, :, :7, :], changed[:, :, :7, :]))
+        self.assertEqual(float(changed[:, :, 7:, :].abs().sum()), 0.0)
+
+    def test_mask_boundaries_at_attention_tile_edges(self):
+        """Check masks ending at and just after the initial tile boundary."""
+
+        torch.manual_seed(12)
+        q = torch.randn(1, 2, 65, 16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        for valid_length in (31, 32, 33, 63, 64, 65):
+            mask = torch.zeros(1, 65, dtype=torch.bool)
+            mask[:, :valid_length] = True
+            for causal in (False, True):
+                candidate = triton_scaled_dot_product_attention(
+                    q, k, v, valid_token_mask=mask, causal=causal
+                )
+                reference = reference_attention(
+                    q, k, v, valid_token_mask=mask, causal=causal
+                )
+                assert_or_close(self, reference, candidate)
+
+    def test_long_masked_fallback_never_uses_dense_reference(self):
+        """An unsupported causal+padding SDPA combination must stay tiled."""
+
+        q = torch.randn(1, 1, 2050, 8)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        mask = torch.zeros(1, 2050, dtype=torch.bool)
+        mask[:, :2047] = True
+        with mock.patch.object(
+            attention_impl.F,
+            "scaled_dot_product_attention",
+            side_effect=RuntimeError("forced unsupported SDPA combination"),
+        ), mock.patch.object(
+            attention_impl,
+            "_explicit_compatibility_attention",
+            side_effect=AssertionError("dense attention must not be used"),
+        ):
+            candidate = attention_impl.sdpa_scaled_dot_product_attention(
+                q, k, v, valid_token_mask=mask, causal=True
+            )
+        self.assertEqual(tuple(candidate.shape), tuple(q.shape))
+        self.assertTrue(torch.isfinite(candidate).all())
+        self.assertEqual(float(candidate[:, :, 2047:, :].abs().sum()), 0.0)
+
+    @unittest.skipUnless(
+        _CUDA_TRITON_AVAILABLE
+        and triton_op_available()
+        and os.environ.get("RUN_LONG_ATTENTION_TESTS") == "1",
+        "set RUN_LONG_ATTENTION_TESTS=1 with CUDA, Triton, and triton_op",
+    )
+    def test_cuda_100k_sequence_smoke_is_memory_bounded(self):
+        """Exercise the long-sequence tiled core without a dense reference."""
+
+        device = torch.device("cuda")
+        q = torch.randn(1, 1, 100_000, 64, device=device, dtype=torch.float16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        candidate = triton_scaled_dot_product_attention(q, k, v, causal=True)
+        self.assertEqual(tuple(candidate.shape), tuple(q.shape))
+        self.assertTrue(torch.isfinite(candidate).all())
+
     def test_packed_weight_transfer_matches_baseline(self):
         torch.manual_seed(11)
         baseline = BaselineSelfAttention(d_model=32, num_heads=4).eval()
@@ -152,10 +329,7 @@ class Person1AttentionTests(unittest.TestCase):
                 )
                 assert_or_close(self, reference, candidate, rtol=0.01, atol=0.001)
 
-    @unittest.skipUnless(
-        _CUDA_TRITON_AVAILABLE,
-        "CUDA and Triton are required for custom-kernel tests",
-    )
+    @unittest.skipUnless(_CUDA_BF16_AVAILABLE, "native CUDA BF16 is unsupported")
     def test_cuda_bfloat16_forward(self):
         device = torch.device("cuda")
         q = torch.randn(2, 2, 64, 64, device=device, dtype=torch.bfloat16)
@@ -248,15 +422,42 @@ class Person1AttentionTests(unittest.TestCase):
     )
     def test_torch_compile_smoke(self):
         device = torch.device("cuda")
+        baseline = (
+            BaselineSelfAttention(64, 2)
+            .to(device=device, dtype=torch.float16)
+            .eval()
+        )
         module = (
             TritonSelfAttention(64, 2, backend="triton")
             .to(device=device, dtype=torch.float16)
             .eval()
         )
+        module.copy_from_baseline(baseline)
         x = torch.randn(2, 32, 64, device=device, dtype=torch.float16)
-        compiled = torch.compile(module, backend="inductor")
-        output = compiled(x)
-        self.assertEqual(tuple(output.shape), (2, 32, 64))
+        compiled_baseline = torch.compile(
+            baseline,
+            backend="inductor",
+            fullgraph=True,
+            dynamic=False,
+        )
+        compiled_candidate = torch.compile(
+            module,
+            backend="inductor",
+            fullgraph=True,
+            dynamic=False,
+        )
+        eager_reference = baseline(x)
+        eager_candidate = module(x)
+        compiled_reference = compiled_baseline(x)
+        compiled_output = compiled_candidate(x)
+        self.assertEqual(tuple(compiled_output.shape), (2, 32, 64))
+        assert_or_close(self, eager_reference, eager_candidate, rtol=0.01, atol=0.001)
+        assert_or_close(
+            self, eager_reference, compiled_reference, rtol=0.01, atol=0.001
+        )
+        assert_or_close(
+            self, compiled_reference, compiled_output, rtol=0.01, atol=0.001
+        )
 
 
 if __name__ == "__main__":
