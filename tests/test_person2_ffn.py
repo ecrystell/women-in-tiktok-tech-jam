@@ -10,9 +10,12 @@ from unittest import mock
 import torch
 
 from bench_person2_ffn import (
+    Case,
+    OptimizedFFNResidual,
     StaticCudaGraphFFN,
     accuracy_output,
     compile_model,
+    make_models,
     mark_inference_step,
     official_cases,
     official_isolated_cases,
@@ -100,6 +103,7 @@ class Person2BlockTests(unittest.TestCase):
         )
         self.assertFalse(optimized._norm2_affine_is_identity)
         self.assertFalse(optimized._compact_ffn_enabled)
+        self.assertFalse(optimized._output_only_layer_norm_enabled)
         self.assertIsNone(optimized._compact_mask)
         self.assertIsNone(optimized._compact_valid_rows)
 
@@ -124,6 +128,126 @@ class Person2BlockTests(unittest.TestCase):
         self.assertIn("simulated build failure", optimized.fast_ffn_error or "")
         self.assertFalse(optimized._fast_ffn_enabled)
         self.assertFalse(optimized._compact_ffn_enabled)
+
+    def test_output_only_layer_norm_cpu_and_build_failure_fall_back(self) -> None:
+        _baseline, optimized = self.make_blocks()
+        x = torch.randn(2, 5, 32)
+        mask = torch.ones(2, 5, dtype=torch.bool)
+        self.assertFalse(
+            optimized.prepare_output_only_layer_norm_ffn(x, mask)
+        )
+        self.assertIn(
+            "unsupported", optimized.output_only_layer_norm_error or ""
+        )
+
+        optimized = self.make_blocks()[1]
+        with (
+            mock.patch.object(
+                optimized,
+                "_supports_output_only_layer_norm_ffn",
+                return_value=True,
+            ),
+            mock.patch(
+                "person2_ffn_post.load_extension",
+                side_effect=RuntimeError("simulated LayerNorm build failure"),
+            ),
+        ):
+            self.assertFalse(
+                optimized.prepare_output_only_layer_norm_ffn(x, mask)
+            )
+        self.assertIn(
+            "simulated LayerNorm build failure",
+            optimized.output_only_layer_norm_error or "",
+        )
+        self.assertFalse(optimized._output_only_layer_norm_enabled)
+
+    def test_output_only_layer_norm_preflight_and_invalidation(self) -> None:
+        baseline, optimized = self.make_blocks()
+        x = torch.randn(2, 5, 32)
+        mask = torch.tensor([[True] * 5, [True, True, True, False, False]])
+
+        def standalone(residual: torch.Tensor, eps: float) -> torch.Tensor:
+            return torch.nn.functional.layer_norm(
+                residual, (residual.shape[-1],), None, None, eps
+            )
+
+        def combined(
+            residual,
+            up_weight,
+            up_bias,
+            down_weight,
+            down_bias,
+            valid,
+            eps,
+        ):
+            normalized = standalone(residual, eps)
+            hidden = torch.nn.functional.gelu(
+                torch.nn.functional.linear(normalized, up_weight, up_bias),
+                approximate="none",
+            )
+            update = torch.addmm(down_bias, hidden, down_weight)
+            return (update + residual).masked_fill(~valid[:, None], 0)
+
+        with (
+            mock.patch.object(
+                optimized,
+                "_supports_output_only_layer_norm_ffn",
+                return_value=True,
+            ),
+            mock.patch("person2_ffn_post.load_extension"),
+            mock.patch(
+                "person2_ffn_post.output_only_layer_norm",
+                side_effect=standalone,
+            ),
+            mock.patch(
+                "person2_ffn_post.output_only_layer_norm_ffn_masked",
+                side_effect=combined,
+            ) as candidate_op,
+        ):
+            self.assertTrue(
+                optimized.prepare_output_only_layer_norm_ffn(x, mask),
+                optimized.output_only_layer_norm_error,
+            )
+            with torch.inference_mode():
+                reference = x + baseline.ffn_out(
+                    torch.nn.functional.gelu(
+                        baseline.ffn_in(baseline.norm2(x)), approximate="none"
+                    )
+                )
+                reference = reference.masked_fill(~mask[..., None], 0)
+                first = optimized._ffn_residual(x, mask)
+                second = optimized._ffn_residual(x, mask)
+            assert_or_close(self, reference, first)
+            self.assertTrue(torch.equal(first, second))
+            self.assertNotEqual(first.data_ptr(), second.data_ptr())
+            self.assertGreaterEqual(candidate_op.call_count, 3)
+
+            with torch.no_grad():
+                optimized.norm2.weight[0] = 0.75
+            with torch.inference_mode():
+                changed = optimized._ffn_residual(x, mask)
+            self.assertFalse(optimized._output_only_layer_norm_enabled)
+            self.assertEqual(candidate_op.call_count, 3)
+            native_changed = optimized._ffn_residual_native(x, mask)
+            assert_or_close(self, native_changed, changed)
+
+    def test_output_only_backend_can_use_full_op_control(self) -> None:
+        case = Case(1, 4, 32, 4, 32, False, 0.0)
+        control, candidate = make_models(
+            case,
+            "isolated",
+            torch.device("cpu"),
+            torch.float32,
+            backend="output-layernorm",
+            control_backend="full-op",
+        )
+        self.assertIsInstance(control, OptimizedFFNResidual)
+        self.assertIsInstance(candidate, OptimizedFFNResidual)
+        self.assertEqual(control.backend, "full-op")
+        self.assertEqual(candidate.backend, "output-layernorm")
+        self.assertEqual(
+            set(control.block.state_dict()), set(candidate.block.state_dict())
+        )
 
     def test_fast_ffn_preflight_and_repeated_calls(self) -> None:
         baseline, optimized = self.make_blocks()
@@ -236,6 +360,33 @@ class Person2BlockTests(unittest.TestCase):
         )
         self.assertEqual(
             person2_ffn_post.identity_layer_norm_ffn_unmasked(
+                residual,
+                up_weight,
+                up_bias,
+                weight,
+                bias,
+                1e-5,
+            ).shape,
+            (4, 8),
+        )
+        self.assertEqual(
+            person2_ffn_post.output_only_layer_norm(residual, 1e-5).shape,
+            (4, 8),
+        )
+        self.assertEqual(
+            person2_ffn_post.output_only_layer_norm_ffn_masked(
+                residual,
+                up_weight,
+                up_bias,
+                weight,
+                bias,
+                mask,
+                1e-5,
+            ).shape,
+            (4, 8),
+        )
+        self.assertEqual(
+            person2_ffn_post.output_only_layer_norm_ffn_unmasked(
                 residual,
                 up_weight,
                 up_bias,
@@ -396,6 +547,170 @@ class Person2BlockTests(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
 class Person2CudaTests(unittest.TestCase):
+    @staticmethod
+    def require_cuda_toolkit() -> None:
+        from torch.utils.cpp_extension import CUDA_HOME
+
+        if CUDA_HOME is None:
+            raise unittest.SkipTest("a CUDA toolkit is unavailable for extension build")
+
+    def test_cuda_output_only_layer_norm_adversarial_dimensions(self) -> None:
+        self.require_cuda_toolkit()
+        import person2_ffn_post
+
+        device = torch.device("cuda")
+        for d_model in (32, 128, 1024):
+            columns = torch.arange(d_model, device=device)
+            values = (
+                torch.randn(8, d_model, device=device, dtype=torch.float16),
+                torch.full(
+                    (8, d_model), 3.25, device=device, dtype=torch.float16
+                ),
+                (
+                    torch.full(
+                        (8, d_model),
+                        64.0,
+                        device=device,
+                        dtype=torch.float16,
+                    )
+                    + ((columns % 5) - 2).to(torch.float16) * 0.0625
+                ),
+                torch.where(
+                    columns.remainder(2) == 0,
+                    torch.tensor(32.0, device=device, dtype=torch.float16),
+                    torch.tensor(-32.0, device=device, dtype=torch.float16),
+                ).expand(8, -1).contiguous(),
+            )
+            for residual in values:
+                reference = torch.nn.functional.layer_norm(
+                    residual, (d_model,), None, None, 1e-5
+                )
+                candidate = person2_ffn_post.output_only_layer_norm(
+                    residual, 1e-5
+                )
+                assert_or_close(self, reference, candidate)
+
+    def test_cuda_output_only_layer_norm_support_guards(self) -> None:
+        device = torch.device("cuda")
+        _baseline, optimized = Person2BlockTests.make_blocks(
+            device, torch.float16
+        )
+        mask = torch.ones(2, 8, device=device, dtype=torch.bool)
+        supported = torch.randn(
+            2, 8, 32, device=device, dtype=torch.float16
+        )
+        unsupported_dimension = torch.randn(
+            2, 8, 64, device=device, dtype=torch.float16
+        )
+        noncontiguous = torch.randn(
+            2, 32, 8, device=device, dtype=torch.float16
+        ).transpose(1, 2)
+        with torch.inference_mode():
+            self.assertTrue(
+                optimized._supports_output_only_layer_norm_ffn(supported, mask)
+            )
+            self.assertFalse(
+                optimized._supports_output_only_layer_norm_ffn(
+                    unsupported_dimension, mask
+                )
+            )
+            self.assertFalse(
+                optimized._supports_output_only_layer_norm_ffn(
+                    noncontiguous, mask
+                )
+            )
+            self.assertFalse(
+                optimized._supports_output_only_layer_norm_ffn(
+                    supported.float(), mask
+                )
+            )
+        with torch.no_grad():
+            optimized.norm2.bias[0] = 1.0
+        optimized._refresh_fast_ffn_state()
+        with torch.inference_mode():
+            self.assertFalse(
+                optimized._supports_output_only_layer_norm_ffn(supported, mask)
+            )
+
+    def test_cuda_output_only_full_op_masks_outputs_and_stream(self) -> None:
+        self.require_cuda_toolkit()
+        import person2_ffn_post
+
+        device = torch.device("cuda")
+        baseline, optimized = Person2BlockTests.make_blocks(
+            device, torch.float16
+        )
+        x = torch.randn(2, 16, 32, device=device, dtype=torch.float16)
+        masks = (
+            None,
+            torch.tensor(
+                [[True] * 16, [True] * 12 + [False] * 4], device=device
+            ),
+        )
+        for mask in masks:
+            self.assertTrue(
+                optimized.prepare_output_only_layer_norm_ffn(x, mask),
+                optimized.output_only_layer_norm_error,
+            )
+            with torch.inference_mode():
+                reference = x + baseline.ffn_out(
+                    torch.nn.functional.gelu(
+                        baseline.ffn_in(baseline.norm2(x)), approximate="none"
+                    )
+                )
+                if mask is not None:
+                    reference = reference.masked_fill(~mask[..., None], 0)
+                candidate = optimized._ffn_residual(x, mask)
+                repeated = optimized._ffn_residual(x, mask)
+            assert_or_close(self, reference, candidate)
+            self.assertTrue(torch.equal(candidate, repeated))
+            self.assertNotEqual(candidate.data_ptr(), repeated.data_ptr())
+            if mask is not None:
+                self.assertTrue(bool((candidate[~mask] == 0).all().item()))
+
+        side_stream = torch.cuda.Stream(device=device)
+        side_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(side_stream):
+            stream_input = torch.randn(
+                16, 128, device=device, dtype=torch.float16
+            )
+            stream_output = person2_ffn_post.output_only_layer_norm(
+                stream_input, 1e-5
+            )
+            completed = torch.cuda.Event()
+            completed.record(side_stream)
+        torch.cuda.current_stream(device).wait_event(completed)
+        assert_or_close(
+            self,
+            torch.nn.functional.layer_norm(
+                stream_input, (128,), None, None, 1e-5
+            ),
+            stream_output,
+        )
+
+        if torch.cuda.get_device_capability()[0] >= 7:
+            class IsolatedFFN(torch.nn.Module):
+                def __init__(self, block: OptimizedTransformerBlock) -> None:
+                    super().__init__()
+                    self.block = block
+
+                def forward(
+                    self, value: torch.Tensor, valid: torch.Tensor
+                ) -> torch.Tensor:
+                    return self.block._ffn_residual(value, valid)
+
+            compile_mask = masks[1]
+            self.assertIsNotNone(compile_mask)
+            compiled = torch.compile(
+                IsolatedFFN(optimized),
+                mode="default",
+                fullgraph=True,
+                dynamic=False,
+            )
+            with torch.inference_mode():
+                reference = optimized._ffn_residual_native(x, compile_mask)
+                assert_or_close(self, reference, compiled(x, compile_mask))
+
     def test_cuda_graph_diagnostic_rejects_aliased_outputs(self) -> None:
         class Doubler(torch.nn.Module):
             def forward(
