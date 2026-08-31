@@ -8,7 +8,7 @@ Correctness rule for every output element:
     OR
     abs(user - ref) <= rtol * abs(ref)
 
-The organizer defaults are atol=0.002 and rtol=0.02 (2%).
+The default thresholds are atol=0.001 and rtol=0.01 (1%).
 """
 
 from __future__ import annotations
@@ -24,15 +24,6 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-import person2_ffn_post
-from person1_triton_attention import PackedQKVSDPAAttention
-from person3_dispatch import (
-    AttentionDispatchPlan,
-    historical_t4_measurements,
-    make_dispatch_key,
-    select_attention_plan,
-)
 
 
 @dataclass(frozen=True)
@@ -131,133 +122,6 @@ class BaselineSelfAttention(nn.Module):
         return output
 
 
-class FastSelfAttention(nn.Module):
-    """Packed-QKV self-attention backed by PyTorch's fused SDPA kernels.
-
-    This module intentionally has the same forward signature and output
-    semantics as :class:`BaselineSelfAttention`, but combines the three input
-    projections into one GEMM and delegates the score/softmax/value pipeline
-    to ``scaled_dot_product_attention``.  The latter can dispatch to a fused
-    CUDA attention implementation when the input shape, dtype, and mask allow
-    it.
-
-    The module is standalone so that the integration layer can choose it for
-    specific benchmark configurations without changing the baseline model.
-    """
-
-    def __init__(self, d_model: int, num_heads: int) -> None:
-        super().__init__()
-        if d_model % num_heads != 0:
-            raise ValueError("d_model must be divisible by num_heads")
-
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        self.scale = self.head_dim**-0.5
-
-        # The rows of qkv_proj are laid out as [Q; K; V].  This preserves the
-        # baseline parameter semantics while reducing three projection calls
-        # to one matrix multiplication.
-        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=True)
-        self.out_proj = nn.Linear(d_model, d_model, bias=True)
-
-    def _attention_mask(
-        self,
-        valid_token_mask: torch.Tensor,
-        seq_len: int,
-        causal: bool,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Build an SDPA boolean mask with True meaning ``allowed``."""
-        if valid_token_mask.ndim != 2 or valid_token_mask.shape[1] != seq_len:
-            raise ValueError(
-                "valid_token_mask must have shape [batch_size, seq_len]"
-            )
-
-        valid_keys = valid_token_mask.to(device=device, dtype=torch.bool)
-        # The baseline masks invalid keys and zeroes invalid queries after the
-        # output projection.  For causal + padding inputs, combine both rules
-        # into one mask because SDPA does not accept both attn_mask and
-        # is_causal=True in the same call.
-        if causal:
-            causal_allowed = torch.ones(
-                (seq_len, seq_len), device=device, dtype=torch.bool
-            ).tril()
-            return causal_allowed[None, None, :, :] & valid_keys[:, None, None, :]
-        return valid_keys[:, None, None, :]
-
-    @torch.no_grad()
-    def copy_from_baseline(self, source: BaselineSelfAttention) -> None:
-        """Copy equivalent weights from a baseline attention module."""
-        if self.d_model != source.d_model or self.num_heads != source.num_heads:
-            raise ValueError("source and destination attention shapes do not match")
-
-        self.qkv_proj.weight.copy_(
-            torch.cat(
-                [
-                    source.q_proj.weight,
-                    source.k_proj.weight,
-                    source.v_proj.weight,
-                ],
-                dim=0,
-            )
-        )
-        self.qkv_proj.bias.copy_(
-            torch.cat(
-                [source.q_proj.bias, source.k_proj.bias, source.v_proj.bias],
-                dim=0,
-            )
-        )
-        self.out_proj.load_state_dict(source.out_proj.state_dict())
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor] = None,
-        causal: bool = False,
-    ) -> torch.Tensor:
-        batch, seq_len, _ = x.shape
-
-        # Keep Q/K/V as views into the packed projection result.  Avoiding a
-        # second materialized projection result is important for launch and
-        # memory traffic; SDPA accepts this strided head layout.
-        qkv = self.qkv_proj(x).view(
-            batch, seq_len, 3, self.num_heads, self.head_dim
-        )
-        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
-
-        if valid_token_mask is None:
-            context = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                is_causal=causal,
-            )
-        else:
-            attention_mask = self._attention_mask(
-                valid_token_mask=valid_token_mask,
-                seq_len=seq_len,
-                causal=causal,
-                device=x.device,
-            )
-            context = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=attention_mask,
-                is_causal=False,
-            )
-
-        context = context.transpose(1, 2).contiguous().view(
-            batch, seq_len, self.d_model
-        )
-        output = self.out_proj(context)
-
-        if valid_token_mask is not None:
-            output = output.masked_fill(~valid_token_mask[..., None], 0)
-        return output
-
-
 class BaselineTransformerBlock(nn.Module):
     def __init__(self, d_model: int, num_heads: int, ffn_dim: int) -> None:
         super().__init__()
@@ -279,304 +143,6 @@ class BaselineTransformerBlock(nn.Module):
         if valid_token_mask is not None:
             x = x.masked_fill(~valid_token_mask[..., None], 0)
         return x
-
-
-class OptimizedTransformerBlock(BaselineTransformerBlock):
-    """Transformer block with a compiler-friendly, token-major FFN path.
-
-    The attention path intentionally remains the baseline implementation so
-    that this block owns only the LayerNorm/FFN/residual portion assigned to
-    Person 2.  The module names and parameter structure are inherited
-    unchanged, which keeps strict state-dict copying compatible.
-    """
-
-    def __init__(self, d_model: int, num_heads: int, ffn_dim: int) -> None:
-        super().__init__(d_model, num_heads, ffn_dim)
-        self.register_buffer(
-            "_ffn_out_weight_nt",
-            self.ffn_out.weight.detach().t().contiguous(),
-            persistent=False,
-        )
-        self._norm2_affine_is_identity = True
-        self._ffn_out_weight_version = self.ffn_out.weight._version
-        self._norm2_weight_version = self.norm2.weight._version
-        self._norm2_bias_version = self.norm2.bias._version
-        self._fast_ffn_enabled = False
-        self._compact_ffn_enabled = False
-        self._compact_mask: Optional[torch.Tensor] = None
-        self._compact_mask_version = -1
-        self._compact_valid_rows: Optional[torch.Tensor] = None
-        self.fast_ffn_error: Optional[str] = None
-        self.compact_ffn_error: Optional[str] = None
-        self.register_load_state_dict_post_hook(self._refresh_after_load)
-
-    def _refresh_after_load(self, module: nn.Module, incompatible_keys: object) -> None:
-        del module, incompatible_keys
-        self._refresh_fast_ffn_state()
-
-    @torch.no_grad()
-    def _refresh_fast_ffn_state(self) -> None:
-        self._ffn_out_weight_nt = self.ffn_out.weight.detach().t().contiguous()
-        self._norm2_affine_is_identity = bool(
-            torch.equal(self.norm2.weight, torch.ones_like(self.norm2.weight))
-            and torch.count_nonzero(self.norm2.bias).item() == 0
-        )
-        self._ffn_out_weight_version = self.ffn_out.weight._version
-        self._norm2_weight_version = self.norm2.weight._version
-        self._norm2_bias_version = self.norm2.bias._version
-        self._fast_ffn_enabled = False
-        self._compact_ffn_enabled = False
-        self._compact_mask = None
-        self._compact_mask_version = -1
-        self._compact_valid_rows = None
-
-    def _fast_parameters_are_current(self) -> bool:
-        if torch.compiler.is_compiling():
-            return True
-        current = (
-            self._ffn_out_weight_version == self.ffn_out.weight._version
-            and self._norm2_weight_version == self.norm2.weight._version
-            and self._norm2_bias_version == self.norm2.bias._version
-        )
-        if not current:
-            self._refresh_fast_ffn_state()
-        return current
-
-    def _supports_fast_ffn(
-        self,
-        x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor],
-    ) -> bool:
-        return (
-            x.is_cuda
-            and x.dtype == torch.float16
-            and x.ndim == 3
-            and x.is_contiguous()
-            and x.shape[-1] % 2 == 0
-            and (valid_token_mask is None or valid_token_mask.is_contiguous())
-            and not self.training
-            and not torch.is_grad_enabled()
-        )
-
-    def _ffn_residual_native(
-        self,
-        x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        batch, seq_len, d_model = x.shape
-        ffn_input = self.norm2(x).reshape(batch * seq_len, d_model)
-        ffn_update = self.ffn_out(
-            F.gelu(self.ffn_in(ffn_input), approximate="none")
-        )
-        output = x + ffn_update.reshape(batch, seq_len, d_model)
-        if valid_token_mask is not None:
-            output = output.masked_fill(~valid_token_mask[..., None], 0)
-        return output
-
-    def _ffn_residual_fast(
-        self,
-        x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        batch, seq_len, d_model = x.shape
-        residual = x.reshape(batch * seq_len, d_model)
-        if self._norm2_affine_is_identity:
-            if valid_token_mask is None:
-                output = person2_ffn_post.identity_layer_norm_ffn_unmasked(
-                    residual,
-                    self.ffn_in.weight,
-                    self.ffn_in.bias,
-                    self._ffn_out_weight_nt,
-                    self.ffn_out.bias,
-                    self.norm2.eps,
-                )
-            else:
-                output = person2_ffn_post.identity_layer_norm_ffn_masked(
-                    residual,
-                    self.ffn_in.weight,
-                    self.ffn_in.bias,
-                    self._ffn_out_weight_nt,
-                    self.ffn_out.bias,
-                    valid_token_mask.reshape(-1),
-                    self.norm2.eps,
-                )
-            return output.reshape(batch, seq_len, d_model)
-        else:
-            normalized = self.norm2(x)
-        ffn_input = normalized.reshape(batch * seq_len, d_model)
-        preactivation = self.ffn_in(ffn_input)
-        if valid_token_mask is None:
-            output = person2_ffn_post.exact_gelu_down_unmasked(
-                preactivation,
-                self._ffn_out_weight_nt,
-                self.ffn_out.bias,
-                residual,
-            )
-        else:
-            output = person2_ffn_post.exact_gelu_down_masked(
-                preactivation,
-                self._ffn_out_weight_nt,
-                self.ffn_out.bias,
-                residual,
-                valid_token_mask.reshape(-1),
-            )
-        return output.reshape(batch, seq_len, d_model)
-
-    def _ffn_residual_compact(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run the FFN only for rows already declared valid by the mask."""
-        if self._compact_valid_rows is None:
-            raise RuntimeError("valid-row compaction was not prepared")
-        batch, seq_len, d_model = x.shape
-        flat = x.reshape(batch * seq_len, d_model)
-        residual = flat.index_select(0, self._compact_valid_rows)
-        if self._norm2_affine_is_identity:
-            normalized = F.layer_norm(
-                residual,
-                self.norm2.normalized_shape,
-                None,
-                None,
-                self.norm2.eps,
-            )
-        else:
-            normalized = self.norm2(residual)
-        preactivation = self.ffn_in(normalized)
-        valid_output = person2_ffn_post.exact_gelu_down_unmasked(
-            preactivation,
-            self._ffn_out_weight_nt,
-            self.ffn_out.bias,
-            residual,
-        )
-        output = torch.zeros_like(flat)
-        output.index_copy_(0, self._compact_valid_rows, valid_output)
-        return output.reshape(batch, seq_len, d_model)
-
-    def _compact_mask_is_current(
-        self,
-        valid_token_mask: Optional[torch.Tensor],
-    ) -> bool:
-        if torch.compiler.is_compiling():
-            return False
-        return (
-            self._compact_ffn_enabled
-            and valid_token_mask is self._compact_mask
-            and valid_token_mask is not None
-            and valid_token_mask._version == self._compact_mask_version
-        )
-
-    def prepare_fast_ffn(
-        self,
-        x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor],
-    ) -> bool:
-        """Build, prepack, and strictly validate outside timed inference."""
-        self._refresh_fast_ffn_state()
-        self.fast_ffn_error = None
-        self.compact_ffn_error = None
-        with torch.inference_mode():
-            supported = self._supports_fast_ffn(x, valid_token_mask)
-        if not supported:
-            self.fast_ffn_error = "unsupported device, dtype, layout, or mode"
-            return False
-        try:
-            person2_ffn_post.load_extension()
-            with torch.inference_mode():
-                reference = self._ffn_residual_native(x, valid_token_mask)
-                candidate = self._ffn_residual_fast(x, valid_token_mask)
-            ref = reference.float()
-            opt = candidate.float()
-            error = (opt - ref).abs()
-            passed = torch.isfinite(ref) & torch.isfinite(opt)
-            passed &= (error <= 0.001) | (error <= 0.01 * ref.abs())
-            if not bool(passed.all().item()):
-                self.fast_ffn_error = (
-                    "strict numerical preflight failed: "
-                    f"max_abs={error.max().item():.6g}, "
-                    f"failed={int((~passed).sum().item())}"
-                )
-                return False
-            self._fast_ffn_enabled = True
-            # Run-length tokenization cannot remove arbitrary benchmark tokens,
-            # but its "do not process known redundant rows" lesson applies to
-            # padding.  Build indices only during setup; timed inference uses
-            # this path solely for the exact, unchanged mask object/version.
-            if x.is_cuda and valid_token_mask is not None:
-                valid_rows = torch.nonzero(
-                    valid_token_mask.reshape(-1), as_tuple=False
-                ).flatten()
-                if 0 < valid_rows.numel() < valid_token_mask.numel():
-                    self._compact_valid_rows = valid_rows
-                    self._compact_mask = valid_token_mask
-                    self._compact_mask_version = valid_token_mask._version
-                    with torch.inference_mode():
-                        compact_candidate = self._ffn_residual_compact(x)
-                    compact_opt = compact_candidate.float()
-                    compact_error = (compact_opt - ref).abs()
-                    compact_passed = torch.isfinite(ref) & torch.isfinite(
-                        compact_opt
-                    )
-                    compact_passed &= (compact_error <= 0.001) | (
-                        compact_error <= 0.01 * ref.abs()
-                    )
-                    if bool(compact_passed.all().item()):
-                        self._compact_ffn_enabled = True
-                    else:
-                        self.compact_ffn_error = (
-                            "strict compact preflight failed: "
-                            f"max_abs={compact_error.max().item():.6g}, "
-                            f"failed={int((~compact_passed).sum().item())}"
-                        )
-                        self._compact_mask = None
-                        self._compact_valid_rows = None
-            return True
-        except (ImportError, OSError, RuntimeError) as error:
-            self.fast_ffn_error = f"{type(error).__name__}: {error}"
-            return False
-
-    def _ffn_residual(
-        self,
-        x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        """Apply the pre-norm FFN residual sublayer with baseline semantics."""
-        if (
-            self._fast_ffn_enabled
-            and self._fast_parameters_are_current()
-            and self._supports_fast_ffn(x, valid_token_mask)
-        ):
-            if self._compact_ffn_enabled and self._compact_mask_is_current(
-                valid_token_mask
-            ):
-                return self._ffn_residual_compact(x)
-            return self._ffn_residual_fast(x, valid_token_mask)
-        return self._ffn_residual_native(x, valid_token_mask)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor],
-        causal: bool,
-    ) -> torch.Tensor:
-        # Keep the pre-LayerNorm attention order identical to the reference.
-        x = x + self.attention(self.norm1(x), valid_token_mask, causal)
-        return self._ffn_residual(x, valid_token_mask)
-
-
-class UserOptimizedTransformerBlock(OptimizedTransformerBlock):
-    """Production block using strict-safe attention and the guarded FFN."""
-
-    def __init__(
-        self,
-        d_model: int,
-        num_heads: int,
-        ffn_dim: int,
-        use_packed_sdpa: bool = False,
-    ) -> None:
-        super().__init__(d_model, num_heads, ffn_dim)
-        if use_packed_sdpa:
-            self.attention = PackedQKVSDPAAttention(d_model, num_heads)
 
 
 class BaselineTransformer(nn.Module):
@@ -606,58 +172,213 @@ class BaselineTransformer(nn.Module):
         return x
 
 
-class UserOptimizedTransformer(BaselineTransformer):
-    """Transformer with explicitly guarded attention and FFN experiments."""
+class PackedQKVSelfAttention(nn.Module):
+    """Packed QKV projection with strict baseline-compatible fallback."""
+
+    def __init__(self, d_model: int, num_heads: int) -> None:
+        super().__init__()
+        if d_model % num_heads != 0:
+            raise ValueError("d_model must be divisible by num_heads")
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.scale = self.head_dim**-0.5
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=True)
+        self.out_proj = nn.Linear(d_model, d_model, bias=True)
+
+    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, _ = x.shape
+        return (
+            x.view(batch, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+            .contiguous()
+        )
+
+    @torch.no_grad()
+    def copy_from_baseline(self, source: BaselineSelfAttention) -> None:
+        if self.d_model != source.d_model or self.num_heads != source.num_heads:
+            raise ValueError("attention configurations must match")
+
+        # Linear stores output features by row, so concatenating on dim 0
+        # produces the required [Q; K; V] packed projection layout.
+        self.qkv_proj.weight.copy_(
+            torch.cat(
+                (source.q_proj.weight, source.k_proj.weight, source.v_proj.weight),
+                dim=0,
+            )
+        )
+        self.qkv_proj.bias.copy_(
+            torch.cat(
+                (source.q_proj.bias, source.k_proj.bias, source.v_proj.bias),
+                dim=0,
+            )
+        )
+        self.out_proj.load_state_dict(source.out_proj.state_dict())
+
+    def _baseline_forward(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        causal: bool,
+    ) -> torch.Tensor:
+        """Reproduce the reference operator order from packed parameters."""
+        batch, seq_len, _ = x.shape
+        q_weight, k_weight, v_weight = self.qkv_proj.weight.split(self.d_model, 0)
+        q_bias, k_bias, v_bias = self.qkv_proj.bias.split(self.d_model, 0)
+
+        q = self._split_heads(F.linear(x, q_weight, q_bias))
+        k = self._split_heads(F.linear(x, k_weight, k_bias))
+        v = self._split_heads(F.linear(x, v_weight, v_bias))
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+        if causal:
+            causal_mask = torch.ones(
+                (seq_len, seq_len), device=x.device, dtype=torch.bool
+            ).triu(diagonal=1)
+            scores = scores.masked_fill(causal_mask, float("-inf"))
+
+        if valid_token_mask is not None:
+            scores = scores.masked_fill(
+                ~valid_token_mask[:, None, None, :], float("-inf")
+            )
+
+        probs = torch.softmax(scores.float(), dim=-1).to(dtype=x.dtype)
+        context = torch.matmul(probs, v)
+        context = (
+            context.transpose(1, 2)
+            .contiguous()
+            .view(batch, seq_len, self.d_model)
+        )
+        output = self.out_proj(context)
+        if valid_token_mask is not None:
+            output = output.masked_fill(~valid_token_mask[..., None], 0)
+        return output
+
+    def _packed_forward(self, x: torch.Tensor, causal: bool) -> torch.Tensor:
+        batch, seq_len, _ = x.shape
+        qkv = self.qkv_proj(x).view(
+            batch, seq_len, 3, self.num_heads, self.head_dim
+        )
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        context = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+        context = context.transpose(1, 2).contiguous().view(
+            batch, seq_len, self.d_model
+        )
+        return self.out_proj(context)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        causal: bool,
+        use_packed: bool,
+    ) -> torch.Tensor:
+        if use_packed and valid_token_mask is None:
+            return self._packed_forward(x, causal)
+        return self._baseline_forward(x, valid_token_mask, causal)
+
+
+class UserOptimizedTransformerBlock(nn.Module):
+    """Pre-norm block with token-major FFN and selectable attention."""
 
     def __init__(
         self,
-        config: TransformerConfig,
-        packed_sdpa_suffix_layers: int = 0,
-        attention_plan: Optional[AttentionDispatchPlan] = None,
+        d_model: int,
+        num_heads: int,
+        ffn_dim: int,
+        packed_attention: bool,
     ) -> None:
-        if attention_plan is not None:
-            if (
-                packed_sdpa_suffix_layers
-                and packed_sdpa_suffix_layers
-                != attention_plan.packed_sdpa_suffix_layers
-            ):
-                raise ValueError(
-                    "attention_plan and packed_sdpa_suffix_layers disagree"
-                )
-            packed_sdpa_suffix_layers = (
-                attention_plan.packed_sdpa_suffix_layers
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attention: nn.Module
+        if packed_attention:
+            self.attention = PackedQKVSelfAttention(d_model, num_heads)
+        else:
+            self.attention = BaselineSelfAttention(d_model, num_heads)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn_in = nn.Linear(d_model, ffn_dim)
+        self.ffn_out = nn.Linear(ffn_dim, d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        causal: bool,
+        use_packed: bool,
+    ) -> torch.Tensor:
+        normalized = self.norm1(x)
+        if isinstance(self.attention, PackedQKVSelfAttention):
+            attention = self.attention(
+                normalized, valid_token_mask, causal, use_packed
             )
-        if not 0 <= packed_sdpa_suffix_layers <= config.num_layers:
-            raise ValueError(
-                "packed_sdpa_suffix_layers must be between 0 and num_layers"
-            )
-        # Construct the optimized hierarchy directly while preserving the
-        # baseline parameter names required by strict weight transfer.
+        else:
+            attention = self.attention(normalized, valid_token_mask, causal)
+        x = x + attention
+
+        batch, seq_len, d_model = x.shape
+        ffn_input = self.norm2(x).reshape(batch * seq_len, d_model)
+        ffn_update = self.ffn_out(
+            F.gelu(self.ffn_in(ffn_input), approximate="none")
+        ).reshape(batch, seq_len, d_model)
+        x = x + ffn_update
+        if valid_token_mask is not None:
+            x = x.masked_fill(~valid_token_mask[..., None], 0)
+        return x
+
+
+class UserOptimizedTransformer(BaselineTransformer):
+    """Self-contained Transformer with conservative T4 shape dispatch."""
+
+    # Only these exact official configurations cleared strict correctness and
+    # repeated end-to-end T4 performance gates with one packed suffix layer.
+    _PACKED_SUFFIX_CONFIGS = frozenset(
+        {
+            (1, 128, 128, 4, 128, 4, True),
+            (4, 128, 128, 4, 128, 4, True),
+            (16, 128, 128, 4, 128, 4, True),
+            (64, 32, 128, 4, 128, 4, True),
+        }
+    )
+
+    def __init__(self, config: TransformerConfig) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.packed_sdpa_suffix_layers = packed_sdpa_suffix_layers
-        self._attention_plan = attention_plan
-        first_packed_layer = config.num_layers - packed_sdpa_suffix_layers
+        config_key = (
+            config.batch_size,
+            config.seq_len,
+            config.d_model,
+            config.num_heads,
+            config.ffn_dim,
+            config.num_layers,
+            config.causal,
+        )
+        self._packed_candidate = config_key in self._PACKED_SUFFIX_CONFIGS
+        first_packed_layer = config.num_layers - 1
         self.layers = nn.ModuleList(
             [
                 UserOptimizedTransformerBlock(
                     config.d_model,
                     config.num_heads,
                     config.ffn_dim,
-                    use_packed_sdpa=index >= first_packed_layer,
+                    packed_attention=(
+                        self._packed_candidate and index >= first_packed_layer
+                    ),
                 )
                 for index in range(config.num_layers)
             ]
         )
         self.final_norm = nn.LayerNorm(config.d_model)
-        self._all_valid_mask: Optional[torch.Tensor] = None
-        self._all_valid_mask_version = -1
+        self._cached_mask: Optional[torch.Tensor] = None
+        self._cached_mask_version: Optional[int] = None
+        self._cached_mask_is_all_valid = False
+        self._cached_runtime_key: Optional[Tuple[str, int, torch.dtype, str]] = None
+        self._cached_runtime_supports_packed = False
 
     @torch.no_grad()
     def copy_from_baseline(
         self, source: BaselineTransformer, strict: bool = True
     ) -> None:
-        """Transfer baseline parameters and refresh optimized FFN state."""
         if self.config != source.config:
             raise ValueError("baseline and optimized configurations must match")
         if len(self.layers) != len(source.layers):
@@ -667,15 +388,11 @@ class UserOptimizedTransformer(BaselineTransformer):
             target_layer.norm1.load_state_dict(
                 source_layer.norm1.state_dict(), strict=strict
             )
-            if isinstance(target_layer.attention, PackedQKVSDPAAttention):
+            if isinstance(target_layer.attention, PackedQKVSelfAttention):
                 target_layer.attention.copy_from_baseline(source_layer.attention)
-            elif isinstance(target_layer.attention, BaselineSelfAttention):
+            else:
                 target_layer.attention.load_state_dict(
                     source_layer.attention.state_dict(), strict=strict
-                )
-            else:
-                raise TypeError(
-                    "optimized attention must be baseline or packed SDPA"
                 )
             target_layer.norm2.load_state_dict(
                 source_layer.norm2.state_dict(), strict=strict
@@ -686,102 +403,95 @@ class UserOptimizedTransformer(BaselineTransformer):
             target_layer.ffn_out.load_state_dict(
                 source_layer.ffn_out.state_dict(), strict=strict
             )
-            target_layer._refresh_fast_ffn_state()
 
         self.final_norm.load_state_dict(source.final_norm.state_dict(), strict=strict)
-        self._all_valid_mask = None
-        self._all_valid_mask_version = -1
+        self._cached_mask = None
+        self._cached_mask_version = None
+        self._cached_mask_is_all_valid = False
 
-    def _effective_valid_token_mask(
+    @staticmethod
+    def _mask_version(valid_token_mask: torch.Tensor) -> Optional[int]:
+        try:
+            return valid_token_mask._version
+        except RuntimeError:
+            # Tensors created inside inference_mode do not track mutations.
+            # They are inspected for this call but deliberately not cached.
+            return None
+
+    def _mask_is_all_valid(
         self,
         valid_token_mask: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        if torch.compiler.is_compiling():
-            return valid_token_mask
-        if (
-            valid_token_mask is not None
-            and valid_token_mask is self._all_valid_mask
-            and valid_token_mask._version == self._all_valid_mask_version
-        ):
-            return None
-        return valid_token_mask
-
-    def prepare_for_inference(
-        self,
         x: torch.Tensor,
-        valid_token_mask: Optional[torch.Tensor] = None,
-        fast_ffn_suffix_layers: Optional[int] = None,
-    ) -> int:
-        """Prepare and validate guarded FFN paths for a representative call.
-
-        Preparation runs before compilation and timing. Walking the complete
-        model gives each layer a representative activation while preserving
-        the exact mask object needed by the optional padded-row fast path.
-        """
-        if fast_ffn_suffix_layers is None:
-            fast_ffn_suffix_layers = len(self.layers)
-        if not 0 <= fast_ffn_suffix_layers <= len(self.layers):
-            raise ValueError("fast_ffn_suffix_layers must be between 0 and num_layers")
-
-        self._all_valid_mask = None
-        self._all_valid_mask_version = -1
+    ) -> bool:
+        if valid_token_mask is None:
+            return True
+        if torch.compiler.is_compiling():
+            return False
         if (
-            valid_token_mask is not None
-            and valid_token_mask.shape == x.shape[:2]
-            and valid_token_mask.device == x.device
-            and bool(valid_token_mask.all().item())
+            valid_token_mask.dtype != torch.bool
+            or valid_token_mask.device != x.device
+            or valid_token_mask.ndim != 2
+            or tuple(valid_token_mask.shape) != tuple(x.shape[:2])
         ):
-            self._all_valid_mask = valid_token_mask
-            self._all_valid_mask_version = valid_token_mask._version
-        effective_mask = self._effective_valid_token_mask(valid_token_mask)
-
-        first_fast_layer = len(self.layers) - fast_ffn_suffix_layers
-        for layer in self.layers:
-            layer._fast_ffn_enabled = False
-
-        prepared_layers = 0
-        with torch.inference_mode():
-            for index, layer in enumerate(self.layers):
-                x = x + layer.attention(
-                    layer.norm1(x), effective_mask, self.config.causal
-                )
-                if index >= first_fast_layer and layer.prepare_fast_ffn(
-                    x, effective_mask
-                ):
-                    prepared_layers += 1
-                x = layer._ffn_residual(x, effective_mask)
-        return prepared_layers
-
-    @property
-    def attention_backend(self) -> str:
-        if self._attention_plan is not None:
-            return self._attention_plan.label
-        if self.packed_sdpa_suffix_layers:
-            return f"packed-sdpa-suffix:{self.packed_sdpa_suffix_layers}"
-        return "baseline"
-
-    @property
-    def attention_dispatch_reason(self) -> str:
-        if self._attention_plan is None:
-            return "manual constructor selection"
-        return self._attention_plan.reason
-
-    @property
-    def mask_dispatch(self) -> str:
+            return False
+        mask_version = self._mask_version(valid_token_mask)
         if (
-            self._all_valid_mask is not None
-            and self._all_valid_mask._version == self._all_valid_mask_version
+            mask_version is not None
+            and valid_token_mask is self._cached_mask
+            and mask_version == self._cached_mask_version
         ):
-            return "all-valid-bypass"
-        return "masked"
+            return self._cached_mask_is_all_valid
+
+        is_all_valid = bool(valid_token_mask.all().item())
+        if mask_version is not None:
+            self._cached_mask = valid_token_mask
+            self._cached_mask_version = mask_version
+            self._cached_mask_is_all_valid = is_all_valid
+        return is_all_valid
+
+    def _runtime_supports_packed(self, x: torch.Tensor) -> bool:
+        if (
+            not self._packed_candidate
+            or torch.compiler.is_compiling()
+            or self.training
+            or torch.is_grad_enabled()
+            or not x.is_cuda
+            or x.dtype != torch.float16
+        ):
+            return False
+
+        device_index = x.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        runtime_key = (
+            x.device.type,
+            device_index,
+            x.dtype,
+            torch.__version__.split("+")[0],
+        )
+        if runtime_key != self._cached_runtime_key:
+            self._cached_runtime_key = runtime_key
+            self._cached_runtime_supports_packed = (
+                runtime_key[3] == "2.11.0"
+                and tuple(torch.cuda.get_device_capability(device_index)) == (7, 5)
+            )
+        return self._cached_runtime_supports_packed
 
     def forward(
         self,
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        effective_mask = self._effective_valid_token_mask(valid_token_mask)
-        return super().forward(x, effective_mask)
+        all_valid = self._mask_is_all_valid(valid_token_mask, x)
+        effective_mask = None if all_valid else valid_token_mask
+        use_packed = all_valid and self._runtime_supports_packed(x)
+
+        for layer in self.layers:
+            x = layer(x, effective_mask, self.config.causal, use_packed)
+        x = self.final_norm(x)
+        if effective_mask is not None:
+            x = x.masked_fill(~effective_mask[..., None], 0)
+        return x
 
 
 def copy_model_weights(
@@ -958,7 +668,6 @@ def run_accuracy_tests(
     input_scale: float,
     rtol: float,
     atol: float,
-    prepared_case: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> bool:
     print("\n=== Accuracy check ===")
     print(f"criterion: abs_error <= {atol:g} OR relative_error <= {rtol:.2%}")
@@ -1006,32 +715,6 @@ def run_accuracy_tests(
                     f"optimized={result.optimized_at_worst:.8g}"
                 )
                 print(f"  failed output feature dims={preview}{suffix}")
-
-        if prepared_case is not None:
-            x, valid_mask = prepared_case
-            reference = baseline(x, valid_mask)
-            candidate = optimized(x, valid_mask)
-            result = compare_outputs(reference, candidate, rtol=rtol, atol=atol)
-
-            all_passed &= result.passed
-            global_max_abs = max(global_max_abs, result.max_abs_error)
-            global_max_rel = max(global_max_rel, result.max_relative_error)
-            total_failed += result.failed_elements
-            total_elements += result.total_elements
-
-            status = "PASS" if result.passed else "FAIL"
-            print(
-                f"prepared benchmark case: {status} | "
-                f"max_abs={result.max_abs_error:.6g} | "
-                f"max_rel={result.max_relative_error:.6g} | "
-                f"failed={result.failed_elements}/{result.total_elements}"
-            )
-            if not result.passed:
-                print(
-                    f"  worst_index={result.worst_index}, "
-                    f"baseline={result.reference_at_worst:.8g}, "
-                    f"optimized={result.optimized_at_worst:.8g}"
-                )
 
     print(
         f"summary: {'PASS' if all_passed else 'FAIL'} | "
@@ -1137,24 +820,20 @@ def benchmark_models(
     warmup: int,
     repeats: int,
     rounds: int,
-    benchmark_case: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> None:
     print("\n=== Performance benchmark ===")
     print("timing excludes random-data generation and uses a fixed input")
     if device.type == "cuda":
         print("CUDA latency is measured with torch.cuda.Event on the current stream")
 
-    if benchmark_case is None:
-        x, valid_mask = generate_random_case(
-            config=config,
-            device=device,
-            dtype=dtype,
-            seed=seed + 100000,
-            padding_ratio=padding_ratio,
-            input_scale=input_scale,
-        )
-    else:
-        x, valid_mask = benchmark_case
+    x, valid_mask = generate_random_case(
+        config=config,
+        device=device,
+        dtype=dtype,
+        seed=seed + 100000,
+        padding_ratio=padding_ratio,
+        input_scale=input_scale,
+    )
 
     # Warm up both models before collecting any timing data.
     warmup_model(baseline, x, valid_mask, warmup, device)
@@ -1254,24 +933,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--non-strict-weight-copy", action="store_true")
     parser.add_argument(
-        "--fast-ffn-suffix-layers",
-        type=int,
-        default=0,
-        help="experimentally enable the guarded FFN in only the final N layers",
-    )
-    parser.add_argument(
-        "--packed-sdpa-suffix-layers",
-        type=int,
-        default=None,
-        help="experimentally use packed SDPA in only the final N layers",
-    )
-    parser.add_argument(
-        "--dispatch-mode",
-        choices=("auto", "native"),
-        default="auto",
-        help="use the exact measured dispatch table or force native attention",
-    )
-    parser.add_argument(
         "--matmul-precision",
         choices=("highest", "high", "medium"),
         default="high",
@@ -1298,15 +959,6 @@ def validate_args(args: argparse.Namespace, device: torch.device, dtype: torch.d
         raise ValueError("warmup must be non-negative")
     if args.repeats <= 0 or args.benchmark_rounds <= 0:
         raise ValueError("repeats and benchmark_rounds must be positive")
-    if not 0 <= args.fast_ffn_suffix_layers <= args.layers:
-        raise ValueError("fast_ffn_suffix_layers must be between 0 and --layers")
-    if (
-        args.packed_sdpa_suffix_layers is not None
-        and not 0 <= args.packed_sdpa_suffix_layers <= args.layers
-    ):
-        raise ValueError(
-            "packed_sdpa_suffix_layers must be between 0 and --layers"
-        )
     if device.type == "cpu" and dtype == torch.float16:
         print("[warning] float16 CPU kernels may be unsupported or slow")
 
@@ -1335,45 +987,8 @@ def main() -> int:
         torch.backends.cuda.matmul.allow_tf32 = args.allow_tf32
         torch.backends.cudnn.allow_tf32 = args.allow_tf32
 
-    benchmark_case = generate_random_case(
-        config=config,
-        device=device,
-        dtype=dtype,
-        seed=args.seed + 100000,
-        padding_ratio=args.padding_ratio,
-        input_scale=args.input_scale,
-    )
-    dispatch_key = make_dispatch_key(
-        batch_size=config.batch_size,
-        seq_len=config.seq_len,
-        d_model=config.d_model,
-        num_heads=config.num_heads,
-        dtype=dtype,
-        causal=config.causal,
-        valid_token_mask=benchmark_case[1],
-        device=device,
-    )
-    if args.dispatch_mode == "native":
-        dispatch_plan = select_attention_plan(
-            dispatch_key,
-            num_layers=config.num_layers,
-            manual_suffix_layers=0,
-        )
-    elif args.packed_sdpa_suffix_layers is not None:
-        dispatch_plan = select_attention_plan(
-            dispatch_key,
-            num_layers=config.num_layers,
-            manual_suffix_layers=args.packed_sdpa_suffix_layers,
-        )
-    else:
-        dispatch_plan = select_attention_plan(
-            dispatch_key,
-            num_layers=config.num_layers,
-            measurements=historical_t4_measurements(),
-        )
-
     baseline = BaselineTransformer(config)
-    optimized = UserOptimizedTransformer(config, attention_plan=dispatch_plan)
+    optimized = UserOptimizedTransformer(config)
     copy_model_weights(
         baseline,
         optimized,
@@ -1382,18 +997,6 @@ def main() -> int:
 
     baseline = baseline.to(device=device, dtype=dtype).eval()
     optimized = optimized.to(device=device, dtype=dtype).eval()
-
-    # Prepare extension-backed paths and mask-specific caches with the exact
-    # tensors used by the timed eager benchmark. Compilation and setup costs
-    # are deliberately excluded from latency measurements.
-    prepared_ffn_layers = optimized.prepare_for_inference(
-        *benchmark_case,
-        fast_ffn_suffix_layers=args.fast_ffn_suffix_layers,
-    )
-    attention_backend = optimized.attention_backend
-    mask_dispatch = (
-        "masked-compile-fallback" if args.compile_user else optimized.mask_dispatch
-    )
 
     # Compile only after model construction, weight copy, device transfer, and eval().
     baseline = maybe_compile(baseline, args.compile_baseline, args.compile_mode)
@@ -1404,18 +1007,6 @@ def main() -> int:
     print(f"device={device}, dtype={dtype}, torch={torch.__version__}")
     if device.type == "cuda":
         print(f"gpu={torch.cuda.get_device_name(device)}")
-    print(f"attention_backend={attention_backend}")
-    print(f"attention_dispatch_reason={optimized.attention_dispatch_reason}")
-    print(f"mask_dispatch={mask_dispatch}")
-    print(
-        "requested_packed_sdpa_suffix_layers="
-        f"{args.packed_sdpa_suffix_layers if args.packed_sdpa_suffix_layers is not None else 'auto'}"
-    )
-    print(f"requested_fast_ffn_suffix_layers={args.fast_ffn_suffix_layers}")
-    print(
-        f"fast_ffn_layers={prepared_ffn_layers}/{config.num_layers} "
-        "(unsupported layers use the native fallback)"
-    )
 
     accuracy_passed = run_accuracy_tests(
         baseline=baseline,
@@ -1429,7 +1020,6 @@ def main() -> int:
         input_scale=args.input_scale,
         rtol=args.rtol,
         atol=args.atol,
-        prepared_case=benchmark_case,
     )
 
     if not accuracy_passed and not args.benchmark_on_failure:
@@ -1449,7 +1039,6 @@ def main() -> int:
         warmup=args.warmup,
         repeats=args.repeats,
         rounds=args.benchmark_rounds,
-        benchmark_case=benchmark_case,
     )
     return 0 if accuracy_passed else 2
 

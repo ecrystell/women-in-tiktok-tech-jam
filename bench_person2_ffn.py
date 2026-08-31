@@ -16,10 +16,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torch_transformer_benchmark import (
-    BaselineTransformerBlock,
-    OptimizedTransformerBlock,
-)
+from person2_ffn_block import OptimizedTransformerBlock
+from torch_transformer_benchmark import BaselineTransformerBlock
 
 
 SWEEP_SHAPES = (
