@@ -39,12 +39,54 @@ authority for correctness and speed.
    This supplies general lessons about fused operations, avoiding repeated
    conversions, layout-aware execution, and caching reusable representations.
    The duplicated link supplied in the project discussion is one source.
+6. **Panopoulos et al., ["Exploring the Performance and Efficiency of
+   Transformer Models for NLP on Mobile Devices"](https://arxiv.org/pdf/2306.11426).**
+   This shows that accelerator coverage, accuracy, and latency depend on the
+   model, device, delegate, and precision; a nominal accelerator is not
+   automatically the fastest or most accurate execution path.
+7. **Kluska et al., ["QAttn: Efficient GPU Kernels for Mixed-precision Vision
+   Transformers"](https://openaccess.thecvf.com/content/CVPR2024W/ELVM/html/Kluska_QAttn_Efficient_GPU_Kernels_for_Mixed-precision_Vision_Transformers_CVPRW_2024_paper.html),
+   CVPR Workshops 2024.** This supplies useful Triton integration, tile-boundary,
+   mixed-precision-attention, and quantization-overhead lessons. Its accuracy
+   criterion, A100 platform, ViT workloads, and INT8 semantics differ from this
+   project.
+8. **Du et al., ["Improving Computation and Memory Efficiency for Real-world
+   Transformer Inference on GPUs"](https://doi.org/10.1145/3617689), ACM TACO
+   2023.** This motivates valid-block attention, dense valid-token FFN execution,
+   block-organized layouts, and reusable memory planning for variable-length
+   inputs, while explicitly exposing indexing and layout-switch overhead.
+9. **Mittal and Vaishay, ["A Survey of Techniques for Optimizing Deep Learning
+   on GPUs"](https://doi.org/10.1016/j.sysarc.2019.101635), Journal of Systems
+   Architecture 2019.** This provides the broader GPU principles behind tiling,
+   batching, coalescing, bank-conflict avoidance, fusion, occupancy, low-precision
+   conversion cost, and hardware-aware sparsity.
+10. **Gerami and Duraiswami, ["Transformer Based Linear Attention with
+    Optimized GPU Kernel Implementation"](https://arxiv.org/pdf/2510.21956).**
+    This demonstrates algebra/implementation co-design for data reuse and
+    coalesced CUDA execution. Linear attention changes the model's attention
+    equation, so only its kernel-engineering lessons transfer to this project.
+11. **Team synthesis, "High-Performance Acceleration Strategies for PyTorch
+    Transformer Optimization"** (user-supplied local report, 12 pages). This
+    collects the project's profiler observations and proposes SDPA backend
+    testing, compiler tuning, CUDA Graphs, and normalization fusion. Treat its
+    expected reductions, dispatch diagrams, and kernel sketches as hypotheses:
+    only repository code, backend traces, and T4 measurements can promote them
+    to project directives or performance claims.
+
+The supplied local `2603.28708v1.pdf` is the same work as source 4. It is not
+counted as a separate source or as independent corroboration.
 
 ### Supplied implementation references
 
 - [PyTorch `torch.compile`](https://docs.pytorch.org/docs/stable/generated/torch.compile)
+- [PyTorch high-performance SDPA tutorial](https://docs.pytorch.org/tutorials/intermediate/scaled_dot_product_attention_tutorial.html)
+- [PyTorch SDPA backend controls](https://docs.pytorch.org/docs/stable/nn.attention.html)
+- [PyTorch compiler programming model](https://docs.pytorch.org/docs/stable/user_guide/torch_compiler/compile/programming_model.html)
+- [PyTorch CUDA Graph Trees](https://docs.pytorch.org/docs/main/user_guide/torch_compiler/torch.compiler_cudagraph_trees.html)
 - [PyTorch CUDA-graph step marker](https://docs.pytorch.org/docs/main/generated/torch.compiler.cudagraph_mark_step_begin.html)
 - [PyTorch profiler](https://docs.pytorch.org/docs/stable/profiler.html)
+- [Triton LayerNorm tutorial](https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html)
+- [PyTorch normalization-fusion analysis](https://pytorch.org/blog/towards-free-normalization-fusing-normalization-into-gemm-and-attention-kernels/)
 - [NVIDIA cuBLAS/cuBLASLt](https://docs.nvidia.com/cuda/cublas/index.html)
 - [Triton exact `erf`](https://triton-lang.org/main/python-api/generated/triton.language.erf.html)
 - [TensorRT exact `GELU_ERF`](https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/c-api/namespacenvinfer1.html)
@@ -77,45 +119,6 @@ Correctness takes precedence over speed for every subsystem and backend.
   devices, dtypes, layouts, masks, training mode, compilation, build failures,
   and numerical preflight failures must use a correct native fallback.
 
-### 1.1 Official appendix test shapes
-
-The organizer appendix defines the required workload matrix below. `QKV Dim`
-maps to the benchmark's `d_model` argument. The appendix specifies `causal =
-TRUE` for every case but does not specify a dtype or padding ratio; run and
-report the matrix explicitly for each supported dtype, using an all-valid mask
-when no padding ratio is otherwise supplied.
-
-| # | Batch | QKV Dim | Heads | Seq Len | Layers | Causal | FFN Dim |
-|--:|------:|--------:|------:|--------:|-------:|:------:|--------:|
-| 1 | 64 | 128 | 4 | 128 | 4 | TRUE | 128 |
-| 2 | 1 | 128 | 4 | 128 | 4 | TRUE | 128 |
-| 3 | 4 | 128 | 4 | 128 | 4 | TRUE | 128 |
-| 4 | 16 | 128 | 4 | 128 | 4 | TRUE | 128 |
-| 5 | 128 | 128 | 4 | 128 | 4 | TRUE | 128 |
-| 6 | 10000 | 128 | 4 | 128 | 4 | TRUE | 128 |
-| 7 | 64 | 32 | 4 | 128 | 4 | TRUE | 32 |
-| 8 | 64 | 1024 | 4 | 128 | 4 | TRUE | 1024 |
-| 9 | 64 | 128 | 1 | 128 | 4 | TRUE | 128 |
-| 10 | 64 | 128 | 2 | 128 | 4 | TRUE | 128 |
-| 11 | 64 | 128 | 16 | 128 | 4 | TRUE | 128 |
-| 12 | 64 | 128 | 4 | 32 | 4 | TRUE | 128 |
-| 13 | 64 | 128 | 4 | 1024 | 4 | TRUE | 128 |
-| 14 | 32 | 1024 | 16 | 100000 | 2 | TRUE | 1024 |
-
-Official IDs 1–13 are direct full-model cases. ID 14 is not an ordinary
-baseline timing case: its explicit score tensor has
-`32 * 16 * 100000^2 = 5.12e12` elements, requiring about 9.31 TiB in FP16 or
-18.63 TiB in FP32 before softmax and other tensors. Guard it in the ordinary
-harness and validate it only through a mathematically equivalent tiled,
-batch-blocked harness. Such timing must be labeled sequential blockwise
-projection rather than full-batch GPU utilization.
-
-The official matrix is dominated by narrow, launch-sensitive configurations:
-most cases have `d_model = ffn_dim = 128`, while head dimensions range across
-8, 32, 64, 128, and 256. Triton head-dimension eligibility must not restrict
-PyTorch SDPA eligibility. Benchmark packed QKV depth per shape because
-rounding drift can accumulate across the four causal layers.
-
 ## 2. Target-hardware policy
 
 The acceptance GPU is the Tesla T4 (`sm_75`). Optimize for what that GPU and the
@@ -133,6 +136,21 @@ installed runtime actually support.
   acceptance case.
 - Never transfer a speedup claim from B300, H100, A100, RTX 3090, or a CPU
   comparison to the T4. Re-measure the exact repository shapes on the T4.
+
+### Backend coverage and deployment
+
+- Verify that the intended backend executes every operation in the candidate
+  graph. Partial delegation can insert transfers or fallbacks that dominate
+  latency, and a successfully loaded model does not prove full acceleration.
+- Treat device, model shape, precision, and backend version as one performance
+  configuration. There is no presumed globally optimal accelerator or library
+  setting.
+- Validate elementwise output on the target device, not only through a host
+  interpreter. A backend may be fast while producing unacceptable target-device
+  accuracy.
+- When measuring a thermally constrained or shared device, document idle/cooldown
+  policy and competing load. For the Colab T4, record runtime resets and process
+  isolation instead of assuming a stable cloud allocation.
 
 ## 3. Shared optimization ladder
 
@@ -174,6 +192,26 @@ Apply the NVIDIA GEMM article's shape-first method to inference.
 - Profile the generated kernels or backend dispatch. A requested backend that
   silently falls back is not evidence that the backend ran.
 
+### Tile, batch, and layout selection
+
+- Select tile size and work assignment jointly with batch size and exact
+  `M/K/N`; a tile that maximizes reuse can reduce thread-level parallelism, and
+  a tile that maximizes occupancy can increase traffic or idle lanes.
+- Include awkward and boundary dimensions in tuning. Odd sequence lengths and
+  dimensions that are not multiples of a tensor-core tile can change masking,
+  wasted work, and the winning kernel.
+- Require global-memory accesses to be coalesced and inspect shared-memory bank
+  conflicts. Transposing or padding a shared-memory tile is useful only when its
+  extra instructions and storage are cheaper than the conflicts removed.
+- Balance registers and shared memory against occupancy. Keeping intermediates
+  on-chip is beneficial only while enough warps remain resident to hide latency.
+- Autotune only a bounded set of legal candidates during setup, then cache the
+  winning plan for the complete configuration. Do not infer a T4 tile from an
+  A100, V100, A6000, or mobile result.
+- Reducing FLOPs through sparsity or compaction is insufficient when irregular
+  addressing loses dense GEMM tiling and coalescing. Measure realized latency,
+  not the nominal operation count.
+
 ## 5. Person 1: attention directives
 
 - Keep packed Q/K/V projection in Q, K, V row order and preserve baseline
@@ -181,10 +219,6 @@ Apply the NVIDIA GEMM article's shape-first method to inference.
 - Use PyTorch scaled-dot-product attention as the guaranteed path. It can avoid
   materializing the full score/probability matrices and can select an efficient
   backend for the installed GPU/runtime.
-- Keep SDPA eligibility separate from custom Triton eligibility. The official
-  matrix exercises head dimensions 8, 32, 64, 128, and 256; a Triton kernel
-  restricted to one proven head dimension must not force the other cases onto
-  explicit quadratic attention.
 - Support causal and padding masks together. Invalid key positions must not be
   attended to, and invalid query outputs must be exactly zero.
 - Avoid constructing an attention mask for a proven no-padding case only when
@@ -197,9 +231,47 @@ Apply the NVIDIA GEMM article's shape-first method to inference.
 - Benchmark short and long sequences separately because attention changes from
   launch/overhead-sensitive to quadratic compute/memory pressure as sequence
   length grows.
-- For official ID 14, use streaming/tiled attention with online FP32 softmax
-  statistics and batch blocking. The dense baseline must be memory-guarded;
-  do not claim full-batch timing from sequential blockwise validation.
+
+### SDPA backend verification
+
+- Use `torch.nn.attention.sdpa_kernel` as a scoped diagnostic context to isolate
+  eligible SDPA implementations. Do not globally disable backends in submission
+  code or let one benchmark case contaminate later cases.
+- Do not assume that `attn_mask=None` implies FlashAttention, or that every
+  explicit boolean/additive mask disables it. Backend eligibility depends on
+  device, dtype, head dimension, strides, causal mode, mask form, and installed
+  PyTorch/CUDA versions. Capture warnings and prove the selected kernel with a
+  profiler or dispatch trace for every claimed configuration.
+- Preserve SDPA boolean semantics: `True` means the position participates in
+  attention, which is the inverse of `MultiheadAttention.key_padding_mask`.
+  Test the conversion with padded queries and keys, not only an all-valid mask.
+- Never evaluate `valid_token_mask.all().item()` in the compiled or timed
+  forward path. Establish an all-valid fact from immutable host metadata or a
+  cache guarded by mask identity, version, shape, strides, and device; otherwise
+  pass the mask through the validated general path.
+- Treat Q/K/V head views as a layout contract. Record strides and backend
+  eligibility before inserting `.contiguous()`; count any required copy in
+  end-to-end latency rather than attributing only the SDPA kernel time.
+
+### Exact-attention boundary
+
+- The benchmark fixes scaled softmax attention. Linear attention, sparse
+  attention, learned token pruning, approximate softmax, or another attention
+  kernel function changes the model and cannot enter the submission path even
+  if it performs well on downstream model-quality metrics.
+- Transfer the linear-attention paper's implementation principles instead:
+  factor repeated work where algebraically exact, organize adjacent threads for
+  adjacent memory, maximize reuse from registers/shared memory, and minimize
+  intermediate global-memory round trips.
+- Compare a reformulation against SDPA/FlashAttention at the repository's actual
+  sequence and head dimensions. An asymptotic crossover reported for very long
+  sequences on an A6000 is not a T4 crossover measurement.
+- Keep normalization and denominator handling numerically stable and explicitly
+  test causal/padding tile boundaries. Algebraic equivalence alone does not
+  establish floating-point equivalence or correct masking.
+- QAttn's pattern of low-precision score computation followed by FP32 softmax is
+  an experiment only. INT8 Q/K/V or outputs require strict elementwise preflight;
+  downstream top-1 or mIOU preservation is not the benchmark contract.
 
 ## 6. Person 2: FFN, LayerNorm, and residual directives
 
@@ -223,6 +295,31 @@ Apply the NVIDIA GEMM article's shape-first method to inference.
   allocate, synchronize, build, autotune, inspect masks, or choose tactics
   inside timed inference.
 
+### LayerNorm and GEMM fusion gate
+
+- Distinguish a row reduction from a GEMM tile. LayerNorm needs the complete
+  hidden row to compute mean and variance, while a high-throughput GEMM divides
+  the output over two-dimensional `M x N` tiles. A naive GEMM epilogue cannot
+  normalize a row that is split across column tiles without communication,
+  redundant reductions, a second stage, or an altered tiling strategy.
+- Do not transfer the PyTorch Lazy Pre-Norm algebra to this benchmark. That
+  method relies on affine-free RMSNorm being a row-wise scale and explicitly
+  does not apply to mean-subtracting LayerNorm or general affine parameters.
+- A dedicated fused residual-add plus LayerNorm candidate must accumulate its
+  mean and variance in FP32, reproduce the baseline epsilon and population-
+  variance convention, apply current gamma/beta values, and specify ownership
+  of both the updated residual and normalized output. Writing either public
+  input in place is disallowed unless the caller's ownership contract permits
+  it and repeated-call tests prove safety.
+- Size a row kernel from feature bytes, register use, shared memory, and active
+  warps rather than copying the Triton tutorial's limit as a universal rule.
+  Test dimensions immediately below, at, and above each implementation guard;
+  large power-of-two padding can reduce occupancy or make the kernel illegal.
+- Compare three boundaries independently: native LayerNorm; a standalone
+  fused add/LayerNorm kernel; and the validated full FFN custom-op boundary.
+  Record launch count, bytes moved, occupancy/resource limits, and block/full-
+  model latency. Fewer launches or HBM passes are not sufficient acceptance.
+
 ## 7. Token reduction and padding directives
 
 The RLT paper's transferable principle is to avoid work for genuinely redundant
@@ -244,6 +341,27 @@ with this fixed benchmark contract.
 - For attention, packed variable-length execution requires semantically correct
   sequence boundaries; never let tokens from different examples attend to one
   another.
+
+### Valid-block execution
+
+- For padded attention, valid mini-block scheduling is permitted only when it
+  computes the same scaled-softmax result as the dense baseline. Cache the block
+  schedule from immutable mask metadata outside timing and invalidate it on
+  object, version, shape, stride, device, causal-mode, or block-size changes.
+- Choose block granularity from a measured trade-off: smaller blocks reduce
+  padding FLOPs but enlarge index structures and worsen locality; larger blocks
+  preserve regular tensor-core work but compute more invalid elements.
+- Avoid atomics when each output tile can have one owner. If accumulation cannot
+  be uniquely owned, measure contention and preserve the baseline reduction
+  order closely enough to pass strict correctness.
+- Treat transitions between dense valid-token FFN layout and block-padded
+  attention layout as first-class kernels. Count index construction, gather,
+  scatter, transpose, padding, and layout-switch latency unless safely reused
+  under the exact cache guards above.
+- The current fixed-shape benchmark does not justify a dynamic chunk allocator
+  in timed inference. Reuse PyTorch's allocator and fixed buffers unless memory
+  profiling across changing shapes proves allocation churn or peak memory is a
+  limiting bottleneck.
 
 ## 8. Person 3: integration and dispatch directives
 
@@ -282,6 +400,38 @@ with this fixed benchmark contract.
 - Custom operations need fake/meta implementations only when compilation can
   safely trace them; otherwise deliberately select the documented compile
   fallback.
+
+### Graph and compiler diagnostics
+
+- Use `fullgraph=True` during qualification to turn graph breaks into explicit
+  failures. Inspect `TORCH_LOGS=graph_breaks`, `TORCH_LOGS=perf_hints`, or a
+  `tlparse` trace; a successful `torch.compile` call does not prove a single
+  optimized graph or CUDA Graph execution.
+- Keep tensor-to-scalar reads (`.item()`, `int(tensor)`, `float(tensor)`), direct
+  pointer inspection, logging, exception-driven fallback, and tensor-dependent
+  Python branches outside the compiled forward. Prefer static Python metadata;
+  use a traceable control-flow operator only when both branches preserve the
+  exact model contract and are independently validated.
+- Query `torch._inductor.list_mode_options()` for the installed runtime and use
+  documented `torch.compile(options=...)` controls where possible. Private
+  `torch._inductor.config` names are version-sensitive. `max_autotune`,
+  `shape_padding`, `epilogue_fusion`, and coordinate-descent searches are
+  candidates, not a bundle that is assumed faster.
+- For every compiler option, record compile/autotune time separately, inspect
+  generated kernels or profiler events, and remeasure peak memory. Shape
+  padding can improve Tensor Core alignment while increasing FLOPs and memory;
+  epilogue fusion is useful only when the selected template actually supports
+  the exact activation and arithmetic order.
+- Raw CUDA Graph replay requires stable kernel arguments, dependencies, and
+  memory addresses. Include any input staging copy and output ownership copy in
+  realistic latency unless the caller already owns fixed buffers. Reject a
+  graph that mutates public inputs or silently overwrites a previously returned
+  tensor.
+- Prefer one exact capture for each fixed official shape. Sequence bucketing is
+  permitted only if internal padding, mask construction, extra compute,
+  unpadding, and output shape all preserve semantics and the complete measured
+  path wins. CUDA Graph Trees reduce recapture overhead; they do not remove the
+  need for static-address and output-lifetime discipline.
 
 ## 10. Optional TensorRT and custom-backend directives
 
@@ -326,6 +476,14 @@ setup costs and sampling parameters explicit.
 - If the current task defines a numerical or speed gate, that gate overrides
   aspirational article results. Failed candidates remain experiments, not
   production dispatch choices.
+- For quantized or mixed-precision experiments, report conversion/calibration
+  cost separately and include quantize/dequantize kernels in end-to-end latency.
+  A prequantized kernel-only result may explain a bottleneck but is not a model
+  speedup.
+- Compare operation coverage as well as timing: record which graph segments ran
+  in PyTorch, compiled CUDA/Triton, cuBLASLt, TensorRT, or fallback code.
+- Add tile-adversarial cases around expected block multiples when validating a
+  custom kernel, even if the official five shapes do not expose every boundary.
 
 ## 12. Evidence and reporting rules
 
@@ -352,6 +510,42 @@ setup costs and sampling parameters explicit.
 - Transformer Engine examples for newer architectures do not make Transformer
   Engine a T4 dependency or prove its fused layers preserve this state dict and
   forward contract.
+- Mobile delegate results do not predict T4 behavior, and their suggestions to
+  replace GELU or LayerNorm are forbidden by this benchmark's exact semantics.
+- QAttn's A100 INT8 throughput and downstream accuracy do not establish strict
+  elementwise correctness, a T4 speedup, or permission to quantize this model.
+- The valid-block and chunk-allocation results for variable-length BERT serving
+  do not prove a gain for fixed benchmark shapes; their index, layout-switch,
+  and allocation costs must be included and can produce negative cases.
+- The GPU survey does not imply that tiling, pruning, batching, fusion, or lower
+  precision is independently beneficial. These techniques interact and sparse
+  execution can be slower than dense execution on a highly parallel GPU.
+- The linear-attention paper does not authorize replacing exact softmax
+  attention. Its reported A6000 results at much longer sequences are neither a
+  T4 performance claim nor numerical equivalence evidence.
+- The supplied acceleration report's operator percentages are CPU-side
+  attribution. SDPA may replace those operators, but it does not thereby prove
+  that exactly 30.59% of end-to-end latency is eliminated. Likewise, reducing
+  36 `addmm` calls to 24 is an expected launch-count change, not a measured
+  model speedup.
+- The report does not prove that an explicit mask always rejects FlashAttention
+  or that `attn_mask=None` always selects it. Verify the exact T4 dispatch; do
+  not label a path FlashAttention from source structure alone.
+- The report's suggested Inductor settings and quoted coordinate-descent gains
+  are not portable guarantees. Private configuration keys, search spaces,
+  compilation cost, generated code, and winning kernels change by PyTorch,
+  Triton, CUDA, GPU, and matrix shape.
+- Exact GELU is not automatically fused merely because compilation succeeds.
+  Inspect generated code and reject any tanh approximation or changed
+  intermediate rounding, even if a fused epilogue benchmarks faster.
+- The report's persistent add/LayerNorm pseudocode mutates a residual buffer and
+  omits production guards, launch geometry, resource limits, stream/error
+  handling, output-lifetime rules, and adversarial numerical validation. It is
+  a design sketch, not submission-ready code.
+- The PyTorch normalization-fusion article's Lazy Pre-Norm result is specific
+  to affine-free RMSNorm and explicitly excludes LayerNorm. It does not justify
+  replacing this benchmark's FP32-statistics LayerNorm or changing its state
+  dict to create a fusion opportunity.
 - A profiler share does not itself prove an optimization; it only bounds the
   opportunity. A reduction in kernel count, FLOPs, or memory traffic is not a
   speedup until CUDA-event measurements show one.
@@ -375,6 +569,11 @@ Before accepting any optimization, answer all of the following:
    reversible?
 8. Are the commit, environment, commands, measurements, failures, and
    limitations documented reproducibly?
+9. Does the measured graph actually execute the intended backend for every
+   operation, without hidden host/device transfer or native fallback?
+10. If the method changes precision, sparsity, token count, or attention
+    algebra, is it still exactly within the benchmark contract? If not, has it
+    been kept out of the submission path?
 
 If any required answer is no, keep the candidate experimental and retain the
 last validated implementation.
