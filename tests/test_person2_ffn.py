@@ -10,9 +10,12 @@ from unittest import mock
 import torch
 
 from bench_person2_ffn import (
+    Case,
+    OptimizedFFNResidual,
     StaticCudaGraphFFN,
     accuracy_output,
     compile_model,
+    make_models,
     mark_inference_step,
     official_cases,
     official_isolated_cases,
@@ -138,6 +141,7 @@ class Person2BlockTests(unittest.TestCase):
         baseline = BaselineTransformerBlock(32, 4, 32).eval()
         optimized = OptimizedTransformerBlock(32, 4, 32).eval()
         optimized.load_state_dict(baseline.state_dict(), strict=True)
+
         x = torch.randn(2, 5, 32)
         mask = torch.tensor([[True] * 5, [True, True, True, False, False]])
 
@@ -196,6 +200,28 @@ class Person2BlockTests(unittest.TestCase):
         self.assertFalse(optimized._ln_gemm_ffn_enabled)
         self.assertIsNone(optimized._compact_mask)
         self.assertIsNone(optimized._compact_valid_rows)
+
+    def test_full_op_can_be_an_alternating_benchmark_control(self) -> None:
+        case = Case(1, 4, 32, 4, 32, False, 0.0)
+        control, candidate = make_models(
+            case,
+            "isolated",
+            torch.device("cpu"),
+            torch.float32,
+            backend="ln-gemm-correction",
+            control_backend="full-op",
+        )
+        self.assertIsInstance(control, OptimizedFFNResidual)
+        self.assertIsInstance(candidate, OptimizedFFNResidual)
+        self.assertEqual(control.backend, "full-op")
+        self.assertEqual(candidate.backend, "ln-gemm-correction")
+        self.assertEqual(
+            set(control.block.state_dict()), set(candidate.block.state_dict())
+        )
+        x = torch.randn(1, 4, 32)
+        mask = torch.ones(1, 4, dtype=torch.bool)
+        with torch.inference_mode():
+            assert_or_close(self, control(x, mask), candidate(x, mask))
 
     def test_fast_ffn_cpu_and_build_failure_fall_back(self) -> None:
         _baseline, optimized = self.make_blocks()

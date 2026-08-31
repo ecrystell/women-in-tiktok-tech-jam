@@ -385,6 +385,7 @@ def make_models(
     device: torch.device,
     dtype: torch.dtype,
     backend: str = "full-op",
+    control_backend: str = "native",
 ) -> tuple[nn.Module, nn.Module]:
     baseline_block = BaselineTransformerBlock(
         case.d_model, case.heads, case.ffn_dim
@@ -396,11 +397,27 @@ def make_models(
     baseline_block = baseline_block.to(device=device, dtype=dtype).eval()
     optimized_block = optimized_block.to(device=device, dtype=dtype).eval()
 
-    if scope == "isolated":
-        return BaselineFFNResidual(baseline_block), OptimizedFFNResidual(
-            optimized_block, backend
+    control_block: Optional[OptimizedTransformerBlock] = None
+    if control_backend != "native":
+        control_block = OptimizedTransformerBlock(
+            case.d_model, case.heads, case.ffn_dim
         )
-    return FullBlock(baseline_block, case.causal, backend), FullBlock(
+        control_block.load_state_dict(baseline_block.state_dict(), strict=True)
+        control_block = control_block.to(device=device, dtype=dtype).eval()
+
+    if scope == "isolated":
+        control = (
+            BaselineFFNResidual(baseline_block)
+            if control_block is None
+            else OptimizedFFNResidual(control_block, control_backend)
+        )
+        return control, OptimizedFFNResidual(optimized_block, backend)
+    control = (
+        FullBlock(baseline_block, case.causal, "full-op")
+        if control_block is None
+        else FullBlock(control_block, case.causal, control_backend)
+    )
+    return control, FullBlock(
         optimized_block, case.causal, backend
     )
 
@@ -434,8 +451,24 @@ def run_case(
             )
         x, mask = make_input(case, device, dtype, args.seed)
         baseline, candidate = make_models(
-            case, scope, device, dtype, args.backend
+            case,
+            scope,
+            device,
+            dtype,
+            args.backend,
+            args.control_backend,
         )
+        control_fast_required = args.control_backend != "native"
+        control_fast_enabled = not control_fast_required
+        control_prepare = getattr(baseline, "prepare", None)
+        if control_prepare is not None and control_fast_required:
+            control_fast_enabled = control_prepare(x, mask)
+            control_reason = getattr(baseline, "prepare_error", None)
+            print(
+                "control_fast_ffn="
+                f"{'ENABLED' if control_fast_enabled else 'FALLBACK'}"
+                + (f" | reason={control_reason}" if control_reason else "")
+            )
         fast_enabled = False
         prepare = getattr(candidate, "prepare", None)
         if prepare is not None:
@@ -548,6 +581,7 @@ def run_case(
             and p90_gate
             and graph_owns_outputs
             and fast_enabled
+            and control_fast_enabled
         )
         result.update(
             status="measured",
@@ -556,6 +590,7 @@ def run_case(
             graph_output_ownership=graph_owns_outputs,
             graph_ownership_reason=graph_ownership_reason,
             fast_path_enabled=fast_enabled,
+            control_fast_path_enabled=control_fast_enabled,
             baseline_median_ms=baseline_median,
             baseline_p90_ms=baseline_p90,
             baseline_throughput_tokens_s=tokens * 1000.0 / baseline_median,
@@ -658,6 +693,12 @@ def parse_args() -> argparse.Namespace:
         "--backend",
         choices=("full-op", "ln-gemm-correction", "cuda-graph"),
         default="full-op",
+    )
+    parser.add_argument(
+        "--control-backend",
+        choices=("native", "full-op"),
+        default="native",
+        help="alternate against native eager or the validated full-op path",
     )
     parser.add_argument(
         "--compile-mode",
