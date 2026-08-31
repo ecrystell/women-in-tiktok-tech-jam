@@ -18,7 +18,79 @@ __inline__ __device__ float warp_sum(float value) {
   return value;
 }
 
-__global__ void layer_norm_correct_exact_gelu(
+__inline__ __device__ float block_sum(float value, float* warp_totals) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  value = warp_sum(value);
+  if (lane == 0) {
+    warp_totals[warp] = value;
+  }
+  __syncthreads();
+
+  const int warps = (blockDim.x + 31) / 32;
+  value = threadIdx.x < warps ? warp_totals[lane] : 0.0f;
+  if (warp == 0) {
+    value = warp_sum(value);
+  }
+  if (threadIdx.x == 0) {
+    warp_totals[0] = value;
+  }
+  __syncthreads();
+  return warp_totals[0];
+}
+
+__inline__ __device__ half exact_gelu_half(float corrected) {
+  // Match the baseline Linear -> GELU boundary: the linear result is first
+  // rounded to FP16, then exact erf GELU is evaluated in FP32 opmath.
+  const half rounded = __float2half_rn(corrected);
+  const float value = __half2float(rounded);
+  const float activated =
+      0.5f * value * erfcf(-value * 0.70710678118654752440f);
+  return __float2half_rn(activated);
+}
+
+__global__ void layer_norm_correct_exact_gelu_block_rows(
+    half* raw_projection,
+    const half* residual,
+    const float* weight_row_sum,
+    const half* bias,
+    int64_t rows,
+    int64_t hidden,
+    int64_t ffn,
+    float eps) {
+  const int64_t row = static_cast<int64_t>(blockIdx.x);
+  if (row >= rows) {
+    return;
+  }
+
+  __shared__ float warp_totals[32];
+  float local_sum = 0.0f;
+  for (int64_t column = threadIdx.x; column < hidden; column += blockDim.x) {
+    local_sum += __half2float(residual[row * hidden + column]);
+  }
+  const float mean = block_sum(local_sum, warp_totals) / hidden;
+
+  float local_squared_difference = 0.0f;
+  for (int64_t column = threadIdx.x; column < hidden; column += blockDim.x) {
+    const float centered =
+        __half2float(residual[row * hidden + column]) - mean;
+    local_squared_difference += centered * centered;
+  }
+  const float variance =
+      block_sum(local_squared_difference, warp_totals) / hidden;
+  const float rstd = rsqrtf(variance + eps);
+
+  for (int64_t column = threadIdx.x; column < ffn; column += blockDim.x) {
+    const int64_t index = row * ffn + column;
+    const float raw = __half2float(raw_projection[index]);
+    const float corrected =
+        (raw - mean * weight_row_sum[column]) * rstd +
+        __half2float(bias[column]);
+    raw_projection[index] = exact_gelu_half(corrected);
+  }
+}
+
+__global__ void layer_norm_correct_exact_gelu_warp_rows(
     half* raw_projection,
     const half* residual,
     const float* weight_row_sum,
@@ -59,13 +131,7 @@ __global__ void layer_norm_correct_exact_gelu(
     const float corrected =
         (raw - mean * weight_row_sum[column]) * rstd +
         __half2float(bias[column]);
-    // Match the baseline Linear -> GELU boundary: the linear result is first
-    // rounded to FP16, then exact erf GELU is evaluated in FP32 opmath.
-    const half rounded = __float2half_rn(corrected);
-    const float value = __half2float(rounded);
-    const float activated =
-        0.5f * value * erfcf(-value * 0.70710678118654752440f);
-    raw_projection[index] = __float2half_rn(activated);
+    raw_projection[index] = exact_gelu_half(corrected);
   }
 }
 
@@ -219,19 +285,40 @@ void layer_norm_correct_exact_gelu_cuda(
   const c10::cuda::CUDAGuard guard(residual.device());
   const int device = residual.get_device();
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream(device).stream();
-  constexpr int threads = 256;
-  constexpr int warps_per_block = threads / 32;
   const int64_t rows = residual.size(0);
-  const int64_t blocks = (rows + warps_per_block - 1) / warps_per_block;
-  layer_norm_correct_exact_gelu<<<blocks, threads, 0, stream>>>(
-      reinterpret_cast<half*>(raw_projection.data_ptr<at::Half>()),
-      reinterpret_cast<const half*>(residual.data_ptr<at::Half>()),
-      weight_row_sum.data_ptr<float>(),
-      reinterpret_cast<const half*>(bias.data_ptr<at::Half>()),
-      rows,
-      residual.size(1),
-      raw_projection.size(1),
-      static_cast<float>(eps));
+  constexpr int warp_threads = 256;
+  constexpr int warps_per_block = warp_threads / 32;
+  if (residual.size(1) <= 32 || rows >= 65536) {
+    const int64_t blocks =
+        (rows + warps_per_block - 1) / warps_per_block;
+    layer_norm_correct_exact_gelu_warp_rows
+        <<<blocks, warp_threads, 0, stream>>>(
+            reinterpret_cast<half*>(raw_projection.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(residual.data_ptr<at::Half>()),
+            weight_row_sum.data_ptr<float>(),
+            reinterpret_cast<const half*>(bias.data_ptr<at::Half>()),
+            rows,
+            residual.size(1),
+            raw_projection.size(1),
+            static_cast<float>(eps));
+  } else {
+    const int64_t largest_dimension =
+        std::max(residual.size(1), raw_projection.size(1));
+    int threads = 32;
+    while (threads < largest_dimension && threads < 256) {
+      threads *= 2;
+    }
+    layer_norm_correct_exact_gelu_block_rows
+        <<<rows, threads, 0, stream>>>(
+            reinterpret_cast<half*>(raw_projection.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(residual.data_ptr<at::Half>()),
+            weight_row_sum.data_ptr<float>(),
+            reinterpret_cast<const half*>(bias.data_ptr<at::Half>()),
+            rows,
+            residual.size(1),
+            raw_projection.size(1),
+            static_cast<float>(eps));
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
