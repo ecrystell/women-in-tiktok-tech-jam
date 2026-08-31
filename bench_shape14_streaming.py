@@ -337,8 +337,9 @@ def main() -> int:
         f"estimated_block={result['estimated_block_gib']:.2f} GiB"
     )
     print(
-        "status=PASS | no explicit baseline or [B,H,S,S] attention matrix was "
-        "allocated; latency is sequential blockwise, not full-batch throughput"
+        "capability_status=PASS | correctness=NOT_CHECKED_AT_FULL_SHAPE | "
+        "no explicit baseline or [B,H,S,S] attention matrix was allocated; "
+        "latency is sequential blockwise, not full-batch throughput"
     )
     return 0
 

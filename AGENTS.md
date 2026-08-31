@@ -368,6 +368,17 @@ recovery candidate: it preserves the reference operator order while bounding
 score memory by query tiles. `--candidate-query-block` independently tunes the
 candidate tile size, defaulting to 64 versus the reference harness's 16.
 
+The combined Shape 14 dispatcher later validated the practical packed-all
+path under the organizer contract. At B2/S4096/D1024/H16/L2 it still failed
+the stricter internal gate by one of 4,194,304 elements with maximum absolute
+error 0.0078125, but passed `atol=0.002`, `rtol=0.02` with zero failed
+elements. Judge-equivalent blockwise timing measured 344.2802 ms baseline and
+21.8125 ms optimized, or 15.784x. The full logical B32/S100000 workload then
+completed sequentially in 161.07 s with 1.57 GiB peak allocation and no
+quadratic attention matrix. That full-size result proves bounded-memory
+execution only; no explicit reference was run, so full-size correctness must
+not be claimed.
+
 Person 1 source `bbd0cc8` (branch tip `cfee3c1`) and validated Person 2 tip
 `f50ef57` are both contained by integration merge `99c1830` (Person 2 entered
 at merge `f6d897a`). The T4-validated source-code tree is `d57502e`; the final

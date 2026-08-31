@@ -63,6 +63,16 @@ peak allocation. The logical official B32 workload also passed with batch
 block 1 in 152.72 s at 1.57 GiB peak allocation; no `[B,H,S,S]` matrix was
 allocated.
 
+The combined branch repeated the full B32/S100000/D1024/H16/L2 capability run
+in 161.07 s with 1.57 GiB peak allocation. This is a finite/no-OOM result, not
+full-shape reference correctness. At the representative B2/S4096/D1024/H16/L2
+shape, packed SDPA in both layers failed the stricter internal gate by one of
+4,194,304 elements (`max_abs=0.0078125`), but passed the organizer's
+`atol=0.002`, `rtol=0.02` OR criterion with zero failed elements. Under those
+judge-equivalent tolerances it measured 344.2802 ms baseline versus 21.8125 ms
+optimized, a 15.784x sequential blockwise speedup. Report both the strict
+failure and organizer-equivalent pass; do not claim strict Shape 14 accuracy.
+
 ## Validation status
 
 The updated T4 checkout passes 54 tests with one expected opt-in skip. The
