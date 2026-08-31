@@ -92,6 +92,24 @@ def validate_memory_budget(
         )
 
 
+def validate_streaming_runtime(
+    optimized: UserOptimizedTransformer,
+    x: torch.Tensor,
+    mask: torch.Tensor,
+) -> None:
+    """Validate the inference-only packed path before the timed block loop."""
+
+    # Runtime dispatch intentionally rejects packed attention while autograd is
+    # enabled. Match the timed inference context during this setup-only check.
+    with torch.inference_mode():
+        if not optimized._mask_is_all_valid(mask, x):
+            raise RuntimeError("Shape 14 streaming requires an all-valid mask")
+        if not optimized._runtime_supports_packed(x):
+            raise RuntimeError(
+                "packed Shape 14 streaming is unsupported at runtime"
+            )
+
+
 def build_shape14_models(
     *,
     batch_block: int,
@@ -243,10 +261,7 @@ def run_streaming_shape14(
     )
     # Resolve mask and runtime metadata before timing without executing the
     # explicit baseline or a full model forward.
-    if not optimized._mask_is_all_valid(mask, x):
-        raise RuntimeError("Shape 14 streaming requires an all-valid mask")
-    if not optimized._runtime_supports_packed(x):
-        raise RuntimeError("packed Shape 14 streaming is unsupported at runtime")
+    validate_streaming_runtime(optimized, x, mask)
     torch.cuda.reset_peak_memory_stats(device)
     optimized_samples = _timed_block_loop(
         optimized,

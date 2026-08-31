@@ -17,7 +17,11 @@ from bench_shape14_blockwise import (
     SeparateQKVTritonAttention,
     configure_candidate_attention,
 )
-from bench_shape14_streaming import Shape14MemoryEstimate, validate_memory_budget
+from bench_shape14_streaming import (
+    Shape14MemoryEstimate,
+    validate_memory_budget,
+    validate_streaming_runtime,
+)
 from person3_dispatch import (
     AttentionDispatchKey,
     DispatchMeasurement,
@@ -215,6 +219,25 @@ class Person3IntegrationTests(unittest.TestCase):
         )
         with self.assertRaises(MemoryError):
             validate_memory_budget(unsafe, free_fraction=0.01)
+
+    def test_shape14_runtime_preflight_uses_inference_mode(self) -> None:
+        class RuntimeProbe:
+            def _mask_is_all_valid(self, mask, x):
+                self.assert_inference_context()
+                return True
+
+            def _runtime_supports_packed(self, x):
+                self.assert_inference_context()
+                return True
+
+            @staticmethod
+            def assert_inference_context():
+                if torch.is_grad_enabled():
+                    raise AssertionError("streaming preflight enabled autograd")
+
+        x = torch.randn(1, 4, 8)
+        mask = torch.ones(1, 4, dtype=torch.bool)
+        validate_streaming_runtime(RuntimeProbe(), x, mask)
 
     def test_shape14_candidate_plans_use_canonical_constructor(self) -> None:
         config = TransformerConfig(1, 16, 32, 4, 32, 2, True)
