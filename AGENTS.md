@@ -595,3 +595,23 @@ accuracy trials, `atol=0.002`, and `rtol=0.02`. Final mode retains the supplied
 20 warmups, 100 repetitions, and three alternating rounds. Strict mode remains
 the default internal gate. ID 14 is still reported separately because invoking
 the unchanged dense reference at B32/S100000 would require multiple terabytes.
+
+## Expanded component integration experiment
+
+Branch `person3/experiment-expanded-components` keeps the canonical production
+defaults unchanged and adds opt-in suffix controls for combined T4 experiments:
+
+- `PERSON3_PACKED_SUFFIX=N` requests packed-QKV SDPA in the final N layers;
+- `PERSON3_FAST_FFN_SUFFIX=N` requests Person 2's identity-LayerNorm/full-FFN
+  custom-op path in the final N layers.
+
+`run_sweep.py` exposes the same controls through
+`--packed-sdpa-suffix-layers` and `--fast-ffn-suffix-layers`. Person 2's path
+refreshes its transposed output weight after device transfer, builds outside
+timing during the first accuracy call, and must pass a strict per-layer
+0.001/0.01 preflight before activation. Unsupported devices, padding,
+compilation, changed parameters, extension failures, and numerical failures
+retain the native FFN. Experimental telemetry reports actual packed selection
+and the number of FFN layers prepared. No candidate is eligible for `main`
+until end-to-end T4 correctness and three-process timing improve on the current
+production policy.

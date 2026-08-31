@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import os
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -396,6 +397,94 @@ class Person3IntegrationTests(unittest.TestCase):
                 for layer in nearby.layers
             )
         )
+
+    def test_component_suffix_overrides_select_exact_layers(self) -> None:
+        config = TransformerConfig(2, 128, 128, 4, 128, 4, True)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PERSON3_PACKED_SUFFIX": "2",
+                "PERSON3_FAST_FFN_SUFFIX": "3",
+            },
+        ):
+            optimized = UserOptimizedTransformer(config)
+
+        self.assertEqual(optimized._packed_suffix_layers, 2)
+        self.assertEqual(optimized._fast_ffn_suffix_layers, 3)
+        self.assertTrue(
+            all(
+                isinstance(layer.attention, BaselineSelfAttention)
+                for layer in optimized.layers[:2]
+            )
+        )
+        self.assertTrue(
+            all(
+                isinstance(layer.attention, PackedQKVSelfAttention)
+                for layer in optimized.layers[2:]
+            )
+        )
+        self.assertFalse(optimized.layers[0].fast_ffn_candidate)
+        self.assertTrue(
+            all(layer.fast_ffn_candidate for layer in optimized.layers[1:])
+        )
+
+    def test_component_suffix_overrides_reject_invalid_depths(self) -> None:
+        config = TransformerConfig(2, 128, 128, 4, 128, 4, True)
+        for name, value in (
+            ("PERSON3_PACKED_SUFFIX", "five"),
+            ("PERSON3_FAST_FFN_SUFFIX", "5"),
+        ):
+            with (
+                self.subTest(name=name, value=value),
+                mock.patch.dict(os.environ, {name: value}),
+                self.assertRaisesRegex(ValueError, name),
+            ):
+                UserOptimizedTransformer(config)
+
+    def test_fast_ffn_cpu_fallback_is_exact(self) -> None:
+        config = TransformerConfig(2, 7, 32, 4, 64, 2, True)
+        with mock.patch.dict(os.environ, {"PERSON3_FAST_FFN_SUFFIX": "1"}):
+            torch.manual_seed(108)
+            baseline = BaselineTransformer(config).eval()
+            optimized = UserOptimizedTransformer(config).eval()
+        copy_model_weights(baseline, optimized)
+        x = torch.randn(2, 7, 32)
+        mask = torch.ones(2, 7, dtype=torch.bool)
+
+        with (
+            mock.patch("builtins.print") as telemetry,
+            torch.inference_mode(),
+        ):
+            reference = baseline(x, mask)
+            candidate = optimized(x, mask)
+
+        self.assertTrue(torch.equal(reference, candidate))
+        telemetry.assert_called_once_with(
+            "attention_backend=native+fast-ffn:0/1"
+        )
+        selected = optimized.layers[-1]
+        self.assertTrue(selected._fast_ffn_prepare_attempted)
+        self.assertFalse(selected._fast_ffn_enabled)
+        self.assertIn("unsupported", selected.fast_ffn_error)
+
+    def test_fast_ffn_weight_state_refreshes_after_copy(self) -> None:
+        config = TransformerConfig(2, 7, 32, 4, 64, 2, False)
+        with mock.patch.dict(os.environ, {"PERSON3_FAST_FFN_SUFFIX": "1"}):
+            baseline = BaselineTransformer(config).eval()
+            optimized = UserOptimizedTransformer(config).eval()
+        with torch.no_grad():
+            baseline.layers[-1].ffn_out.weight.fill_(0.125)
+        copy_model_weights(baseline, optimized)
+
+        selected = optimized.layers[-1]
+        self.assertTrue(
+            torch.equal(
+                selected._ffn_out_weight_nt,
+                selected.ffn_out.weight.t().contiguous(),
+            )
+        )
+        self.assertFalse(selected._fast_ffn_enabled)
+        self.assertFalse(selected._fast_ffn_prepare_attempted)
 
     def test_packed_weight_transfer_uses_qkv_row_order(self) -> None:
         config = TransformerConfig(1, 128, 128, 4, 128, 4, True)

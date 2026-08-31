@@ -288,6 +288,7 @@ class UserOptimizedTransformerBlock(nn.Module):
         num_heads: int,
         ffn_dim: int,
         packed_attention: bool,
+        fast_ffn_candidate: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
@@ -299,6 +300,143 @@ class UserOptimizedTransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn_in = nn.Linear(d_model, ffn_dim)
         self.ffn_out = nn.Linear(ffn_dim, d_model)
+        self.fast_ffn_candidate = fast_ffn_candidate
+        self.register_buffer(
+            "_ffn_out_weight_nt",
+            self.ffn_out.weight.detach().t().contiguous(),
+            persistent=False,
+        )
+        self._fast_ffn_enabled = False
+        self._fast_ffn_prepare_attempted = False
+        self._norm2_affine_is_identity = True
+        self._ffn_out_weight_version = self.ffn_out.weight._version
+        self._norm2_weight_version = self.norm2.weight._version
+        self._norm2_bias_version = self.norm2.bias._version
+        self.fast_ffn_error: Optional[str] = None
+
+    @torch.no_grad()
+    def refresh_fast_ffn_state(self) -> None:
+        """Refresh Person 2's nonpersistent packed state after weight copy."""
+
+        self._ffn_out_weight_nt = self.ffn_out.weight.detach().t().contiguous()
+        self._norm2_affine_is_identity = bool(
+            torch.equal(self.norm2.weight, torch.ones_like(self.norm2.weight))
+            and torch.count_nonzero(self.norm2.bias).item() == 0
+        )
+        self._ffn_out_weight_version = self.ffn_out.weight._version
+        self._norm2_weight_version = self.norm2.weight._version
+        self._norm2_bias_version = self.norm2.bias._version
+        self._fast_ffn_enabled = False
+        self._fast_ffn_prepare_attempted = False
+        self.fast_ffn_error = None
+
+    def _fast_ffn_parameters_are_current(self) -> bool:
+        return (
+            self._ffn_out_weight_version == self.ffn_out.weight._version
+            and self._norm2_weight_version == self.norm2.weight._version
+            and self._norm2_bias_version == self.norm2.bias._version
+        )
+
+    def _supports_fast_ffn(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> bool:
+        return (
+            self.fast_ffn_candidate
+            and valid_token_mask is None
+            and x.is_cuda
+            and x.dtype == torch.float16
+            and x.ndim == 3
+            and x.is_contiguous()
+            and x.shape[-1] % 8 == 0
+            and self._norm2_affine_is_identity
+            and not self.training
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        )
+
+    def _ffn_residual_native(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        batch, seq_len, d_model = x.shape
+        ffn_input = self.norm2(x).reshape(batch * seq_len, d_model)
+        ffn_update = self.ffn_out(
+            F.gelu(self.ffn_in(ffn_input), approximate="none")
+        ).reshape(batch, seq_len, d_model)
+        output = x + ffn_update
+        if valid_token_mask is not None:
+            output = output.masked_fill(~valid_token_mask[..., None], 0)
+        return output
+
+    def _ffn_residual_fast(self, x: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, d_model = x.shape
+        residual = x.reshape(batch * seq_len, d_model)
+        person2_post = __import__("person2_ffn_post")
+        output = person2_post.identity_layer_norm_ffn_unmasked(
+            residual,
+            self.ffn_in.weight,
+            self.ffn_in.bias,
+            self._ffn_out_weight_nt,
+            self.ffn_out.bias,
+            self.norm2.eps,
+        )
+        return output.reshape(batch, seq_len, d_model)
+
+    @torch.no_grad()
+    def _prepare_fast_ffn(self, x: torch.Tensor) -> bool:
+        """Build and strictly preflight Person 2's path before timing."""
+
+        # Device/dtype transfer happens after weight copy in the organizer
+        # harness, so rebuild the transposed weight on the final device.
+        self.refresh_fast_ffn_state()
+        self._fast_ffn_prepare_attempted = True
+        if not self._supports_fast_ffn(x, None):
+            self.fast_ffn_error = "unsupported device, dtype, layout, or mode"
+            return False
+        try:
+            person2_post = __import__("person2_ffn_post")
+            person2_post.load_extension()
+            reference = self._ffn_residual_native(x, None)
+            candidate = self._ffn_residual_fast(x)
+            ref = reference.float()
+            opt = candidate.float()
+            error = (opt - ref).abs()
+            passed = torch.isfinite(ref) & torch.isfinite(opt)
+            passed &= (error <= 0.001) | (error <= 0.01 * ref.abs())
+            if not bool(passed.all().item()):
+                self.fast_ffn_error = (
+                    "strict numerical preflight failed: "
+                    f"max_abs={error.max().item():.6g}, "
+                    f"failed={int((~passed).sum().item())}"
+                )
+                return False
+            self._fast_ffn_enabled = True
+            return True
+        except (ImportError, OSError, RuntimeError) as error:
+            self.fast_ffn_error = f"{type(error).__name__}: {error}"
+            return False
+
+    def _ffn_residual(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if (
+            self.fast_ffn_candidate
+            and not self._fast_ffn_prepare_attempted
+            and valid_token_mask is None
+        ):
+            self._prepare_fast_ffn(x)
+        if (
+            self._fast_ffn_enabled
+            and self._fast_ffn_parameters_are_current()
+            and self._supports_fast_ffn(x, valid_token_mask)
+        ):
+            return self._ffn_residual_fast(x)
+        return self._ffn_residual_native(x, valid_token_mask)
 
     def forward(
         self,
@@ -316,15 +454,7 @@ class UserOptimizedTransformerBlock(nn.Module):
             attention = self.attention(normalized, valid_token_mask, causal)
         x = x + attention
 
-        batch, seq_len, d_model = x.shape
-        ffn_input = self.norm2(x).reshape(batch * seq_len, d_model)
-        ffn_update = self.ffn_out(
-            F.gelu(self.ffn_in(ffn_input), approximate="none")
-        ).reshape(batch, seq_len, d_model)
-        x = x + ffn_update
-        if valid_token_mask is not None:
-            x = x.masked_fill(~valid_token_mask[..., None], 0)
-        return x
+        return self._ffn_residual(x, valid_token_mask)
 
 
 class UserOptimizedTransformer(BaselineTransformer):
@@ -353,8 +483,29 @@ class UserOptimizedTransformer(BaselineTransformer):
             config.num_layers,
             config.causal,
         )
-        self._packed_candidate = config_key in self._PACKED_SUFFIX_CONFIGS
-        first_packed_layer = config.num_layers - 1
+        environment = __import__("os").environ
+        packed_override = environment.get("PERSON3_PACKED_SUFFIX")
+        fast_ffn_override = environment.get("PERSON3_FAST_FFN_SUFFIX", "0")
+        default_packed_suffix = int(config_key in self._PACKED_SUFFIX_CONFIGS)
+        self._packed_suffix_layers = self._parse_suffix_override(
+            "PERSON3_PACKED_SUFFIX",
+            packed_override,
+            default_packed_suffix,
+            config.num_layers,
+        )
+        self._fast_ffn_suffix_layers = self._parse_suffix_override(
+            "PERSON3_FAST_FFN_SUFFIX",
+            fast_ffn_override,
+            0,
+            config.num_layers,
+        )
+        self._experimental_dispatch = (
+            packed_override is not None or self._fast_ffn_suffix_layers > 0
+        )
+        self._dispatch_reported = False
+        self._packed_candidate = self._packed_suffix_layers > 0
+        first_packed_layer = config.num_layers - self._packed_suffix_layers
+        first_fast_ffn_layer = config.num_layers - self._fast_ffn_suffix_layers
         self.layers = nn.ModuleList(
             [
                 UserOptimizedTransformerBlock(
@@ -364,6 +515,7 @@ class UserOptimizedTransformer(BaselineTransformer):
                     packed_attention=(
                         self._packed_candidate and index >= first_packed_layer
                     ),
+                    fast_ffn_candidate=(index >= first_fast_ffn_layer),
                 )
                 for index in range(config.num_layers)
             ]
@@ -374,6 +526,23 @@ class UserOptimizedTransformer(BaselineTransformer):
         self._cached_mask_is_all_valid = False
         self._cached_runtime_key: Optional[Tuple[str, int, torch.dtype, str]] = None
         self._cached_runtime_supports_packed = False
+
+    @staticmethod
+    def _parse_suffix_override(
+        name: str,
+        raw_value: Optional[str],
+        default: int,
+        num_layers: int,
+    ) -> int:
+        if raw_value is None:
+            return default
+        try:
+            value = int(raw_value)
+        except ValueError as error:
+            raise ValueError(f"{name} must be an integer") from error
+        if not 0 <= value <= num_layers:
+            raise ValueError(f"{name} must be between 0 and {num_layers}")
+        return value
 
     @torch.no_grad()
     def copy_from_baseline(
@@ -403,6 +572,7 @@ class UserOptimizedTransformer(BaselineTransformer):
             target_layer.ffn_out.load_state_dict(
                 source_layer.ffn_out.state_dict(), strict=strict
             )
+            target_layer.refresh_fast_ffn_state()
 
         self.final_norm.load_state_dict(source.final_norm.state_dict(), strict=strict)
         self._cached_mask = None
@@ -491,6 +661,21 @@ class UserOptimizedTransformer(BaselineTransformer):
         x = self.final_norm(x)
         if effective_mask is not None:
             x = x.masked_fill(~effective_mask[..., None], 0)
+        if self._experimental_dispatch and not self._dispatch_reported:
+            packed_backend = (
+                f"packed-sdpa-suffix:{self._packed_suffix_layers}"
+                if use_packed
+                else "native"
+            )
+            prepared_ffn_layers = sum(
+                layer._fast_ffn_enabled for layer in self.layers
+            )
+            print(
+                f"attention_backend={packed_backend}"
+                f"+fast-ffn:{prepared_ffn_layers}/"
+                f"{self._fast_ffn_suffix_layers}"
+            )
+            self._dispatch_reported = True
         return x
 
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import statistics
 import subprocess
@@ -286,13 +287,9 @@ def build_command(
     accuracy_trials: int = 20,
     dispatch_mode: str = "auto",
 ) -> list[str]:
-    if (
-        fast_ffn_suffix_layers != 0
-        or packed_sdpa_suffix_layers is not None
-        or dispatch_mode != "auto"
-    ):
+    if dispatch_mode != "auto":
         raise ValueError(
-            "the canonical benchmark exposes automatic dispatch only"
+            "native dispatch override is unavailable in the canonical benchmark"
         )
     command = [
         sys.executable,
@@ -656,8 +653,20 @@ def main() -> int:
         f"processes={processes} contract={args.contract} "
         f"warmup={warmup} repeats={repeats} rounds={rounds} "
         f"accuracy_trials={accuracy_trials} atol={atol:g} rtol={rtol:g} "
+        f"packed_suffix={args.packed_sdpa_suffix_layers} "
+        f"fast_ffn_suffix={args.fast_ffn_suffix_layers} "
         "benchmark=canonical-auto-dispatch"
     )
+    child_environment = os.environ.copy()
+    child_environment["PERSON3_FAST_FFN_SUFFIX"] = str(
+        args.fast_ffn_suffix_layers
+    )
+    if args.packed_sdpa_suffix_layers is None:
+        child_environment.pop("PERSON3_PACKED_SUFFIX", None)
+    else:
+        child_environment["PERSON3_PACKED_SUFFIX"] = str(
+            args.packed_sdpa_suffix_layers
+        )
     correctness_failed = False
     execution_failed = False
     completed_case_results: list[tuple[Case, tuple[RunResult, ...]]] = []
@@ -680,7 +689,12 @@ def main() -> int:
             dispatch_mode=args.dispatch_mode,
         )
         for process_index in range(processes):
-            completed = subprocess.run(command, capture_output=True, text=True)
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                env=child_environment,
+            )
             if completed.returncode != 0:
                 execution_failed = True
                 print(f"process {process_index + 1}: ERROR ({completed.returncode})")
