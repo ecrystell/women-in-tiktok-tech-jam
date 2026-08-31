@@ -153,7 +153,6 @@ accumulation, and tail-latency requirements.
 | `person3/experiment-narrow-ffn` | Test Person 2's official narrow FFN behind the winning attention suffix. | All outputs passed, but the median optimized latency was 2.4019 ms versus 2.3764 ms native, and one p90 reached 4.0306 ms. | Rejected for official narrow integration. |
 | `person3/integrate-shape14-dispatch` | Add guarded query/batch-blocked long-context evaluation and compare packed, separate, Triton, and explicit-tiled plans. | Reduced judge-contract timing was about 15.4x faster. Full logical B32/S100000 completed in 153–161 seconds with about 1.57 GiB peak allocation, but no full dense reference could run. | Retained as a separate bounded-memory evaluator, not a canonical full-size speedup claim. |
 | `person3/official-benchmark-integration` and hardening | Rebuild from the organizer template, make the optimized model self-contained, calibrate IDs 1–13, and guard unchanged baseline/CLI sections. | The canonical T4 matrix passed 39/39 strict process comparisons with a 1.272x geometric-mean speedup. | **Selected release implementation.** |
-| `person3/experiment-expanded-components` | Add opt-in environment/CLI controls for deeper packed and fast-FFN suffixes with strict preflight telemetry. | The branch was created after the release and has no qualifying end-to-end T4 evidence. Production defaults remain unchanged. | Unvalidated experiment; excluded from this report's final claims. |
 
 ## Final selected architecture
 
