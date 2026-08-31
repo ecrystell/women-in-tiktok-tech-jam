@@ -18,27 +18,6 @@ __inline__ __device__ float warp_sum(float value) {
   return value;
 }
 
-__inline__ __device__ float block_sum(float value, float* warp_totals) {
-  const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  value = warp_sum(value);
-  if (lane == 0) {
-    warp_totals[warp] = value;
-  }
-  __syncthreads();
-
-  const int warps = (blockDim.x + 31) / 32;
-  value = threadIdx.x < warps ? warp_totals[lane] : 0.0f;
-  if (warp == 0) {
-    value = warp_sum(value);
-  }
-  if (threadIdx.x == 0) {
-    warp_totals[0] = value;
-  }
-  __syncthreads();
-  return warp_totals[0];
-}
-
 __global__ void layer_norm_correct_exact_gelu(
     half* raw_projection,
     const half* residual,
@@ -48,29 +27,33 @@ __global__ void layer_norm_correct_exact_gelu(
     int64_t hidden,
     int64_t ffn,
     float eps) {
-  const int64_t row = static_cast<int64_t>(blockIdx.x);
+  constexpr int warps_per_block = 8;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int64_t row =
+      static_cast<int64_t>(blockIdx.x) * warps_per_block + warp;
   if (row >= rows) {
     return;
   }
 
-  __shared__ float warp_totals[32];
   float local_sum = 0.0f;
-  for (int64_t column = threadIdx.x; column < hidden; column += blockDim.x) {
+  for (int64_t column = lane; column < hidden; column += 32) {
     local_sum += __half2float(residual[row * hidden + column]);
   }
-  const float mean = block_sum(local_sum, warp_totals) / hidden;
+  const float mean =
+      __shfl_sync(0xffffffff, warp_sum(local_sum), 0) / hidden;
 
   float local_squared_difference = 0.0f;
-  for (int64_t column = threadIdx.x; column < hidden; column += blockDim.x) {
+  for (int64_t column = lane; column < hidden; column += 32) {
     const float centered =
         __half2float(residual[row * hidden + column]) - mean;
     local_squared_difference += centered * centered;
   }
-  const float variance =
-      block_sum(local_squared_difference, warp_totals) / hidden;
+  const float variance = __shfl_sync(
+      0xffffffff, warp_sum(local_squared_difference), 0) / hidden;
   const float rstd = rsqrtf(variance + eps);
 
-  for (int64_t column = threadIdx.x; column < ffn; column += blockDim.x) {
+  for (int64_t column = lane; column < ffn; column += 32) {
     const int64_t index = row * ffn + column;
     const float raw = __half2float(raw_projection[index]);
     const float corrected =
@@ -236,14 +219,11 @@ void layer_norm_correct_exact_gelu_cuda(
   const c10::cuda::CUDAGuard guard(residual.device());
   const int device = residual.get_device();
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream(device).stream();
-  const int64_t largest_dimension =
-      std::max(residual.size(1), raw_projection.size(1));
-  int threads = 32;
-  while (threads < largest_dimension && threads < 256) {
-    threads *= 2;
-  }
+  constexpr int threads = 256;
+  constexpr int warps_per_block = threads / 32;
   const int64_t rows = residual.size(0);
-  layer_norm_correct_exact_gelu<<<rows, threads, 0, stream>>>(
+  const int64_t blocks = (rows + warps_per_block - 1) / warps_per_block;
+  layer_norm_correct_exact_gelu<<<blocks, threads, 0, stream>>>(
       reinterpret_cast<half*>(raw_projection.data_ptr<at::Half>()),
       reinterpret_cast<const half*>(residual.data_ptr<at::Half>()),
       weight_row_sum.data_ptr<float>(),
