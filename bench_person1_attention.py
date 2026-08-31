@@ -7,6 +7,9 @@ Examples:
     python bench_person1_attention.py --device cuda --dtype float16 \
         --padding-ratio 0.25 --mode both
     python bench_person1_attention.py --device cuda --dtype float16 --sweep
+    python bench_person1_attention.py --official-case 13 --device cuda
+    python bench_person1_attention.py --official-case 14 --attention-core \
+        --allow-long-sequence --device cuda
 
 The benchmark intentionally does not modify ``torch_transformer_benchmark.py``.
 It compares complete attention modules so packed-QKV projection and output
@@ -31,8 +34,33 @@ if torch is not None:
     from person1_triton_attention import (
         PackedQKVSDPAAttention,
         TritonSelfAttention,
+        cuda_bfloat16_supported,
+        prepare_valid_token_mask,
+        sdpa_scaled_dot_product_attention,
+        sdpa_backend_diagnostics,
+        triton_scaled_dot_product_attention,
+        triton_scaled_dot_product_attention_with_status,
     )
     from torch_transformer_benchmark import BaselineSelfAttention
+
+
+OFFICIAL_CASES = {
+    1: (64, 128, 4, 128),
+    2: (1, 128, 4, 128),
+    3: (4, 128, 4, 128),
+    4: (16, 128, 4, 128),
+    5: (128, 128, 4, 128),
+    6: (10000, 128, 4, 128),
+    7: (64, 32, 4, 128),
+    8: (64, 1024, 4, 128),
+    9: (64, 128, 1, 128),
+    10: (64, 128, 2, 128),
+    11: (64, 128, 16, 128),
+    12: (64, 128, 4, 32),
+    13: (64, 128, 4, 1024),
+    14: (32, 1024, 16, 100000),
+}
+_DENSE_BENCHMARK_MAX_SEQ_LEN = 8192
 
 
 @dataclass(frozen=True)
@@ -125,6 +153,45 @@ def synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def timed_call(
+    call: Callable[[], torch.Tensor],
+    device: torch.device,
+    warmup: int,
+    repeats: int,
+) -> Tuple[List[float], torch.Tensor]:
+    """Time an already-constructed attention call without data generation."""
+
+    with torch.inference_mode():
+        output = None
+        for _ in range(warmup):
+            output = call()
+    synchronize(device)
+
+    samples: List[float] = []
+    with torch.inference_mode():
+        if device.type == "cuda":
+            starts = [torch.cuda.Event(enable_timing=True) for _ in range(repeats)]
+            ends = [torch.cuda.Event(enable_timing=True) for _ in range(repeats)]
+            for index in range(repeats):
+                starts[index].record()
+                output = call()
+                ends[index].record()
+            synchronize(device)
+            samples.extend(
+                start.elapsed_time(end)
+                for start, end in zip(starts, ends)
+            )
+        else:
+            for _ in range(repeats):
+                start = time.perf_counter_ns()
+                output = call()
+                end = time.perf_counter_ns()
+                samples.append((end - start) / 1e6)
+    if output is None:
+        raise RuntimeError("benchmark call produced no output")
+    return samples, output.detach()
+
+
 def timed_forward(
     model: torch.nn.Module,
     x: torch.Tensor,
@@ -133,32 +200,37 @@ def timed_forward(
     warmup: int,
     repeats: int,
 ) -> List[float]:
-    with torch.inference_mode():
-        for _ in range(warmup):
-            model(x, valid_token_mask, causal)
-    synchronize(x.device)
-
-    samples: List[float] = []
-    with torch.inference_mode():
-        if x.device.type == "cuda":
-            starts = [torch.cuda.Event(enable_timing=True) for _ in range(repeats)]
-            ends = [torch.cuda.Event(enable_timing=True) for _ in range(repeats)]
-            for index in range(repeats):
-                starts[index].record()
-                model(x, valid_token_mask, causal)
-                ends[index].record()
-            synchronize(x.device)
-            samples.extend(
-                start.elapsed_time(end)
-                for start, end in zip(starts, ends)
-            )
-        else:
-            for _ in range(repeats):
-                start = time.perf_counter_ns()
-                model(x, valid_token_mask, causal)
-                end = time.perf_counter_ns()
-                samples.append((end - start) / 1e6)
+    samples, _ = timed_call(
+        lambda: model(x, valid_token_mask, causal),
+        x.device,
+        warmup,
+        repeats,
+    )
     return samples
+
+
+def backend_report(
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    valid_token_mask: Optional[torch.Tensor],
+) -> str:
+    """Report the backend used by the preceding eager call when available."""
+
+    if hasattr(model, "backend_status"):
+        actual, reason = model.backend_status()
+        if actual != "uninitialized":
+            if reason:
+                return f"{actual} | fallback_reason={reason}"
+            return actual
+        # The compiled wrapper deliberately does not mutate Python module
+        # state during graph capture/execution.  Do not report an eligibility
+        # prediction as proof that a Triton kernel ran.
+        planned = model.selected_backend(x, valid_token_mask)
+        return (
+            "unverified | "
+            f"planned={planned} | compiled_backend_telemetry_unavailable"
+        )
+    return "baseline"
 
 
 def timed_backward(
@@ -250,7 +322,13 @@ def maybe_compile(
     if not hasattr(torch, "compile"):
         raise RuntimeError("this PyTorch build does not provide torch.compile")
     return {
-        name: torch.compile(model, backend="inductor", mode=mode)
+        name: torch.compile(
+            model,
+            backend="inductor",
+            mode=mode,
+            fullgraph=True,
+            dynamic=False,
+        )
         for name, model in models.items()
     }
 
@@ -283,6 +361,170 @@ def run_profile(
     )
 
 
+def run_sdpa_diagnostic(
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    valid_token_mask: Optional[torch.Tensor],
+    causal: bool,
+) -> None:
+    """Print SDPA eligibility and layout metadata outside benchmark timing."""
+
+    if not hasattr(model, "qkv_proj"):
+        return
+    try:
+        batch, seq_len, _ = x.shape
+        num_heads = int(model.num_heads)
+        head_dim = int(model.head_dim)
+        with torch.inference_mode():
+            qkv = model.qkv_proj(x).view(
+                batch, seq_len, 3, num_heads, head_dim
+            )
+            q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        diagnostics = sdpa_backend_diagnostics(
+            q, k, v, valid_token_mask=valid_token_mask, causal=causal
+        )
+    except (AttributeError, RuntimeError, ValueError) as error:
+        print(f"[sdpa-diagnostic] unavailable: {type(error).__name__}: {error}")
+        return
+    backend_summary = ", ".join(
+        f"{name}={status}"
+        for name, status in diagnostics["backends"].items()
+    )
+    print(
+        "[sdpa-diagnostic] "
+        f"shape={diagnostics['shape']} dtype={diagnostics['dtype']} "
+        f"mask={diagnostics['mask']} causal={diagnostics['causal']} "
+        f"q_stride={diagnostics['q_stride']} "
+        f"k_stride={diagnostics['k_stride']} "
+        f"v_stride={diagnostics['v_stride']} "
+        f"selected_kernel={diagnostics['selected_kernel']} "
+        f"backends={backend_summary}"
+    )
+
+
+def make_core_inputs(
+    config: BenchmarkConfig,
+    seed: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Create preprojected Q/K/V for a memory-safe long-sequence smoke run."""
+
+    generator = torch.Generator(device=config.device)
+    generator.manual_seed(seed)
+    shape = (
+        config.batch_size,
+        config.num_heads,
+        config.seq_len,
+        config.head_dim,
+    )
+    q = torch.randn(*shape, device=config.device, dtype=config.dtype, generator=generator)
+    k = torch.randn(*shape, device=config.device, dtype=config.dtype, generator=generator)
+    v = torch.randn(*shape, device=config.device, dtype=config.dtype, generator=generator)
+    if config.padding_ratio <= 0.0:
+        return q, k, v, None
+
+    min_valid = max(1, int(round(config.seq_len * (1.0 - config.padding_ratio))))
+    lengths = torch.randint(
+        min_valid,
+        config.seq_len + 1,
+        (config.batch_size,),
+        device=config.device,
+        generator=generator,
+    )
+    positions = torch.arange(config.seq_len, device=config.device)[None, :]
+    valid_token_mask = positions < lengths[:, None]
+    return q, k, v, valid_token_mask
+
+
+def run_attention_core_case(args: argparse.Namespace, config: BenchmarkConfig) -> None:
+    """Benchmark only the memory-safe attention core for long sequences.
+
+    The full official Shape #14 also requires streaming QKV projection, which
+    is outside this standalone Person 1 attention-core benchmark.  Refuse a
+    case whose preprojected Q/K/V tensors cannot fit instead of risking an
+    accidental OOM.
+    """
+
+    if args.mode != "forward":
+        raise ValueError("long attention-core benchmarking supports forward mode only")
+
+    element_size = torch.tensor([], dtype=config.dtype).element_size()
+    required_bytes = (
+        4
+        * config.batch_size
+        * config.num_heads
+        * config.seq_len
+        * config.head_dim
+        * element_size
+    )
+    if config.device.type == "cuda":
+        free_bytes, _ = torch.cuda.mem_get_info(config.device)
+        if required_bytes > int(free_bytes * 0.70):
+            print(
+                f"[skip] core tensors need approximately {required_bytes / 2**30:.2f} GiB "
+                f"but only {free_bytes / 2**30:.2f} GiB is free; use a reduced "
+                "batch/head configuration for the long-sequence smoke run"
+            )
+            return
+    elif required_bytes > 2**30:
+        print(
+            f"[skip] core tensors need approximately {required_bytes / 2**30:.2f} GiB "
+            "on CPU; use a reduced batch/head configuration for the long-sequence "
+            "smoke run"
+        )
+        return
+
+    q, k, v, valid_token_mask = make_core_inputs(config, args.seed)
+    valid_token_mask = prepare_valid_token_mask(valid_token_mask)
+
+    def sdpa_call() -> torch.Tensor:
+        return sdpa_scaled_dot_product_attention(
+            q, k, v, valid_token_mask=valid_token_mask, causal=config.causal
+        )
+
+    def triton_call() -> torch.Tensor:
+        return triton_scaled_dot_product_attention(
+            q, k, v, valid_token_mask=valid_token_mask, causal=config.causal
+        )
+
+    print(
+        f"\n=== attention core: B={config.batch_size}, S={config.seq_len}, "
+        f"D={config.d_model}, H={config.num_heads}, Dh={config.head_dim}, "
+        f"dtype={args.dtype}, causal={config.causal}, device={config.device} ==="
+    )
+    if config.device.type == "cuda":
+        print(f"gpu={torch.cuda.get_device_name(config.device)}")
+
+    _, triton_backend, triton_reason = triton_scaled_dot_product_attention_with_status(
+        q,
+        k,
+        v,
+        valid_token_mask=valid_token_mask,
+        causal=config.causal,
+    )
+    sdpa_samples, sdpa_output = timed_call(
+        sdpa_call, config.device, args.warmup, args.repeats
+    )
+    triton_samples, triton_output = timed_call(
+        triton_call, config.device, args.warmup, args.repeats
+    )
+    finite = bool(torch.isfinite(triton_output).all())
+    passed, max_abs, max_rel, failed = compare_outputs(
+        sdpa_output, triton_output, rtol=0.01, atol=0.001
+    )
+    print(f"sdpa-core : {summarize(sdpa_samples)} | backend=sdpa")
+    print(
+        f"triton-core: {summarize(triton_samples)} | backend={triton_backend} | "
+        f"finite={'PASS' if finite else 'FAIL'} | vs_sdpa={'PASS' if passed else 'FAIL'} | "
+        f"max_abs={max_abs:.6g} | max_rel={max_rel:.6g} | failed={failed}"
+    )
+    if triton_reason:
+        print(f"  triton fallback reason: {triton_reason}")
+    print(
+        f"  speedup triton-core vs sdpa-core: "
+        f"{statistics.median(sdpa_samples) / statistics.median(triton_samples):.3f}x"
+    )
+
+
 def run_case(args: argparse.Namespace, batch_size: int, seq_len: int) -> None:
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -302,11 +544,38 @@ def run_case(args: argparse.Namespace, batch_size: int, seq_len: int) -> None:
     )
     config.validate()
 
+    if (
+        config.dtype == torch.bfloat16
+        and config.device.type == "cuda"
+        and not cuda_bfloat16_supported(config.device)
+    ):
+        print(
+            f"[unsupported] native BF16 is not reported for {config.device}; "
+            "skipping instead of benchmarking emulated BF16"
+        )
+        return
+
+    if seq_len > _DENSE_BENCHMARK_MAX_SEQ_LEN:
+        if not args.allow_long_sequence:
+            raise ValueError(
+                f"S={seq_len} exceeds the dense benchmark safety limit "
+                f"({_DENSE_BENCHMARK_MAX_SEQ_LEN}); pass --allow-long-sequence "
+                "and --attention-core to run only memory-safe core timings"
+            )
+        if not args.attention_core:
+            raise ValueError(
+                "long-sequence cases must use --attention-core so the dense "
+                "baseline and full-module QKV allocation are not attempted"
+            )
+        run_attention_core_case(args, config)
+        return
+
     if args.sweep and device.type == "cpu" and seq_len >= 2048:
         print(f"[warning] large CPU case may be very slow: B={batch_size}, S={seq_len}")
 
     torch.manual_seed(args.seed)
     x, valid_token_mask = make_inputs(config, args.seed)
+    valid_token_mask = prepare_valid_token_mask(valid_token_mask)
     upstream = torch.randn_like(x)
     models = maybe_compile(
         build_models(config),
@@ -335,11 +604,7 @@ def run_case(args: argparse.Namespace, batch_size: int, seq_len: int) -> None:
         passed, max_abs, max_rel, failed = compare_outputs(
             reference_output, candidate_output
         )
-        backend = (
-            model.selected_backend(x, valid_token_mask)
-            if hasattr(model, "selected_backend")
-            else "baseline"
-        )
+        backend = backend_report(model, x, valid_token_mask)
         print(
             f"{name:12s}: accuracy={'PASS' if passed else 'FAIL'} | "
             f"backend={backend} | max_abs={max_abs:.6g} | "
@@ -391,8 +656,18 @@ def run_case(args: argparse.Namespace, batch_size: int, seq_len: int) -> None:
             if name in results:
                 speedup = baseline_median / statistics.median(results[name])
                 print(f"  speedup {name:12s}: {speedup:.3f}x")
+        if "packed-sdpa" in results and "triton" in results:
+            packed_median = statistics.median(results["packed-sdpa"])
+            triton_median = statistics.median(results["triton"])
+            print(
+                f"  speedup triton vs packed-sdpa: "
+                f"{packed_median / triton_median:.3f}x"
+            )
 
     if args.profile:
+        run_sdpa_diagnostic(models["packed-sdpa"], x, valid_token_mask, config.causal)
+        print("\n=== Packed SDPA implementation profile ===")
+        run_profile(models["packed-sdpa"], x, valid_token_mask, config.causal)
         print("\n=== Triton implementation profile ===")
         run_profile(models["triton"], x, valid_token_mask, config.causal)
 
@@ -405,6 +680,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--d-model", type=int, default=512)
     parser.add_argument("--heads", type=int, default=8)
+    parser.add_argument(
+        "--official-case",
+        type=int,
+        choices=tuple(OFFICIAL_CASES),
+        help="use one organizer appendix case; CLI dtype/device/padding override it",
+    )
     parser.add_argument(
         "--dtype", choices=("float32", "float16", "bfloat16"), default="float16"
     )
@@ -425,6 +706,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument(
+        "--attention-core",
+        action="store_true",
+        help="for long sequences, benchmark preprojected Q/K/V only",
+    )
+    parser.add_argument(
+        "--allow-long-sequence",
+        action="store_true",
+        help="explicitly permit guarded long-sequence benchmarking",
+    )
+    parser.add_argument(
         "--sweep",
         action="store_true",
         help="run B in {1, 8} and S in {32, 128, 512, 2048, 4096}",
@@ -442,7 +733,13 @@ def main() -> int:
     if args.warmup < 0 or args.repeats <= 0:
         raise ValueError("warmup must be non-negative and repeats must be positive")
 
-    if args.sweep:
+    if args.official_case is not None:
+        batch_size, d_model, heads, seq_len = OFFICIAL_CASES[args.official_case]
+        args.d_model = d_model
+        args.heads = heads
+        args.causal = True
+        run_case(args, batch_size, seq_len)
+    elif args.sweep:
         for batch_size in (1, 8):
             for seq_len in (32, 128, 512, 2048, 4096):
                 run_case(args, batch_size, seq_len)

@@ -81,17 +81,20 @@ for numerically sensitive online-softmax statistics.
 
 Current Person 1 branch: `person1/attention-sdpa`.
 
-Current Person 1 source commit: `bbd0cc8 Harden Triton attention fallbacks and dispatch`.
-The shared context on that branch is updated in `cfee3c1`.
+Current Person 1 source commit: `18348ba Harden Person 1 attention diagnostics
+and validation`, integrated upstream through merge `4dc2b55`.
 
 The implementation adds `triton_scaled_dot_product_attention`,
 `TritonSelfAttention`, `PackedQKVSDPAAttention`,
 `tests/test_person1_attention.py`, and `bench_person1_attention.py` without
 modifying `UserOptimizedTransformer`; Person 3 owns dispatch and final
-assembly. Validation on the RTX 4050 Laptop GPU passed all 8 standalone tests
-with PyTorch 2.13.0+cu126 and Triton 3.7.1. Packed SDPA is currently faster
-than the custom Triton path at the default attention shape, so SDPA remains
-the production choice.
+assembly. The latest hardening adds actual-backend telemetry, setup-time mask
+normalization, official head-dimension coverage, non-contiguous-layout and
+mask-boundary tests, and a bounded long-sequence fallback that never invokes
+the dense reference for Shape 14. The upstream T4 handoff passed 10 default
+tests with one gated 100k test skipped; the explicitly enabled 100k smoke also
+passed. Packed SDPA remains the production choice because both RTX 4050 and T4
+measurements found it materially faster than the custom Triton path.
 
 ### Person 2 — FFN, LayerNorm, and residuals
 
