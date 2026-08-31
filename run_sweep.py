@@ -213,6 +213,14 @@ def build_command(
     accuracy_trials: int = 20,
     dispatch_mode: str = "auto",
 ) -> list[str]:
+    if (
+        fast_ffn_suffix_layers != 0
+        or packed_sdpa_suffix_layers is not None
+        or dispatch_mode != "auto"
+    ):
+        raise ValueError(
+            "the canonical benchmark exposes automatic dispatch only"
+        )
     command = [
         sys.executable,
         "torch_transformer_benchmark.py",
@@ -242,19 +250,11 @@ def build_command(
         str(rounds),
         "--accuracy-trials",
         str(accuracy_trials),
-        "--fast-ffn-suffix-layers",
-        str(fast_ffn_suffix_layers),
-        "--dispatch-mode",
-        dispatch_mode,
         "--atol",
         str(atol),
         "--rtol",
         str(rtol),
     ]
-    if packed_sdpa_suffix_layers is not None:
-        command.extend(
-            ["--packed-sdpa-suffix-layers", str(packed_sdpa_suffix_layers)]
-        )
     if case.causal:
         command.append("--causal")
     return command
@@ -322,6 +322,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--case-id must be between 1 and 14")
     if args.calibrate and (args.suite != "official" or args.case_id is None):
         parser.error("--calibrate requires --suite official and --case-id")
+    if args.calibrate:
+        parser.error(
+            "--calibrate is unavailable for the canonical auto-dispatch benchmark"
+        )
     if args.calibrate and args.case_id == 14:
         parser.error("ID 14 uses bench_shape14_blockwise.py, not --calibrate")
     if args.calibrate and (
@@ -563,11 +567,9 @@ def main() -> int:
 
     print(
         f"suite={args.suite} mode={args.mode} device={device} dtype={dtype} "
-            f"processes={processes} "
+        f"processes={processes} "
         f"warmup={warmup} repeats={repeats} rounds={rounds} "
-        f"fast_ffn_suffix_layers={args.fast_ffn_suffix_layers} "
-        f"packed_sdpa_suffix_layers={args.packed_sdpa_suffix_layers if args.packed_sdpa_suffix_layers is not None else 'auto'} "
-        f"dispatch_mode={args.dispatch_mode}"
+        "benchmark=canonical-auto-dispatch"
     )
     correctness_failed = False
     execution_failed = False

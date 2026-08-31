@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+from pathlib import Path
 import unittest
 from unittest import mock
 
 import torch
+import torch_transformer_benchmark as benchmark_module
 
 from bench_shape14_blockwise import (
     QueryTiledSelfAttention,
@@ -14,7 +17,6 @@ from bench_shape14_blockwise import (
     SeparateQKVTritonAttention,
 )
 from bench_shape14_streaming import Shape14MemoryEstimate, validate_memory_budget
-from person1_triton_attention import PackedQKVSDPAAttention
 from person3_dispatch import (
     AttentionDispatchKey,
     DispatchMeasurement,
@@ -36,6 +38,7 @@ from run_sweep import (
 from torch_transformer_benchmark import (
     BaselineSelfAttention,
     BaselineTransformer,
+    PackedQKVSelfAttention,
     TransformerConfig,
     UserOptimizedTransformer,
     UserOptimizedTransformerBlock,
@@ -315,14 +318,12 @@ class Person3IntegrationTests(unittest.TestCase):
                 for layer in optimized.layers
             )
         )
-        self.assertEqual(optimized.attention_backend, "baseline")
 
-    def test_packed_sdpa_suffix_uses_only_final_layers(self) -> None:
-        config = TransformerConfig(2, 7, 32, 4, 64, 3, False)
-        optimized = UserOptimizedTransformer(
-            config, packed_sdpa_suffix_layers=1
-        )
+    def test_exact_official_dispatch_uses_only_final_packed_layer(self) -> None:
+        config = TransformerConfig(1, 128, 128, 4, 128, 4, True)
+        optimized = UserOptimizedTransformer(config)
 
+        self.assertTrue(optimized._packed_candidate)
         self.assertTrue(
             all(
                 isinstance(layer.attention, BaselineSelfAttention)
@@ -330,20 +331,25 @@ class Person3IntegrationTests(unittest.TestCase):
             )
         )
         self.assertIsInstance(
-            optimized.layers[-1].attention, PackedQKVSDPAAttention
+            optimized.layers[-1].attention, PackedQKVSelfAttention
         )
-        self.assertEqual(optimized.attention_backend, "packed-sdpa-suffix:1")
 
-        with self.assertRaisesRegex(ValueError, "between 0 and num_layers"):
-            UserOptimizedTransformer(config, packed_sdpa_suffix_layers=4)
+        nearby = UserOptimizedTransformer(
+            TransformerConfig(2, 128, 128, 4, 128, 4, True)
+        )
+        self.assertFalse(nearby._packed_candidate)
+        self.assertTrue(
+            all(
+                isinstance(layer.attention, BaselineSelfAttention)
+                for layer in nearby.layers
+            )
+        )
 
-    def test_packed_sdpa_suffix_weight_transfer_uses_qkv_row_order(self) -> None:
-        config = TransformerConfig(2, 7, 32, 4, 64, 2, False)
+    def test_packed_weight_transfer_uses_qkv_row_order(self) -> None:
+        config = TransformerConfig(1, 128, 128, 4, 128, 4, True)
         torch.manual_seed(102)
         baseline = BaselineTransformer(config).eval()
-        optimized = UserOptimizedTransformer(
-            config, packed_sdpa_suffix_layers=1
-        ).eval()
+        optimized = UserOptimizedTransformer(config).eval()
         copy_model_weights(baseline, optimized)
 
         source = baseline.layers[-1].attention
@@ -360,36 +366,26 @@ class Person3IntegrationTests(unittest.TestCase):
             torch.equal(packed.out_proj.weight, source.out_proj.weight)
         )
 
-    def test_packed_sdpa_suffix_cpu_end_to_end(self) -> None:
+    def test_packed_core_cpu_strict_comparison(self) -> None:
+        config = TransformerConfig(1, 128, 128, 4, 128, 4, True)
         torch.manual_seed(104)
-        x = torch.randn(2, 7, 32)
-        masks = (
-            None,
-            torch.ones(2, 7, dtype=torch.bool),
-            torch.tensor(
-                [
-                    [True, True, True, True, True, True, True],
-                    [True, True, True, True, False, False, False],
-                ]
+        baseline = BaselineTransformer(config).eval()
+        optimized = UserOptimizedTransformer(config).eval()
+        copy_model_weights(baseline, optimized)
+        x = torch.randn(1, 128, 128)
+        mask = torch.ones(1, 128, dtype=torch.bool)
+
+        with (
+            mock.patch.object(
+                optimized, "_runtime_supports_packed", return_value=True
             ),
-        )
+            torch.inference_mode(),
+        ):
+            reference = baseline(x, mask)
+            candidate = optimized(x, mask)
+        assert_or_close(self, reference, candidate)
 
-        for causal in (False, True):
-            config = TransformerConfig(2, 7, 32, 4, 64, 2, causal)
-            baseline = BaselineTransformer(config).eval()
-            optimized = UserOptimizedTransformer(
-                config, packed_sdpa_suffix_layers=1
-            ).eval()
-            copy_model_weights(baseline, optimized)
-            for mask in masks:
-                with torch.inference_mode():
-                    reference = baseline(x, mask)
-                    candidate = optimized(x, mask)
-                assert_or_close(self, reference, candidate)
-                if mask is not None:
-                    self.assertTrue(bool((candidate[~mask] == 0).all().item()))
-
-    def test_weight_transfer_preserves_attention_and_refreshes_ffn_state(self) -> None:
+    def test_weight_transfer_preserves_native_parameters(self) -> None:
         baseline, optimized = self.make_models()
 
         for source, target in zip(baseline.layers, optimized.layers):
@@ -409,19 +405,14 @@ class Person3IntegrationTests(unittest.TestCase):
             self.assertTrue(torch.equal(target.norm2.bias, source.norm2.bias))
             self.assertTrue(torch.equal(target.ffn_in.weight, source.ffn_in.weight))
             self.assertTrue(torch.equal(target.ffn_out.bias, source.ffn_out.bias))
-            self.assertTrue(
-                torch.equal(
-                    target._ffn_out_weight_nt,
-                    target.ffn_out.weight.detach().t().contiguous(),
-                )
-            )
 
         self.assertTrue(
             torch.equal(optimized.final_norm.weight, baseline.final_norm.weight)
         )
-        optimized_keys = set(optimized.state_dict())
-        self.assertIn("layers.0.attention.q_proj.weight", optimized_keys)
-        self.assertNotIn("layers.0.attention.qkv_proj.weight", optimized_keys)
+        self.assertEqual(
+            set(optimized.state_dict()),
+            set(baseline.state_dict()),
+        )
 
     def test_weight_transfer_rejects_mismatched_configuration(self) -> None:
         baseline, _optimized = self.make_models()
@@ -458,72 +449,51 @@ class Person3IntegrationTests(unittest.TestCase):
                 if mask is not None:
                     self.assertTrue(bool((candidate[~mask] == 0).all().item()))
 
-    def test_model_preparation_counts_layers_and_cpu_falls_back(self) -> None:
-        _baseline, optimized = self.make_models()
-        x = torch.randn(2, 7, 32)
-        mask = torch.ones(2, 7, dtype=torch.bool)
-
-        self.assertEqual(optimized.prepare_for_inference(x, mask), 0)
-        self.assertTrue(
-            all(
-                "unsupported" in (layer.fast_ffn_error or "")
-                for layer in optimized.layers
-            )
-        )
-
-        with mock.patch.object(
-            UserOptimizedTransformerBlock,
-            "prepare_fast_ffn",
-            return_value=True,
-        ):
-            self.assertEqual(
-                optimized.prepare_for_inference(x, mask),
-                len(optimized.layers),
-            )
-
-        def enable_fast_ffn(layer, _x, _mask):
-            layer._fast_ffn_enabled = True
-            return True
-
-        with mock.patch.object(
-            UserOptimizedTransformerBlock,
-            "prepare_fast_ffn",
-            autospec=True,
-            side_effect=enable_fast_ffn,
-        ) as prepare:
-            self.assertEqual(
-                optimized.prepare_for_inference(
-                    x, mask, fast_ffn_suffix_layers=1
-                ),
-                1,
-            )
-            self.assertEqual(prepare.call_count, 1)
-        self.assertFalse(optimized.layers[0]._fast_ffn_enabled)
-        self.assertTrue(optimized.layers[-1]._fast_ffn_enabled)
-
-        self.assertEqual(
-            optimized.prepare_for_inference(x, mask, fast_ffn_suffix_layers=0),
-            0,
-        )
-        self.assertTrue(
-            all(not layer._fast_ffn_enabled for layer in optimized.layers)
-        )
-        with self.assertRaisesRegex(ValueError, "between 0 and num_layers"):
-            optimized.prepare_for_inference(x, mask, fast_ffn_suffix_layers=3)
-
-    def test_all_valid_mask_bypass_is_identity_and_version_guarded(self) -> None:
+    def test_all_valid_mask_cache_is_identity_and_version_guarded(self) -> None:
         baseline, optimized = self.make_models()
         torch.manual_seed(107)
         x = torch.randn(2, 7, 32)
         mask = torch.ones(2, 7, dtype=torch.bool)
 
-        self.assertEqual(
-            optimized.prepare_for_inference(
-                x, mask, fast_ffn_suffix_layers=0
-            ),
-            0,
+        with torch.inference_mode():
+            reference = baseline(x, mask)
+            candidate = optimized(x, mask)
+        self.assertTrue(torch.equal(reference, candidate))
+        self.assertIs(optimized._cached_mask, mask)
+        self.assertTrue(optimized._cached_mask_is_all_valid)
+
+        cloned_mask = mask.clone()
+        with torch.inference_mode():
+            cloned_candidate = optimized(x, cloned_mask)
+        self.assertTrue(torch.equal(reference, cloned_candidate))
+        self.assertIs(optimized._cached_mask, cloned_mask)
+
+        cloned_mask[1, -1] = False
+        with torch.inference_mode():
+            mutated_reference = baseline(x, cloned_mask)
+            mutated_candidate = optimized(x, cloned_mask)
+        self.assertTrue(torch.equal(mutated_reference, mutated_candidate))
+        self.assertFalse(optimized._cached_mask_is_all_valid)
+        self.assertTrue(bool((mutated_candidate[~cloned_mask] == 0).all().item()))
+
+    def test_inference_tensor_masks_are_not_cached(self) -> None:
+        _baseline, optimized = self.make_models()
+        x = torch.randn(2, 7, 32)
+        with torch.inference_mode():
+            mask = torch.ones(2, 7, dtype=torch.bool)
+            optimized(x, mask)
+        self.assertIsNone(optimized._cached_mask)
+        self.assertIsNone(optimized._cached_mask_version)
+
+    def test_padded_mask_is_not_bypassed(self) -> None:
+        baseline, optimized = self.make_models()
+        x = torch.randn(2, 7, 32)
+        mask = torch.tensor(
+            [
+                [True, True, True, True, True, True, True],
+                [True, True, True, True, False, False, False],
+            ]
         )
-        self.assertEqual(optimized.mask_dispatch, "all-valid-bypass")
         with mock.patch.object(
             optimized.layers[0].attention,
             "forward",
@@ -532,47 +502,40 @@ class Person3IntegrationTests(unittest.TestCase):
             with torch.inference_mode():
                 reference = baseline(x, mask)
                 candidate = optimized(x, mask)
-            self.assertIsNone(attention.call_args.args[1])
+            self.assertIs(attention.call_args.args[1], mask)
         self.assertTrue(torch.equal(reference, candidate))
+        self.assertFalse(optimized._cached_mask_is_all_valid)
 
-        cloned_mask = mask.clone()
-        with mock.patch.object(
-            optimized.layers[0].attention,
-            "forward",
-            wraps=optimized.layers[0].attention.forward,
-        ) as attention:
-            with torch.inference_mode():
-                cloned_candidate = optimized(x, cloned_mask)
-            self.assertIs(attention.call_args.args[1], cloned_mask)
-        self.assertTrue(torch.equal(reference, cloned_candidate))
-
-        mask[1, -1] = False
-        self.assertEqual(optimized.mask_dispatch, "masked")
-        with torch.inference_mode():
-            mutated_reference = baseline(x, mask)
-            mutated_candidate = optimized(x, mask)
-        self.assertTrue(torch.equal(mutated_reference, mutated_candidate))
-        self.assertTrue(bool((mutated_candidate[~mask] == 0).all().item()))
-
-    def test_padded_mask_is_not_bypassed(self) -> None:
+    def test_invalid_mask_metadata_never_uses_bypass(self) -> None:
         _baseline, optimized = self.make_models()
         x = torch.randn(2, 7, 32)
-        mask = torch.tensor(
-            [
-                [True, True, True, True, True, True, True],
-                [True, True, True, True, False, False, False],
-            ]
+        self.assertFalse(
+            optimized._mask_is_all_valid(torch.ones(2, 6, dtype=torch.bool), x)
         )
-        optimized.prepare_for_inference(x, mask, fast_ffn_suffix_layers=0)
-        self.assertEqual(optimized.mask_dispatch, "masked")
-        with mock.patch.object(
-            optimized.layers[0].attention,
-            "forward",
-            wraps=optimized.layers[0].attention.forward,
-        ) as attention:
-            with torch.inference_mode():
-                optimized(x, mask)
-            self.assertIs(attention.call_args.args[1], mask)
+        self.assertFalse(optimized._mask_is_all_valid(torch.ones(2, 7), x))
+
+    def test_runtime_gate_rejects_cpu_and_training(self) -> None:
+        config = TransformerConfig(1, 128, 128, 4, 128, 4, True)
+        optimized = UserOptimizedTransformer(config).eval()
+        x = torch.randn(1, 128, 128)
+        self.assertFalse(optimized._runtime_supports_packed(x))
+        optimized.train()
+        self.assertFalse(optimized._runtime_supports_packed(x))
+
+    def test_canonical_template_sections_have_not_drifted(self) -> None:
+        source = Path(benchmark_module.__file__).read_text()
+        self.assertNotIn("import person", source)
+        self.assertNotIn("import triton", source)
+        prefix = source[: source.index("class PackedQKVSelfAttention")]
+        tail = source[source.index("def resolve_device") :].rstrip() + "\n"
+        self.assertEqual(
+            hashlib.sha256(prefix.encode()).hexdigest(),
+            "3e25293daeb8826cdbbf64fece4a4ce51a634d093473f018f47e2530d52fc89c",
+        )
+        self.assertEqual(
+            hashlib.sha256(tail.encode()).hexdigest(),
+            "e8fd8365ade5d3ab1bafc70303d4fe5b7886a0de8258aff86aa803d188ea83d0",
+        )
 
     def test_sweep_parser_reads_strict_result_and_timings(self) -> None:
         output = """
@@ -626,7 +589,7 @@ speedup  : 2.000x based on median latency
         )
         self.assertIsNone(select_relative_winner([rejected]))
 
-    def test_calibration_parses_failure_and_builds_strict_command(self) -> None:
+    def test_runner_builds_canonical_strict_command(self) -> None:
         output = (
             "summary: FAIL | max_abs=0.003 | max_rel=2 | "
             "failed=3/344064\n"
@@ -642,7 +605,7 @@ speedup  : 2.000x based on median latency
             100,
             3,
             0,
-            1,
+            None,
         )
         self.assertEqual(command[command.index("--atol") + 1], "0.001")
         self.assertEqual(command[command.index("--rtol") + 1], "0.01")
@@ -650,6 +613,9 @@ speedup  : 2.000x based on median latency
             command[command.index("--accuracy-trials") + 1], "20"
         )
         self.assertIn("--causal", command)
+        self.assertNotIn("--dispatch-mode", command)
+        self.assertNotIn("--packed-sdpa-suffix-layers", command)
+        self.assertNotIn("--fast-ffn-suffix-layers", command)
 
 
 if __name__ == "__main__":

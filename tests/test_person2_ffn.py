@@ -19,10 +19,10 @@ from bench_person2_ffn import (
 )
 from profile_person2_gemms import gemm_shapes
 from profile_person2_ffn import event_device_time_us
+from person2_ffn_block import OptimizedTransformerBlock
 
 from torch_transformer_benchmark import (
     BaselineTransformerBlock,
-    OptimizedTransformerBlock,
     TransformerConfig,
     UserOptimizedTransformer,
     UserOptimizedTransformerBlock,
