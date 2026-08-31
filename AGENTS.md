@@ -588,3 +588,10 @@ with the untouched organizer defaults should be retained as judge-equivalent
 evidence. Shape 14 remains in the separate streaming/blockwise evaluators
 because the unchanged organizer `main()` cannot safely construct its dense
 reference.
+
+`run_sweep.py --contract judge` performs the directly runnable official
+ID 1-13 matrix with the organizer benchmark's executable defaults: five
+accuracy trials, `atol=0.002`, and `rtol=0.02`. Final mode retains the supplied
+20 warmups, 100 repetitions, and three alternating rounds. Strict mode remains
+the default internal gate. ID 14 is still reported separately because invoking
+the unchanged dense reference at B32/S100000 would require multiple terabytes.

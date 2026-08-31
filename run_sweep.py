@@ -349,6 +349,15 @@ def parse_args() -> argparse.Namespace:
         help="allow the original full-allocation harness to attempt official ID 14",
     )
     parser.add_argument("--mode", choices=("smoke", "final"), default="smoke")
+    parser.add_argument(
+        "--contract",
+        choices=("strict", "judge"),
+        default="strict",
+        help=(
+            "strict uses the internal 20-trial 0.001/0.01 gate; judge uses "
+            "the organizer benchmark's 5-trial 0.002/0.02 defaults"
+        ),
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--dtype",
@@ -576,6 +585,10 @@ def main() -> int:
     final_mode = args.mode == "final" or args.calibrate
     processes = args.processes or (3 if final_mode else 1)
     warmup, repeats, rounds = (20, 100, 3) if final_mode else (5, 20, 1)
+    if args.contract == "judge":
+        accuracy_trials, atol, rtol = 5, 0.002, 0.02
+    else:
+        accuracy_trials, atol, rtol = 20, 0.001, 0.01
     cases = OFFICIAL_CASES if args.suite == "official" else INTEGRATION_CASES
     if args.case_id is not None:
         cases = tuple(case for case in cases if case.case_id == args.case_id)
@@ -640,8 +653,9 @@ def main() -> int:
 
     print(
         f"suite={args.suite} mode={args.mode} device={device} dtype={dtype} "
-        f"processes={processes} "
+        f"processes={processes} contract={args.contract} "
         f"warmup={warmup} repeats={repeats} rounds={rounds} "
+        f"accuracy_trials={accuracy_trials} atol={atol:g} rtol={rtol:g} "
         "benchmark=canonical-auto-dispatch"
     )
     correctness_failed = False
@@ -660,6 +674,9 @@ def main() -> int:
             rounds,
             args.fast_ffn_suffix_layers,
             args.packed_sdpa_suffix_layers,
+            atol=atol,
+            rtol=rtol,
+            accuracy_trials=accuracy_trials,
             dispatch_mode=args.dispatch_mode,
         )
         for process_index in range(processes):

@@ -669,6 +669,24 @@ speedup  : 2.000x based on median latency
         self.assertNotIn("--packed-sdpa-suffix-layers", command)
         self.assertNotIn("--fast-ffn-suffix-layers", command)
 
+    def test_runner_builds_canonical_judge_contract_command(self) -> None:
+        command = build_command(
+            OFFICIAL_CASES[1],
+            "cuda",
+            "float16",
+            20,
+            100,
+            3,
+            0,
+            None,
+            atol=0.002,
+            rtol=0.02,
+            accuracy_trials=5,
+        )
+        self.assertEqual(command[command.index("--atol") + 1], "0.002")
+        self.assertEqual(command[command.index("--rtol") + 1], "0.02")
+        self.assertEqual(command[command.index("--accuracy-trials") + 1], "5")
+
     def test_runner_reports_canonical_policy_and_suite_summary(self) -> None:
         with (
             mock.patch("run_sweep.torch.cuda.is_available", return_value=True),
