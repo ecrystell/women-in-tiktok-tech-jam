@@ -15,6 +15,7 @@ from bench_shape14_blockwise import (
     QueryTiledSelfAttention,
     SeparateQKVSDPAAttention,
     SeparateQKVTritonAttention,
+    configure_candidate_attention,
 )
 from bench_shape14_streaming import Shape14MemoryEstimate, validate_memory_budget
 from person3_dispatch import (
@@ -214,6 +215,32 @@ class Person3IntegrationTests(unittest.TestCase):
         )
         with self.assertRaises(MemoryError):
             validate_memory_budget(unsafe, free_fraction=0.01)
+
+    def test_shape14_candidate_plans_use_canonical_constructor(self) -> None:
+        config = TransformerConfig(1, 16, 32, 4, 32, 2, True)
+        optimized = UserOptimizedTransformer(config)
+
+        configure_candidate_attention(
+            optimized, config, "separate-then-packed", 8
+        )
+        self.assertIsInstance(
+            optimized.layers[0].attention, SeparateQKVSDPAAttention
+        )
+        self.assertIsInstance(
+            optimized.layers[1].attention, PackedQKVSelfAttention
+        )
+        self.assertTrue(optimized._packed_candidate)
+
+        configure_candidate_attention(
+            optimized, config, "explicit-tiled-all", 8
+        )
+        self.assertTrue(
+            all(
+                isinstance(layer.attention, QueryTiledSelfAttention)
+                for layer in optimized.layers
+            )
+        )
+        self.assertFalse(optimized._packed_candidate)
 
     def test_query_tiled_reference_matches_baseline_attention(self) -> None:
         torch.manual_seed(99)

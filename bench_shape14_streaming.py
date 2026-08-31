@@ -18,6 +18,7 @@ import torch
 
 from torch_transformer_benchmark import (
     BaselineTransformer,
+    PackedQKVSelfAttention,
     TransformerConfig,
     UserOptimizedTransformer,
     copy_model_weights,
@@ -115,10 +116,10 @@ def build_shape14_models(
     )
     config.validate()
     baseline = BaselineTransformer(config)
-    optimized = UserOptimizedTransformer(
-        config,
-        packed_sdpa_suffix_layers=layers,
-    )
+    optimized = UserOptimizedTransformer(config)
+    for layer in optimized.layers:
+        layer.attention = PackedQKVSelfAttention(d_model, heads)
+    optimized._packed_candidate = True
     copy_model_weights(baseline, optimized)
     baseline = baseline.to(device=device, dtype=dtype).eval()
     optimized = optimized.to(device=device, dtype=dtype).eval()
@@ -144,9 +145,8 @@ def _make_block_inputs(
         dtype=dtype,
         generator=generator,
     )
-    # Shape #14 has no padding semantics in the supplied appendix.  Keeping a
-    # reusable all-valid mask lets prepare_for_inference remove the no-op mask
-    # path before timing while preserving the public forward contract.
+    # Shape #14 has no padding semantics in the supplied appendix. Keeping a
+    # reusable all-valid mask lets the canonical model cache that fact once.
     mask = torch.ones(batch_block, seq_len, device=device, dtype=torch.bool)
     return x, mask
 
@@ -241,9 +241,12 @@ def run_streaming_shape14(
         dtype=dtype,
         seed=seed + 100000,
     )
-    # Prepare only the production model.  The explicit baseline is never run
-    # at S=100,000; its [S,S] reference path is unsafe by construction.
-    optimized.prepare_for_inference(x, mask, fast_ffn_suffix_layers=0)
+    # Resolve mask and runtime metadata before timing without executing the
+    # explicit baseline or a full model forward.
+    if not optimized._mask_is_all_valid(mask, x):
+        raise RuntimeError("Shape 14 streaming requires an all-valid mask")
+    if not optimized._runtime_supports_packed(x):
+        raise RuntimeError("packed Shape 14 streaming is unsupported at runtime")
     torch.cuda.reset_peak_memory_stats(device)
     optimized_samples = _timed_block_loop(
         optimized,
@@ -265,7 +268,7 @@ def run_streaming_shape14(
         "heads": heads,
         "layers": layers,
         "blocks": blocks,
-        "backend": optimized.attention_backend,
+        "backend": f"packed-sdpa-suffix:{layers}",
         "median_ms": median_ms,
         "p90_ms": _percentile(optimized_samples, 0.90),
         "min_ms": min(optimized_samples),

@@ -20,6 +20,7 @@ from person1_triton_attention import triton_scaled_dot_product_attention
 from torch_transformer_benchmark import (
     BaselineSelfAttention,
     BaselineTransformer,
+    PackedQKVSelfAttention,
     TransformerConfig,
     UserOptimizedTransformer,
     compare_outputs,
@@ -154,6 +155,46 @@ class QueryTiledReferenceTransformer(BaselineTransformer):
             )
 
 
+def configure_candidate_attention(
+    model: UserOptimizedTransformer,
+    config: TransformerConfig,
+    attention_plan: str,
+    candidate_query_block: int,
+) -> None:
+    """Apply a Shape 14 plan without changing the canonical constructor."""
+
+    for index, layer in enumerate(model.layers):
+        if attention_plan == "explicit-tiled-all":
+            attention: nn.Module = QueryTiledSelfAttention(
+                config.d_model, config.num_heads, candidate_query_block
+            )
+        elif attention_plan == "separate-triton-all":
+            attention = SeparateQKVTritonAttention(
+                config.d_model, config.num_heads
+            )
+        elif attention_plan == "separate-all":
+            attention = SeparateQKVSDPAAttention(
+                config.d_model, config.num_heads
+            )
+        elif (
+            attention_plan == "separate-then-packed"
+            and index < config.num_layers - 1
+        ):
+            attention = SeparateQKVSDPAAttention(
+                config.d_model, config.num_heads
+            )
+        else:
+            attention = PackedQKVSelfAttention(
+                config.d_model, config.num_heads
+            )
+        layer.attention = attention
+
+    model._packed_candidate = attention_plan in {
+        "packed-all",
+        "separate-then-packed",
+    }
+
+
 def elapsed_samples(
     model: nn.Module,
     x: torch.Tensor,
@@ -239,33 +280,13 @@ def main() -> int:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     baseline = QueryTiledReferenceTransformer(config, args.query_block)
-    optimized = UserOptimizedTransformer(
-        config, packed_sdpa_suffix_layers=config.num_layers
+    optimized = UserOptimizedTransformer(config)
+    configure_candidate_attention(
+        optimized,
+        config,
+        args.attention_plan,
+        args.candidate_query_block,
     )
-    if args.attention_plan == "explicit-tiled-all":
-        for index in range(config.num_layers):
-            optimized.layers[index].attention = QueryTiledSelfAttention(
-                config.d_model,
-                config.num_heads,
-                args.candidate_query_block,
-            )
-        separate_layers = ()
-    elif args.attention_plan == "separate-triton-all":
-        for index in range(config.num_layers):
-            optimized.layers[index].attention = SeparateQKVTritonAttention(
-                config.d_model, config.num_heads
-            )
-        separate_layers = ()
-    elif args.attention_plan == "separate-all":
-        separate_layers = range(config.num_layers)
-    elif args.attention_plan == "separate-then-packed":
-        separate_layers = range(max(0, config.num_layers - 1))
-    else:
-        separate_layers = ()
-    for index in separate_layers:
-        optimized.layers[index].attention = SeparateQKVSDPAAttention(
-            config.d_model, config.num_heads
-        )
     copy_model_weights(baseline, optimized)
     baseline = baseline.to(device=device, dtype=dtype).eval()
     optimized = optimized.to(device=device, dtype=dtype).eval()
@@ -283,8 +304,6 @@ def main() -> int:
     mask = torch.ones(
         args.batch_block, args.seq_len, device=device, dtype=torch.bool
     )
-    optimized.prepare_for_inference(x, mask, fast_ffn_suffix_layers=0)
-
     with torch.inference_mode():
         reference = baseline(x, mask)
         candidate = optimized(x, mask)
