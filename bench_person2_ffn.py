@@ -75,9 +75,14 @@ class BaselineFFNResidual(nn.Module):
 class OptimizedFFNResidual(nn.Module):
     """Expose the exact FFN path used by OptimizedTransformerBlock."""
 
-    def __init__(self, block: OptimizedTransformerBlock) -> None:
+    def __init__(
+        self,
+        block: OptimizedTransformerBlock,
+        backend: str = "full-op",
+    ) -> None:
         super().__init__()
         self.block = block
+        self.backend = backend
 
     def forward(
         self, x: torch.Tensor, valid_token_mask: Optional[torch.Tensor]
@@ -87,18 +92,30 @@ class OptimizedFFNResidual(nn.Module):
     def prepare(
         self, x: torch.Tensor, valid_token_mask: Optional[torch.Tensor]
     ) -> bool:
+        if self.backend == "output-layernorm":
+            return self.block.prepare_output_only_layer_norm_ffn(
+                x, valid_token_mask
+            )
         return self.block.prepare_fast_ffn(x, valid_token_mask)
 
     @property
     def prepare_error(self) -> Optional[str]:
+        if self.backend == "output-layernorm":
+            return self.block.output_only_layer_norm_error
         return self.block.fast_ffn_error
 
 
 class FullBlock(nn.Module):
-    def __init__(self, block: nn.Module, causal: bool) -> None:
+    def __init__(
+        self,
+        block: nn.Module,
+        causal: bool,
+        backend: str = "full-op",
+    ) -> None:
         super().__init__()
         self.block = block
         self.causal = causal
+        self.backend = backend
 
     def forward(
         self, x: torch.Tensor, valid_token_mask: Optional[torch.Tensor]
@@ -114,10 +131,16 @@ class FullBlock(nn.Module):
             ffn_input = x + self.block.attention(
                 self.block.norm1(x), valid_token_mask, self.causal
             )
+        if self.backend == "output-layernorm":
+            return self.block.prepare_output_only_layer_norm_ffn(
+                ffn_input, valid_token_mask
+            )
         return self.block.prepare_fast_ffn(ffn_input, valid_token_mask)
 
     @property
     def prepare_error(self) -> Optional[str]:
+        if self.backend == "output-layernorm":
+            return getattr(self.block, "output_only_layer_norm_error", None)
         return getattr(self.block, "fast_ffn_error", None)
 
 
@@ -370,6 +393,8 @@ def make_models(
     scope: str,
     device: torch.device,
     dtype: torch.dtype,
+    backend: str = "full-op",
+    control_backend: str = "native",
 ) -> tuple[nn.Module, nn.Module]:
     baseline_block = BaselineTransformerBlock(
         case.d_model, case.heads, case.ffn_dim
@@ -381,13 +406,29 @@ def make_models(
     baseline_block = baseline_block.to(device=device, dtype=dtype).eval()
     optimized_block = optimized_block.to(device=device, dtype=dtype).eval()
 
-    if scope == "isolated":
-        return BaselineFFNResidual(baseline_block), OptimizedFFNResidual(
-            optimized_block
+    control_block: Optional[OptimizedTransformerBlock] = None
+    if control_backend != "native":
+        control_block = OptimizedTransformerBlock(
+            case.d_model, case.heads, case.ffn_dim
         )
-    return FullBlock(baseline_block, case.causal), FullBlock(
-        optimized_block, case.causal
+        control_block.load_state_dict(baseline_block.state_dict(), strict=True)
+        control_block = control_block.to(device=device, dtype=dtype).eval()
+
+    selected_backend = "full-op" if backend == "cuda-graph" else backend
+
+    if scope == "isolated":
+        control = (
+            BaselineFFNResidual(baseline_block)
+            if control_block is None
+            else OptimizedFFNResidual(control_block, control_backend)
+        )
+        return control, OptimizedFFNResidual(optimized_block, selected_backend)
+    control = (
+        FullBlock(baseline_block, case.causal)
+        if control_block is None
+        else FullBlock(control_block, case.causal, control_backend)
     )
+    return control, FullBlock(optimized_block, case.causal, selected_backend)
 
 
 def run_case(
@@ -402,6 +443,7 @@ def run_case(
         "case": asdict(case),
         "scope": scope,
         "backend": args.backend,
+        "control_backend": args.control_backend,
         "mode": mode,
         "process_index": args.process_index,
         "status": "error",
@@ -414,7 +456,25 @@ def run_case(
         if args.backend == "cuda-graph" and mode != "eager":
             raise RuntimeError("CUDA-graph diagnostics require eager mode")
         x, mask = make_input(case, device, dtype, args.seed)
-        baseline, candidate = make_models(case, scope, device, dtype)
+        baseline, candidate = make_models(
+            case,
+            scope,
+            device,
+            dtype,
+            args.backend,
+            args.control_backend,
+        )
+        control_fast_required = args.control_backend != "native"
+        control_fast_enabled = not control_fast_required
+        control_prepare = getattr(baseline, "prepare", None)
+        if control_prepare is not None and control_fast_required:
+            control_fast_enabled = control_prepare(x, mask)
+            control_reason = getattr(baseline, "prepare_error", None)
+            print(
+                "control_fast_ffn="
+                f"{'ENABLED' if control_fast_enabled else 'FALLBACK'}"
+                + (f" | reason={control_reason}" if control_reason else "")
+            )
         fast_enabled = False
         prepare = getattr(candidate, "prepare", None)
         if prepare is not None:
@@ -439,6 +499,11 @@ def run_case(
                     else ""
                 )
             )
+        if args.backend == "output-layernorm" and mode != "eager":
+            print(
+                "output-only LayerNorm deliberately uses the native compile fallback"
+            )
+            fast_enabled = False
         baseline = compile_model(baseline, mode)
         graph_owns_outputs = True
         graph_ownership_reason = "not applicable"
@@ -527,6 +592,7 @@ def run_case(
             and p90_gate
             and graph_owns_outputs
             and fast_enabled
+            and control_fast_enabled
         )
         result.update(
             status="measured",
@@ -535,6 +601,7 @@ def run_case(
             graph_output_ownership=graph_owns_outputs,
             graph_ownership_reason=graph_ownership_reason,
             fast_path_enabled=fast_enabled,
+            control_fast_path_enabled=control_fast_enabled,
             baseline_median_ms=baseline_median,
             baseline_p90_ms=baseline_p90,
             baseline_throughput_tokens_s=tokens * 1000.0 / baseline_median,
@@ -634,7 +701,15 @@ def parse_args() -> argparse.Namespace:
         "--scope", choices=("isolated", "full", "both"), default="isolated"
     )
     parser.add_argument(
-        "--backend", choices=("full-op", "cuda-graph"), default="full-op"
+        "--backend",
+        choices=("full-op", "output-layernorm", "cuda-graph"),
+        default="full-op",
+    )
+    parser.add_argument(
+        "--control-backend",
+        choices=("native", "full-op"),
+        default="native",
+        help="alternate against native eager or the validated full-op path",
     )
     parser.add_argument(
         "--compile-mode",

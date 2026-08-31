@@ -42,12 +42,16 @@ class ProfileResult:
     approximate_cuda_launch_count: int
     gemm_percent: float
     layer_norm_percent: float
+    layer_norm_ms: float
+    layer_norm_minimum_io_bytes: int
+    layer_norm_effective_gib_s: float
     gelu_percent: float
     residual_mask_percent: float
     copy_layout_percent: float
     other_percent: float
     non_gemm_percent: float
     amdahl_upper_bound: float
+    layer_norm_removal_upper_bound: float
     target_feasible: bool
 
 
@@ -144,6 +148,15 @@ def profile_model(
     gemm_fraction = category_us["gemm"] / total_us
     non_gemm_fraction = 1.0 - gemm_fraction
     amdahl_upper_bound = float("inf") if gemm_fraction == 0 else 1.0 / gemm_fraction
+    layer_norm_fraction = category_us["layer_norm"] / total_us
+    layer_norm_ms = category_us["layer_norm"] / args.profile_iterations / 1000.0
+    layer_norm_minimum_io_bytes = case.tokens * case.d_model * 2 * 2
+    layer_norm_effective_gib_s = (
+        layer_norm_minimum_io_bytes / (layer_norm_ms / 1000.0) / (1024**3)
+        if layer_norm_ms > 0
+        else 0.0
+    )
+    layer_norm_removal_upper_bound = 1.0 / (1.0 - layer_norm_fraction)
 
     def percent(category: str) -> float:
         return 100.0 * category_us[category] / total_us
@@ -158,13 +171,17 @@ def profile_model(
         approximate_cuda_launch_count=launch_count,
         gemm_percent=percent("gemm"),
         layer_norm_percent=percent("layer_norm"),
+        layer_norm_ms=layer_norm_ms,
+        layer_norm_minimum_io_bytes=layer_norm_minimum_io_bytes,
+        layer_norm_effective_gib_s=layer_norm_effective_gib_s,
         gelu_percent=percent("gelu"),
         residual_mask_percent=percent("residual_mask"),
         copy_layout_percent=percent("copy_layout"),
         other_percent=percent("other"),
         non_gemm_percent=100.0 * non_gemm_fraction,
         amdahl_upper_bound=amdahl_upper_bound,
-        target_feasible=amdahl_upper_bound >= TARGET_SPEEDUP,
+        layer_norm_removal_upper_bound=layer_norm_removal_upper_bound,
+        target_feasible=layer_norm_removal_upper_bound >= TARGET_SPEEDUP,
     )
 
 
@@ -178,7 +195,10 @@ def print_result(result: ProfileResult) -> None:
     )
     print(
         f"gemm={result.gemm_percent:.2f}% | "
-        f"layer_norm={result.layer_norm_percent:.2f}% | "
+        f"layer_norm={result.layer_norm_percent:.2f}% "
+        f"({result.layer_norm_ms:.4f} ms, "
+        f"minimum_io={result.layer_norm_minimum_io_bytes} bytes, "
+        f"effective={result.layer_norm_effective_gib_s:.2f} GiB/s) | "
         f"gelu={result.gelu_percent:.2f}% | "
         f"residual_mask={result.residual_mask_percent:.2f}% | "
         f"copy_layout={result.copy_layout_percent:.2f}% | "
@@ -187,7 +207,9 @@ def print_result(result: ProfileResult) -> None:
     print(
         f"non_gemm={result.non_gemm_percent:.2f}% | "
         f"amdahl_upper_bound={result.amdahl_upper_bound:.3f}x | "
-        f"non_gemm_1.005x_feasible={'YES' if result.target_feasible else 'NO'}"
+        f"layer_norm_removal_upper_bound="
+        f"{result.layer_norm_removal_upper_bound:.3f}x | "
+        f"layer_norm_1.005x_feasible={'YES' if result.target_feasible else 'NO'}"
     )
 
 
@@ -216,6 +238,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--models", choices=("baseline", "optimized", "both"), default="both"
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("full-op", "output-layernorm"),
+        default="output-layernorm",
+    )
+    parser.add_argument(
+        "--control-backend",
+        choices=("native", "full-op"),
+        default="full-op",
     )
     parser.add_argument("--sweep", action="store_true")
     parser.add_argument("--batch-size", type=int, default=8)
@@ -281,8 +313,18 @@ def main() -> int:
 
     results: list[ProfileResult] = []
     for case in cases_from_args(args):
-        baseline, optimized = make_models(case, "isolated", device, dtype)
+        baseline, optimized = make_models(
+            case,
+            "isolated",
+            device,
+            dtype,
+            args.backend,
+            args.control_backend,
+        )
         prep_x, prep_mask = make_input(case, device, dtype, args.seed)
+        control_prepare = getattr(baseline, "prepare", None)
+        if control_prepare is not None and not control_prepare(prep_x, prep_mask):
+            print(f"control fallback: {baseline.prepare_error}")
         prepare = getattr(optimized, "prepare", None)
         if prepare is not None and not prepare(prep_x, prep_mask):
             print(f"optimized fallback: {optimized.prepare_error}")
@@ -305,8 +347,8 @@ def main() -> int:
         print(
             "\nPROFILE GATE: "
             + ("PASS" if universal else "FAIL")
-            + " | theoretical 1.005x target "
-            + ("remains feasible" if universal else "is impossible from non-GEMM removal alone")
+            + " | theoretical 1.005x target from LayerNorm removal "
+            + ("remains feasible" if universal else "is impossible")
         )
 
     if args.json_output is not None:
