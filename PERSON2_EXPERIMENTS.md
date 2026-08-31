@@ -273,3 +273,83 @@ reformulation was also screened: it had zero strict failures on short and
 medium shapes, but was not promoted because it changes floating-point
 evaluation and would require a new fused statistics/correction kernel. It
 remains a separately gated future experiment rather than part of this result.
+
+## Output-only LayerNorm rejection on official T4 shapes
+
+Branch `person2/output-only-layernorm-t4` evaluated source tip `968ea82`
+directly against the validated `f50ef57` full-op control. The experiment
+specializes identity-affine LayerNorm for CUDA FP16 inference while preserving
+both cuBLAS GEMMs, exact ATen GELU, residual/mask order, APIs, and state-dict
+layout. The CUDA implementation uses FP32 two-pass mean and centered-variance
+statistics, vectorized `half2` I/O, eight warp-per-row lanes for `D=32/128`,
+one block per row for `D=1024`, output-only storage, and the current CUDA
+stream. Unsupported devices, dtypes, layouts, affine parameters, training,
+compilation, extension failures, and failed preflight validation fall back to
+the existing full-op implementation.
+
+The validation environment was a Tesla T4 (`sm_75`, 15,360 MiB), PyTorch
+2.11.0+cu128, and CUDA 12.8. All 29 unit tests passed in 125.993 seconds with
+the real extension, including adversarial and zero-variance rows, dimension
+guards, current-stream execution, repeated-output ownership, parameter
+invalidation, strict state loading, masks, exact invalid zeroing, compilation,
+FP16, FP32 fallback, and BF16 fallback. A causal official-harness smoke test
+also passed with zero failed elements and an unchanged
+`UserOptimizedTransformer.forward`; its baseline and optimized medians were
+3.2677 and 3.2657 ms (`1.001x`).
+
+The profiler confirmed that LayerNorm was a meaningful target for most narrow
+shapes. Times below are self CUDA time per call; the bound assumes LayerNorm is
+removed completely and is therefore only an Amdahl ceiling. Minimal traffic is
+one FP16 read and one FP16 write per element.
+
+| `(M,D,FFN)` | Control LN ms | Control share | Candidate LN ms | Candidate effective GiB/s | LN-removal ceiling |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `(128,128,128)` | 0.0072 | 23.89% | 0.0048 | 12.80 | 1.314x |
+| `(512,128,128)` | 0.0134 | 27.87% | 0.0052 | 46.92 | 1.386x |
+| `(2048,128,128)` | 0.0400 | 41.89% | 0.0097 | 100.70 | 1.721x |
+| `(8192,128,128)` | 0.1512 | 53.45% | 0.0308 | 126.91 | 2.148x |
+| `(16384,128,128)` | 0.2993 | 55.40% | 0.0560 | 139.60 | 2.242x |
+| `(65536,128,128)` | 0.6192 | 48.21% | 0.1489 | 209.87 | 1.931x |
+| `(1280000,128,128)` | 12.4566 | 50.52% | 2.8650 | 213.04 | 2.021x |
+| `(8192,32,32)` | 0.0639 | 74.81% | 0.0080 | 122.05 | 3.970x |
+| `(8192,1024,1024)` | 0.1936 | 10.33% | 0.2221 | 140.68 | 1.115x |
+
+The isolated acceptance run used FP16, seed 1234, `atol=0.001`, `rtol=0.01`,
+20 warmups, 100 CUDA-event repetitions, five alternating rounds, and three
+independent processes. Each cell lists process 1/2/3 speedup; all 27
+comparisons had zero failed elements.
+
+| `(M,D,FFN)` | Speedups by process | p90 gate |
+| --- | --- | --- |
+| `(128,128,128)` | 1.074x / 1.092x / **0.956x** | pass / pass / pass |
+| `(512,128,128)` | 1.084x / 1.079x / 1.108x | pass / pass / pass |
+| `(2048,128,128)` | 1.072x / 1.067x / 1.057x | pass / pass / pass |
+| `(8192,128,128)` | 1.666x / 1.654x / 1.614x | pass / pass / pass |
+| `(16384,128,128)` | 1.488x / 1.538x / 1.536x | pass / pass / pass |
+| `(65536,128,128)` | 1.588x / 1.598x / 1.608x | pass / pass / pass |
+| `(1280000,128,128)` | 1.655x / 1.643x / 1.630x | pass / pass / pass |
+| `(8192,32,32)` | 1.072x / 1.093x / 1.056x | pass / pass / **fail** |
+| `(8192,1024,1024)` | 1.006x / 1.023x / 1.009x | pass / pass / pass |
+
+The universal isolated gate failed. Process 3 at `(128,128,128)` regressed
+from 0.275328 to 0.288080 ms (`0.955735x`). Process 3 at `(8192,32,32)` had a
+passing 1.056x median but p90 increased from 0.198659 to 0.205491 ms. This was
+not discarded as variance because the gate requires every process and shape.
+
+All 39 feasible causal full-block checks for official configurations 1–13
+were strict-correct and measured at least `0.996844x`, so the median safety
+threshold passed. Four p90 comparisons exceeded the allowed 2% regression:
+
+| Process / configuration | Median speedup | Control p90 ms | Candidate p90 ms |
+| --- | ---: | ---: | ---: |
+| 1 / 4 | 1.030x | 0.9393 | 1.0048 |
+| 1 / 12 | 1.015x | 0.8529 | 0.8902 |
+| 2 / 2 | 1.010x | 0.9733 | 1.0379 |
+| 2 / 3 | 1.001x | 0.9360 | 0.9787 |
+
+Configuration 14 remains excluded from the T4 gate as planned. The candidate
+is therefore rejected despite strong gains on seven official tuples: it fails
+both the repeatable universal isolated gate and the full-block p90 safety gate.
+The output-only path remains opt-in experimental code on this branch, while
+`person2/ffn-fullop-t4` at `f50ef57` remains the recommended Person 2 result.
+`AGENTS.md` is intentionally unchanged and no speedup claim is promoted.
