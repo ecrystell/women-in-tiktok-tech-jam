@@ -65,6 +65,13 @@ authority for correctness and speed.
     This demonstrates algebra/implementation co-design for data reuse and
     coalesced CUDA execution. Linear attention changes the model's attention
     equation, so only its kernel-engineering lessons transfer to this project.
+11. **Team synthesis, "High-Performance Acceleration Strategies for PyTorch
+    Transformer Optimization"** (user-supplied local report, 12 pages). This
+    collects the project's profiler observations and proposes SDPA backend
+    testing, compiler tuning, CUDA Graphs, and normalization fusion. Treat its
+    expected reductions, dispatch diagrams, and kernel sketches as hypotheses:
+    only repository code, backend traces, and T4 measurements can promote them
+    to project directives or performance claims.
 
 The supplied local `2603.28708v1.pdf` is the same work as source 4. It is not
 counted as a separate source or as independent corroboration.
@@ -72,8 +79,14 @@ counted as a separate source or as independent corroboration.
 ### Supplied implementation references
 
 - [PyTorch `torch.compile`](https://docs.pytorch.org/docs/stable/generated/torch.compile)
+- [PyTorch high-performance SDPA tutorial](https://docs.pytorch.org/tutorials/intermediate/scaled_dot_product_attention_tutorial.html)
+- [PyTorch SDPA backend controls](https://docs.pytorch.org/docs/stable/nn.attention.html)
+- [PyTorch compiler programming model](https://docs.pytorch.org/docs/stable/user_guide/torch_compiler/compile/programming_model.html)
+- [PyTorch CUDA Graph Trees](https://docs.pytorch.org/docs/main/user_guide/torch_compiler/torch.compiler_cudagraph_trees.html)
 - [PyTorch CUDA-graph step marker](https://docs.pytorch.org/docs/main/generated/torch.compiler.cudagraph_mark_step_begin.html)
 - [PyTorch profiler](https://docs.pytorch.org/docs/stable/profiler.html)
+- [Triton LayerNorm tutorial](https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html)
+- [PyTorch normalization-fusion analysis](https://pytorch.org/blog/towards-free-normalization-fusing-normalization-into-gemm-and-attention-kernels/)
 - [NVIDIA cuBLAS/cuBLASLt](https://docs.nvidia.com/cuda/cublas/index.html)
 - [Triton exact `erf`](https://triton-lang.org/main/python-api/generated/triton.language.erf.html)
 - [TensorRT exact `GELU_ERF`](https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/c-api/namespacenvinfer1.html)
@@ -219,6 +232,27 @@ Apply the NVIDIA GEMM article's shape-first method to inference.
   launch/overhead-sensitive to quadratic compute/memory pressure as sequence
   length grows.
 
+### SDPA backend verification
+
+- Use `torch.nn.attention.sdpa_kernel` as a scoped diagnostic context to isolate
+  eligible SDPA implementations. Do not globally disable backends in submission
+  code or let one benchmark case contaminate later cases.
+- Do not assume that `attn_mask=None` implies FlashAttention, or that every
+  explicit boolean/additive mask disables it. Backend eligibility depends on
+  device, dtype, head dimension, strides, causal mode, mask form, and installed
+  PyTorch/CUDA versions. Capture warnings and prove the selected kernel with a
+  profiler or dispatch trace for every claimed configuration.
+- Preserve SDPA boolean semantics: `True` means the position participates in
+  attention, which is the inverse of `MultiheadAttention.key_padding_mask`.
+  Test the conversion with padded queries and keys, not only an all-valid mask.
+- Never evaluate `valid_token_mask.all().item()` in the compiled or timed
+  forward path. Establish an all-valid fact from immutable host metadata or a
+  cache guarded by mask identity, version, shape, strides, and device; otherwise
+  pass the mask through the validated general path.
+- Treat Q/K/V head views as a layout contract. Record strides and backend
+  eligibility before inserting `.contiguous()`; count any required copy in
+  end-to-end latency rather than attributing only the SDPA kernel time.
+
 ### Exact-attention boundary
 
 - The benchmark fixes scaled softmax attention. Linear attention, sparse
@@ -260,6 +294,31 @@ Apply the NVIDIA GEMM article's shape-first method to inference.
   dimensions, layout, alignment, and relevant parameter versions. Do not
   allocate, synchronize, build, autotune, inspect masks, or choose tactics
   inside timed inference.
+
+### LayerNorm and GEMM fusion gate
+
+- Distinguish a row reduction from a GEMM tile. LayerNorm needs the complete
+  hidden row to compute mean and variance, while a high-throughput GEMM divides
+  the output over two-dimensional `M x N` tiles. A naive GEMM epilogue cannot
+  normalize a row that is split across column tiles without communication,
+  redundant reductions, a second stage, or an altered tiling strategy.
+- Do not transfer the PyTorch Lazy Pre-Norm algebra to this benchmark. That
+  method relies on affine-free RMSNorm being a row-wise scale and explicitly
+  does not apply to mean-subtracting LayerNorm or general affine parameters.
+- A dedicated fused residual-add plus LayerNorm candidate must accumulate its
+  mean and variance in FP32, reproduce the baseline epsilon and population-
+  variance convention, apply current gamma/beta values, and specify ownership
+  of both the updated residual and normalized output. Writing either public
+  input in place is disallowed unless the caller's ownership contract permits
+  it and repeated-call tests prove safety.
+- Size a row kernel from feature bytes, register use, shared memory, and active
+  warps rather than copying the Triton tutorial's limit as a universal rule.
+  Test dimensions immediately below, at, and above each implementation guard;
+  large power-of-two padding can reduce occupancy or make the kernel illegal.
+- Compare three boundaries independently: native LayerNorm; a standalone
+  fused add/LayerNorm kernel; and the validated full FFN custom-op boundary.
+  Record launch count, bytes moved, occupancy/resource limits, and block/full-
+  model latency. Fewer launches or HBM passes are not sufficient acceptance.
 
 ## 7. Token reduction and padding directives
 
@@ -341,6 +400,38 @@ with this fixed benchmark contract.
 - Custom operations need fake/meta implementations only when compilation can
   safely trace them; otherwise deliberately select the documented compile
   fallback.
+
+### Graph and compiler diagnostics
+
+- Use `fullgraph=True` during qualification to turn graph breaks into explicit
+  failures. Inspect `TORCH_LOGS=graph_breaks`, `TORCH_LOGS=perf_hints`, or a
+  `tlparse` trace; a successful `torch.compile` call does not prove a single
+  optimized graph or CUDA Graph execution.
+- Keep tensor-to-scalar reads (`.item()`, `int(tensor)`, `float(tensor)`), direct
+  pointer inspection, logging, exception-driven fallback, and tensor-dependent
+  Python branches outside the compiled forward. Prefer static Python metadata;
+  use a traceable control-flow operator only when both branches preserve the
+  exact model contract and are independently validated.
+- Query `torch._inductor.list_mode_options()` for the installed runtime and use
+  documented `torch.compile(options=...)` controls where possible. Private
+  `torch._inductor.config` names are version-sensitive. `max_autotune`,
+  `shape_padding`, `epilogue_fusion`, and coordinate-descent searches are
+  candidates, not a bundle that is assumed faster.
+- For every compiler option, record compile/autotune time separately, inspect
+  generated kernels or profiler events, and remeasure peak memory. Shape
+  padding can improve Tensor Core alignment while increasing FLOPs and memory;
+  epilogue fusion is useful only when the selected template actually supports
+  the exact activation and arithmetic order.
+- Raw CUDA Graph replay requires stable kernel arguments, dependencies, and
+  memory addresses. Include any input staging copy and output ownership copy in
+  realistic latency unless the caller already owns fixed buffers. Reject a
+  graph that mutates public inputs or silently overwrites a previously returned
+  tensor.
+- Prefer one exact capture for each fixed official shape. Sequence bucketing is
+  permitted only if internal padding, mask construction, extra compute,
+  unpadding, and output shape all preserve semantics and the complete measured
+  path wins. CUDA Graph Trees reduce recapture overhead; they do not remove the
+  need for static-address and output-lifetime discipline.
 
 ## 10. Optional TensorRT and custom-backend directives
 
@@ -432,6 +523,29 @@ setup costs and sampling parameters explicit.
 - The linear-attention paper does not authorize replacing exact softmax
   attention. Its reported A6000 results at much longer sequences are neither a
   T4 performance claim nor numerical equivalence evidence.
+- The supplied acceleration report's operator percentages are CPU-side
+  attribution. SDPA may replace those operators, but it does not thereby prove
+  that exactly 30.59% of end-to-end latency is eliminated. Likewise, reducing
+  36 `addmm` calls to 24 is an expected launch-count change, not a measured
+  model speedup.
+- The report does not prove that an explicit mask always rejects FlashAttention
+  or that `attn_mask=None` always selects it. Verify the exact T4 dispatch; do
+  not label a path FlashAttention from source structure alone.
+- The report's suggested Inductor settings and quoted coordinate-descent gains
+  are not portable guarantees. Private configuration keys, search spaces,
+  compilation cost, generated code, and winning kernels change by PyTorch,
+  Triton, CUDA, GPU, and matrix shape.
+- Exact GELU is not automatically fused merely because compilation succeeds.
+  Inspect generated code and reject any tanh approximation or changed
+  intermediate rounding, even if a fused epilogue benchmarks faster.
+- The report's persistent add/LayerNorm pseudocode mutates a residual buffer and
+  omits production guards, launch geometry, resource limits, stream/error
+  handling, output-lifetime rules, and adversarial numerical validation. It is
+  a design sketch, not submission-ready code.
+- The PyTorch normalization-fusion article's Lazy Pre-Norm result is specific
+  to affine-free RMSNorm and explicitly excludes LayerNorm. It does not justify
+  replacing this benchmark's FP32-statistics LayerNorm or changing its state
+  dict to create a fusion opportunity.
 - A profiler share does not itself prove an optimization; it only bounds the
   opportunity. A reduction in kernel count, FLOPs, or memory traffic is not a
   speedup until CUDA-event measurements show one.
