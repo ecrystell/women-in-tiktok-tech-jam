@@ -22,22 +22,31 @@ CUDA-event measurements record median and p90 latency after warmup. Extreme
 long-sequence work is evaluated separately with memory-bounded batch and query
 tiling because the dense attention score matrix cannot fit in GPU memory.
 
-Addressed the FFN, LayerNorm, and residual portion of the problem by building
-and validating a standalone, baseline-compatible optimized Transformer block
-that preserves exact GELU, FP32 LayerNorm statistics, masking semantics,
-state-dict compatibility, and invalid-token zeroing. I used Visual Studio Code,
-OpenAI Codex, Git/GitHub, and a Google Colab Jupyter runtime with a Tesla T4;
-the implementation and measurements used Python, PyTorch tensor and
-neural-network APIs, `torch.compile`, `torch.profiler`, CUDA Events, and
-PyTorch C++/CUDA custom-operator APIs, with unittest-based regression coverage.
-Official-shape retuning reduced Python/kernel-launch overhead through a single
-guarded FFN operation boundary and a vectorized residual/mask kernel, fixed a
-CUDA grid-limit failure for workloads above 65,535 token rows, and produced a
-strict measured allowlist for eight of nine official FP16 FFN tuples while
-retaining native fallbacks elsewhere. No external dataset or application API
-was required: all validation used the organizer-provided
-`torch_transformer_benchmark.py`, official configuration shapes, and
-deterministic seeded random tensors.
+For Person 2, the official narrow FFNs are dominated less by GEMM throughput
+than by dispatcher, allocation, kernel-launch, and memory-traffic overhead. The
+native sublayer independently launches LayerNorm, the up projection, exact
+GELU, the down projection, residual addition, and `masked_fill`. The optimized
+path first flattens `[B,S,D]` to a zero-copy token-major `[M,D]` view, then
+crosses Python once through an inference-only C++ custom operator. Inside that
+boundary, ATen still supplies FP32-statistics LayerNorm and cuBLAS supplies both
+FP16 GEMMs, preserving their tuned kernels; exact `gelu_(..., "none")` runs
+in-place to avoid another activation allocation. The down-projection weight is
+cached in contiguous `[FFN,D]` form, and a final CUDA kernel uses 128-bit
+vectorized loads/stores to combine FP16 residual addition with invalid-row
+zeroing, eliminating the separate residual and mask passes. This reduced the
+profiled launch sequence from approximately eight CUDA launches to five and
+removed intermediate dispatcher transitions without changing numerical order.
+Extension compilation, weight packing, and strict numerical preflight occur
+before timing, while guards fall back to native PyTorch for training, changed
+parameters, non-contiguous layouts, unsupported dtypes, compilation, or failed
+validation. Retuning also replaced the masked kernel's row-indexed 2D launch
+with a 1D vector grid, avoiding CUDA's 65,535 `grid.y` limit for the 65,536- and
+1,280,000-token official workloads. On the Tesla T4, eight of nine official
+FP16 FFN tuples passed three-process median and p90 gates with zero failed
+elements; the lowest accepted isolated speedup was 1.128x. The
+`(M,D,FFN)=(2048,128,128)` tuple remains on the native path because its p90 and
+causal full-block results were not repeatable, so the result is a measured
+allowlist rather than an unsupported universal-speedup claim.
 
 For the attention portion, I replaced the separate Q/K/V projection path with
 a packed QKV projection followed by PyTorch scaled dot-product attention, while
