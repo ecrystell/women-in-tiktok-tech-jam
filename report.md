@@ -22,7 +22,7 @@ CUDA-event measurements record median and p90 latency after warmup. Extreme
 long-sequence work is evaluated separately with memory-bounded batch and query
 tiling because the dense attention score matrix cannot fit in GPU memory.
 
-For Person 2, the official narrow FFNs are dominated less by GEMM throughput
+The official narrow FFNs are dominated less by GEMM throughput
 than by dispatcher, allocation, kernel-launch, and memory-traffic overhead. The
 native sublayer independently launches LayerNorm, the up projection, exact
 GELU, the down projection, residual addition, and `masked_fill`. The optimized
@@ -59,12 +59,7 @@ strict correctness and timing gates. Exact-key dispatch keeps validated
 one-layer packed-SDPA cases on the fast path and sends unsupported or
 numerically unstable shapes to the native fallback, while the long-sequence
 Shape #14 evaluator uses memory-safe blockwise attention rather than a dense
-quadratic score matrix. This work used Visual Studio Code, OpenAI Codex,
-Google Colab/Jupyter, Git/GitHub, Python, PyTorch tensor/neural-network/CUDA
-APIs, `scaled_dot_product_attention`, CUDA events, `torch.profiler`,
-`torch.compile`, Triton, and `unittest`; no external dataset or application
-API was used beyond the organizer-provided benchmark, official shape appendix,
-and deterministic seeded tensors.
+quadratic score matrix.
 
 ## Development tools used
 
