@@ -168,11 +168,13 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         self._norm2_weight_version = self.norm2.weight._version
         self._norm2_bias_version = self.norm2.bias._version
         self._fast_ffn_enabled = False
+        self._output_only_layer_norm_enabled = False
         self._compact_ffn_enabled = False
         self._compact_mask: Optional[torch.Tensor] = None
         self._compact_mask_version = -1
         self._compact_valid_rows: Optional[torch.Tensor] = None
         self.fast_ffn_error: Optional[str] = None
+        self.output_only_layer_norm_error: Optional[str] = None
         self.compact_ffn_error: Optional[str] = None
         self.register_load_state_dict_post_hook(self._refresh_after_load)
 
@@ -191,6 +193,7 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
         self._norm2_weight_version = self.norm2.weight._version
         self._norm2_bias_version = self.norm2.bias._version
         self._fast_ffn_enabled = False
+        self._output_only_layer_norm_enabled = False
         self._compact_ffn_enabled = False
         self._compact_mask = None
         self._compact_mask_version = -1
@@ -222,6 +225,18 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
             and (valid_token_mask is None or valid_token_mask.is_contiguous())
             and not self.training
             and not torch.is_grad_enabled()
+        )
+
+    def _supports_output_only_layer_norm_ffn(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> bool:
+        return (
+            not torch.compiler.is_compiling()
+            and self._norm2_affine_is_identity
+            and x.shape[-1] in (32, 128, 1024)
+            and self._supports_fast_ffn(x, valid_token_mask)
         )
 
     def _ffn_residual_native(
@@ -285,6 +300,34 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
                 self.ffn_out.bias,
                 residual,
                 valid_token_mask.reshape(-1),
+            )
+        return output.reshape(batch, seq_len, d_model)
+
+    def _ffn_residual_output_only_layer_norm(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        batch, seq_len, d_model = x.shape
+        residual = x.reshape(batch * seq_len, d_model)
+        if valid_token_mask is None:
+            output = person2_ffn_post.output_only_layer_norm_ffn_unmasked(
+                residual,
+                self.ffn_in.weight,
+                self.ffn_in.bias,
+                self._ffn_out_weight_nt,
+                self.ffn_out.bias,
+                self.norm2.eps,
+            )
+        else:
+            output = person2_ffn_post.output_only_layer_norm_ffn_masked(
+                residual,
+                self.ffn_in.weight,
+                self.ffn_in.bias,
+                self._ffn_out_weight_nt,
+                self.ffn_out.bias,
+                valid_token_mask.reshape(-1),
+                self.norm2.eps,
             )
         return output.reshape(batch, seq_len, d_model)
 
@@ -401,12 +444,132 @@ class OptimizedTransformerBlock(BaselineTransformerBlock):
             self.fast_ffn_error = f"{type(error).__name__}: {error}"
             return False
 
+    @staticmethod
+    def _strictly_matches(
+        reference: torch.Tensor,
+        candidate: torch.Tensor,
+    ) -> tuple[bool, float, int]:
+        ref = reference.float()
+        opt = candidate.float()
+        error = (opt - ref).abs()
+        passed = torch.isfinite(ref) & torch.isfinite(opt)
+        passed &= (error <= 0.001) | (error <= 0.01 * ref.abs())
+        return (
+            bool(passed.all().item()),
+            float(error.max().item()),
+            int((~passed).sum().item()),
+        )
+
+    @torch.no_grad()
+    def _output_only_layer_norm_probes(self, x: torch.Tensor) -> list[torch.Tensor]:
+        d_model = x.shape[-1]
+        rows = min(x.shape[0] * x.shape[1], 8)
+        flat = x.reshape(-1, d_model)
+        probes = [flat[:rows]]
+        generator = torch.Generator(device=x.device).manual_seed(1701)
+        probes.append(
+            torch.randn(
+                (8, d_model),
+                device=x.device,
+                dtype=x.dtype,
+                generator=generator,
+            )
+        )
+        probes.append(torch.full_like(probes[-1], 3.25))
+        columns = torch.arange(d_model, device=x.device)
+        near_constant = torch.full(
+            (8, d_model),
+            64.0,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        near_constant += ((columns % 5) - 2).to(x.dtype) * 0.0625
+        probes.append(near_constant)
+        alternating = torch.where(
+            columns.remainder(2) == 0,
+            torch.tensor(32.0, device=x.device, dtype=x.dtype),
+            torch.tensor(-32.0, device=x.device, dtype=x.dtype),
+        ).expand(8, -1).contiguous()
+        probes.append(alternating)
+        return probes
+
+    def prepare_output_only_layer_norm_ffn(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+    ) -> bool:
+        """Build and strictly qualify the output-only LayerNorm experiment."""
+        self._refresh_fast_ffn_state()
+        self.output_only_layer_norm_error = None
+        with torch.inference_mode():
+            supported = self._supports_output_only_layer_norm_ffn(
+                x, valid_token_mask
+            )
+        if not supported:
+            self.output_only_layer_norm_error = (
+                "unsupported device, dtype, dimension, affine state, layout, or mode"
+            )
+            return False
+        try:
+            person2_ffn_post.load_extension()
+            with torch.inference_mode():
+                for probe_index, probe in enumerate(
+                    self._output_only_layer_norm_probes(x)
+                ):
+                    reference_norm = F.layer_norm(
+                        probe,
+                        (probe.shape[-1],),
+                        None,
+                        None,
+                        self.norm2.eps,
+                    )
+                    candidate_norm = person2_ffn_post.output_only_layer_norm(
+                        probe, self.norm2.eps
+                    )
+                    passed, max_abs, failed = self._strictly_matches(
+                        reference_norm, candidate_norm
+                    )
+                    if not passed:
+                        self.output_only_layer_norm_error = (
+                            "standalone LayerNorm preflight failed: "
+                            f"probe={probe_index}, max_abs={max_abs:.6g}, "
+                            f"failed={failed}"
+                        )
+                        return False
+
+                reference = self._ffn_residual_native(x, valid_token_mask)
+                candidate = self._ffn_residual_output_only_layer_norm(
+                    x, valid_token_mask
+                )
+                passed, max_abs, failed = self._strictly_matches(
+                    reference, candidate
+                )
+            if not passed:
+                self.output_only_layer_norm_error = (
+                    "full FFN preflight failed: "
+                    f"max_abs={max_abs:.6g}, failed={failed}"
+                )
+                return False
+            self._output_only_layer_norm_enabled = True
+            return True
+        except (ImportError, OSError, RuntimeError) as error:
+            self.output_only_layer_norm_error = f"{type(error).__name__}: {error}"
+            return False
+
     def _ffn_residual(
         self,
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Apply the pre-norm FFN residual sublayer with baseline semantics."""
+        if (
+            self._output_only_layer_norm_enabled
+            and self._fast_parameters_are_current()
+            and self._supports_output_only_layer_norm_ffn(x, valid_token_mask)
+        ):
+            return self._ffn_residual_output_only_layer_norm(
+                x, valid_token_mask
+            )
         if (
             self._fast_ffn_enabled
             and self._fast_parameters_are_current()

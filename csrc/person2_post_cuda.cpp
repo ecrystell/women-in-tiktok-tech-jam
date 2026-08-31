@@ -11,6 +11,19 @@ void residual_unmasked_cuda(
     const torch::Tensor& residual,
     torch::Tensor& output);
 
+void output_only_layer_norm_cuda(
+    const torch::Tensor& input,
+    torch::Tensor& output,
+    double eps);
+
+torch::Tensor output_only_layer_norm(
+    const torch::Tensor& input,
+    double eps) {
+  auto output = torch::empty_like(input);
+  output_only_layer_norm_cuda(input, output, eps);
+  return output;
+}
+
 torch::Tensor exact_gelu_down_masked(
     torch::Tensor preactivation,
     const torch::Tensor& weight_nt,
@@ -79,6 +92,37 @@ torch::Tensor identity_layer_norm_ffn_unmasked(
       preactivation, down_weight_nt, down_bias, residual);
 }
 
+torch::Tensor output_only_layer_norm_ffn_masked(
+    const torch::Tensor& residual,
+    const torch::Tensor& up_weight,
+    const torch::Tensor& up_bias,
+    const torch::Tensor& down_weight_nt,
+    const torch::Tensor& down_bias,
+    const torch::Tensor& valid_token_mask,
+    double eps) {
+  auto normalized = output_only_layer_norm(residual, eps);
+  auto preactivation = at::linear(normalized, up_weight, up_bias);
+  return exact_gelu_down_masked(
+      preactivation,
+      down_weight_nt,
+      down_bias,
+      residual,
+      valid_token_mask);
+}
+
+torch::Tensor output_only_layer_norm_ffn_unmasked(
+    const torch::Tensor& residual,
+    const torch::Tensor& up_weight,
+    const torch::Tensor& up_bias,
+    const torch::Tensor& down_weight_nt,
+    const torch::Tensor& down_bias,
+    double eps) {
+  auto normalized = output_only_layer_norm(residual, eps);
+  auto preactivation = at::linear(normalized, up_weight, up_bias);
+  return exact_gelu_down_unmasked(
+      preactivation, down_weight_nt, down_bias, residual);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def(
       "residual_masked_out",
@@ -104,4 +148,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       "identity_layer_norm_ffn_unmasked",
       &identity_layer_norm_ffn_unmasked,
       "Identity LayerNorm, exact FFN, and residual add");
+  module.def(
+      "output_only_layer_norm",
+      &output_only_layer_norm,
+      "FP16 output-only LayerNorm with FP32 statistics");
+  module.def(
+      "output_only_layer_norm_ffn_masked",
+      &output_only_layer_norm_ffn_masked,
+      "Output-only LayerNorm, exact FFN, residual add, and invalid-row zeroing");
+  module.def(
+      "output_only_layer_norm_ffn_unmasked",
+      &output_only_layer_norm_ffn_unmasked,
+      "Output-only LayerNorm, exact FFN, and residual add");
 }

@@ -237,3 +237,106 @@ def _identity_layer_norm_ffn_unmasked_fake(
 ) -> torch.Tensor:
     del up_weight, up_bias, down_weight_nt, down_bias, eps
     return torch.empty_like(residual)
+
+
+@torch.library.custom_op(
+    "person2_post::output_only_layer_norm_v1",
+    mutates_args=(),
+)
+def output_only_layer_norm(
+    residual: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Return identity-affine LayerNorm output without saved statistics."""
+    return load_extension().output_only_layer_norm(residual, eps)
+
+
+@output_only_layer_norm.register_fake
+def _output_only_layer_norm_fake(
+    residual: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    del eps
+    return torch.empty_like(residual)
+
+
+@torch.library.custom_op(
+    "person2_post::output_only_layer_norm_ffn_masked_v1",
+    mutates_args=(),
+)
+def output_only_layer_norm_ffn_masked(
+    residual: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    down_weight_nt: torch.Tensor,
+    down_bias: torch.Tensor,
+    valid_token_mask: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Orchestrate the masked FFN with specialized output-only LayerNorm."""
+    return load_extension().output_only_layer_norm_ffn_masked(
+        residual,
+        up_weight,
+        up_bias,
+        down_weight_nt,
+        down_bias,
+        valid_token_mask,
+        eps,
+    )
+
+
+@output_only_layer_norm_ffn_masked.register_fake
+def _output_only_layer_norm_ffn_masked_fake(
+    residual: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    down_weight_nt: torch.Tensor,
+    down_bias: torch.Tensor,
+    valid_token_mask: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    del (
+        up_weight,
+        up_bias,
+        down_weight_nt,
+        down_bias,
+        valid_token_mask,
+        eps,
+    )
+    return torch.empty_like(residual)
+
+
+@torch.library.custom_op(
+    "person2_post::output_only_layer_norm_ffn_unmasked_v1",
+    mutates_args=(),
+)
+def output_only_layer_norm_ffn_unmasked(
+    residual: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    down_weight_nt: torch.Tensor,
+    down_bias: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Orchestrate the unmasked FFN with output-only LayerNorm."""
+    return load_extension().output_only_layer_norm_ffn_unmasked(
+        residual,
+        up_weight,
+        up_bias,
+        down_weight_nt,
+        down_bias,
+        eps,
+    )
+
+
+@output_only_layer_norm_ffn_unmasked.register_fake
+def _output_only_layer_norm_ffn_unmasked_fake(
+    residual: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    down_weight_nt: torch.Tensor,
+    down_bias: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    del up_weight, up_bias, down_weight_nt, down_bias, eps
+    return torch.empty_like(residual)
