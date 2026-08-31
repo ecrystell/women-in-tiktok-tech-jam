@@ -143,12 +143,12 @@ speedup against the infeasible dense reference.
 
 ## Team Contributions
 
-- Zhao Jin (Person 1): packed-QKV SDPA, optional Triton attention, masks, and attention
+- Zhao Jin (Person 1): packed-QKV SDPA, optional Triton attention, masks, Shape 14 optimization and attention
   validation.
-- Yeo Su Gar (Person 2): FFN, LayerNorm, residual fusion experiments, CUDA post-processing,
+- Yeo Su Gar (Person 2): FFN, LayerNorm, residual fusion experiments, CUDA post-processing, documentation,
   and standalone validation.
-- Tiffany Heng (Person 3): final model assembly, weight transfer, shape dispatch, integration,
-  Shape 14 evaluation, official sweeps, and reproducibility documentation.
+- Tiffany Heng (Person 3): final model assembly, weight transfer, shape dispatch, integration, official sweeps,
+  and video.
 
 The team used OpenAI Codex for AI-assisted analysis, implementation, debugging,
 test generation, benchmark design, and code review. Final correctness and
